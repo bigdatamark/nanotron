@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Purpose: Command-line script to evaluate a nanotron checkpoint with lighteval.
+# Main contents: create_lighteval_config (build a LightEvalConfig programmatically), save_lighteval_config_as_yaml,
+# get_parser, and a main block. Without an override, the main block builds a default config with many custom
+# zero-shot tasks (hellaswag, winogrande, piqa, siqa, openbookqa, arc, commonsense_qa, all MMLU subsets), a
+# hard-coded custom_tasks path, batch size 8 and max 50 samples, writes it to
+# configs/examples/lighteval-config.yaml, then calls lighteval's nanotron entrypoint with the checkpoint config
+# path, the lighteval config path and cache dir.
+# Import-time side effects: imports lighteval (must be installed).
+# KNOWN ISSUE: the default custom_tasks path is a hard-coded cluster-specific absolute path; unknown CLI
+# arguments are parsed but silently ignored.
 import argparse
 import os
 from typing import Optional
@@ -31,6 +42,18 @@ def create_lighteval_config(
     push_to_hub: bool = False,
     results_org: Optional[str] = None,
 ) -> LightEvalConfig:
+    # [FUNCTION DOC]
+    # Behavior: builds LightEvalLoggingArgs (no tensorboard, private run, metric prefix eval), LightEvalTasksArgs
+    # (8 dataset loading processes, no pairwise tokenization), ParallelismArgs with dp/pp/tp, and GenerationArgs
+    # (greedy sampler, one sample), then wraps them into a LightEvalConfig.
+    # Inputs: output_dir (default ./eval_results), tasks (comma-separated suite|task|fewshot|truncate specs),
+    # custom_tasks (path or None), batch_size (16), dp/pp/tp (1), max_samples (None means all), temperature (0.0),
+    # top_k (0), top_p (1.0), seed (42), use_cache (True), save_details (True), push_to_hub (False),
+    # results_org (None).
+    # Outputs: LightEvalConfig.
+    # Exceptions: None explicitly raised (constructors may validate).
+    # Side effects: None.
+    # KNOWN ISSUE: sampler is always greedy, so temperature/top_k/top_p have no effect on sampling choice.
     """
     Create a LightEvalConfig object programmatically.
 
@@ -104,6 +127,14 @@ def create_lighteval_config(
 
 
 def save_lighteval_config_as_yaml(config: LightEvalConfig, output_path: str) -> None:
+    # [FUNCTION DOC]
+    # Behavior: creates the parent directory, builds a plain nested dictionary of the logging, tasks, parallelism,
+    # batch_size and generation fields (sampler enum converted to its lowercase name), and dumps it as block YAML.
+    # Inputs: config (LightEvalConfig), output_path (str file path).
+    # Outputs: None.
+    # Exceptions: errors from os.makedirs (for example when output_path has no directory component, the empty
+    # dirname makes makedirs fail) or file I/O.
+    # Side effects: writes the YAML file and creates directories.
     """
     Save a LightEvalConfig object as a YAML file.
 
@@ -161,6 +192,10 @@ def save_lighteval_config_as_yaml(config: LightEvalConfig, output_path: str) -> 
 
 
 def get_parser():
+    # [FUNCTION DOC]
+    # Behavior: builds the argument parser with required checkpoint-config-path, optional lighteval-override (YAML
+    # path) and cache-dir (default None).
+    # Inputs: None. Outputs: argparse.ArgumentParser. Exceptions: None explicitly raised. Side effects: None.
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--checkpoint-config-path",

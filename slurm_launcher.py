@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# [MODULE DOC]
+# Purpose: Command-line launcher that builds (or loads) a nanotron Config, writes it to YAML, generates a Slurm
+# batch script running torchrun with run_train.py, and submits it with sbatch (or prints it on dry run).
+# Main contents: default path constants, MODEL_SIZES presets (layers, hidden, heads, kv heads, ffn size),
+# parse_args, generate_model_config, launch_slurm_job, create_nanotron_config, create_slurm_script,
+# tail_output_file, main.
+# Import-time side effects: imports nanotron.config classes; creates a standard-library logger (unused).
+# KNOWN ISSUE: the module docstring shows a --run_name flag but the actual flag is --run.
 """
 Nanotron Slurm Launcher
 
@@ -80,6 +88,17 @@ MODEL_SIZES = {
 
 
 def parse_args():
+    # [FUNCTION DOC]
+    # Behavior: defines CLI groups: Slurm (gpus per node 8, partition, qos, time limit, email, tmp dir, pre-launch
+    # commands, extra env lines, bench CSV path, run-train script, slurm scripts dir), optional existing config path,
+    # model (preset name plus per-field overrides, vocab size 65536, seq 4096), training (seed, steps, mbs, acc, lr,
+    # min lr, weight decay, grad clip, warmup), parallelism (dp 8, pp 1, tp 2, cp 1, ep 1, zero 0 or 1), dataset
+    # (dataset, text column, tokenizer), paths (project, configs/logs/checkpoints dirs, save interval, save initial
+    # state), logging (wandb, profiler export path, log level, no-sanity) and execution (dry-run, show-logs).
+    # Inputs: None (sys.argv). Outputs: argparse Namespace.
+    # Exceptions: SystemExit on bad args. Side effects: None.
+    # KNOWN ISSUE: dataset and text-column options are parsed but never used (the Nanoset folder is hard-coded); the
+    # slurm-scripts-dir help says set to None to disable, but a CLI value is always a string so it can never be None.
     """Parse command line arguments for the Slurm launcher."""
     parser = argparse.ArgumentParser(
         description="Nanotron Slurm Launcher", formatter_class=argparse.ArgumentDefaultsHelpFormatter
@@ -214,6 +233,15 @@ def generate_model_config(
     vocab_size: Optional[int] = None,
     max_position_embeddings: int = 4096,
 ) -> LlamaConfig:
+    # [FUNCTION DOC]
+    # Behavior: starts from the MODEL_SIZES preset (falls back to custom), applies each non-None override (including
+    # vocab_size), and builds a LlamaConfig with fixed bos 1, eos 2, silu, init range 0.02, rms eps 1e-5, no rope
+    # scaling, untied embeddings and use_cache.
+    # Inputs: model_size (preset key, default custom), hidden_size, intermediate_size, num_hidden_layers,
+    # num_attention_heads, num_key_value_heads, vocab_size (ints or None), max_position_embeddings (default 4096).
+    # Outputs: LlamaConfig.
+    # Exceptions: errors from LlamaConfig validation. Side effects: None.
+    # KNOWN ISSUE: the docstring lists preset names tiny/small/base/large, which do not exist in MODEL_SIZES.
     """
     Generate a model configuration based on predefined sizes or custom parameters.
 
@@ -273,6 +301,12 @@ def generate_model_config(
 
 
 def launch_slurm_job(launch_file_contents: str, *args) -> str:
+    # [FUNCTION DOC]
+    # Behavior: writes the script to a temporary file, runs sbatch with extra args and the file, and returns the last
+    # whitespace token of its output (the job id).
+    # Inputs: launch_file_contents (str), extra positional sbatch arguments.
+    # Outputs: job id (str).
+    # Exceptions: subprocess.CalledProcessError if sbatch fails. Side effects: temp file, job submission.
     """
     Save a sbatch script to a temporary file and submit it to Slurm.
 
@@ -290,6 +324,18 @@ def launch_slurm_job(launch_file_contents: str, *args) -> str:
 
 
 def create_nanotron_config(args) -> Config:
+    # [FUNCTION DOC]
+    # Behavior: builds the model config from args, prints an approximate parameter count, builds ParallelismArgs
+    # (1f1b, REDUCE_SCATTER with async TP, no recompute), TokensArgs, prints global batch size in tokens and total
+    # tokens, builds a linear-warmup cosine LR schedule and AdamW optimizer (fp32 grad accumulation, fused), a single
+    # data stage using a hard-coded Nanoset folder, creates the checkpoints dir and CheckpointsArgs, and assembles the
+    # Config (general, random init std 0.025, tokenizer, logging every step, optional profiler).
+    # Inputs: args (Namespace from parse_args).
+    # Outputs: Config.
+    # Exceptions: validation errors from config dataclasses.
+    # Side effects: creates the checkpoints directory; prints.
+    # KNOWN ISSUE: the printed GBS multiplies by context and expert parallel sizes, which do not increase the number
+    # of tokens per step, so the logged batch size and total token count are inflated when cp or ep exceed 1.
     """
     Create a Nanotron configuration object based on the provided arguments.
 
@@ -448,6 +494,17 @@ def create_slurm_script(
     ep: int,
     run_train_script: str = "run_train.py",
 ) -> str:
+    # [FUNCTION DOC]
+    # Behavior: creates the logs dir for the run, computes GPUs per node (at most the requested value) and node count
+    # (asserting divisibility), makes config_path absolute, and returns a bash script with SBATCH headers (one task
+    # per node, exclusive, output file in the logs dir, optional time limit and email), environment setup (master
+    # address/port 6000, TMPDIR, CUDA_DEVICE_MAX_CONNECTIONS, extra env, NANOTRON_BENCHMARK when benchmarking,
+    # WANDB disabled unless enabled), a hard check that nvcc reports CUDA 12.4, extensive system/env logging, and a
+    # srun of torchrun (c10d rendezvous) with the training command.
+    # Inputs: config_path (str), args (Namespace), dp, pp, tp, cp, ep (ints), run_train_script (default run_train.py).
+    # Outputs: script text (str).
+    # Exceptions: AssertionError when the world size is not a multiple of GPUs per node.
+    # Side effects: creates the logs directory.
     """
     Create a Slurm job submission script.
 
@@ -591,6 +648,10 @@ echo "Total training time: $(secs_to_human $elapsed)"
 
 
 def tail_output_file(output_file: str):
+    # [FUNCTION DOC]
+    # HELPER: waits (polling every second) until output_file exists, then runs tail -f on it.
+    # Inputs: output_file (str path). Outputs: None (blocks until tail exits).
+    # Exceptions: None explicitly raised. Side effects: subprocess, blocking sleep.
     """Tail the output file when available."""
     while not os.path.exists(output_file):
         time.sleep(1)
@@ -599,6 +660,17 @@ def tail_output_file(output_file: str):
 
 
 def main():
+    # [FUNCTION DOC]
+    # Behavior: parses args, creates configs and logs dirs, builds a config (or loads YAML and reads its parallel sizes,
+    # overriding benchmark CSV path when bench is given), saves it under configs_path/run/timestamp-run.yaml, prints
+    # details, generates the Slurm script and saves it in the scripts dir, then either prints it (dry run) or submits
+    # it, prints the expected log path, and optionally tails it.
+    # Inputs: None (CLI). Outputs: 0.
+    # Exceptions: those of the helpers (sbatch failure, assertion, config errors).
+    # Side effects: directory and file creation, job submission, prints.
+    # KNOWN ISSUE: the predicted log file path uses the timestamp from main and the run name with spaces replaced,
+    # while the Slurm output pattern uses a separately generated timestamp and the raw job name, so the printed path
+    # can be wrong and show-logs may wait forever.
     """Main entry point for the Slurm launcher."""
     args = parse_args()
 

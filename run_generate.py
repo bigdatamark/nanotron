@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Purpose: Inference/demo script that loads a nanotron checkpoint and greedily generates text (launch with
+# torchrun; CUDA_DEVICE_MAX_CONNECTIONS=1 recommended).
+# Main contents: get_args (CLI) and main (build parallel context and model, load weights, decode prompts).
+# Import-time side effects: tries to import transformers AutoTokenizer, setting it to None when missing (then a
+# tokenized dummy input path is used instead). Creates a module logger.
 """
 Nanotron Inference Script
 
@@ -58,6 +64,10 @@ logger = logging.get_logger(__name__)
 
 
 def get_args():
+    # [FUNCTION DOC]
+    # Behavior: parses CLI: required ckpt-path (Path), dp (default 1), pp and tp (default 0, meaning take from the
+    # checkpoint config), max-new-tokens (128), use-cache flag.
+    # Inputs: None (reads sys.argv). Outputs: argparse Namespace. Exceptions: SystemExit on bad args. Side effects: None.
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt-path", type=Path, required=True, help="Checkpoint path")
     parser.add_argument("--dp", type=int, default=1)
@@ -69,6 +79,26 @@ def get_args():
 
 
 def main():
+    # [FUNCTION DOC]
+    # Behavior:
+    # 1. Parse args, assert the checkpoint dir exists, load config.yaml from it, take model config and tokenizer path.
+    # 2. Build ParallelismArgs (CLI value or config value for dp/pp/tp, 1F1B engine, ALL_REDUCE TP, sync linears) and a
+    #    ParallelContext (initializes all process groups); set per-rank log levels to info.
+    # 3. Seed RNG with 42; reject model configs not in CONFIG_TO_MODEL_CLASS; build TP-synced random states (all
+    #    reduce mode) and build the model in bfloat16 with build_model; mark tied parameters; sanity_check.
+    # 4. Load weights from the checkpoint folder and switch to eval.
+    # 5. With transformers: load the tokenizer, choose a pad token (eos, else model config pad id, else model eos id,
+    #    else add a [PAD] special token), left padding/truncation, run decode_text on two hardcoded prompts with
+    #    micro batch size 2 and greedy sampling (benchmark mode when env USE_BENCH is 1), and on ranks holding outputs
+    #    log the decoded input and generated continuation from rank 0.
+    # 6. Without transformers: decode_tokenized from a single zero token on CUDA for 12 new tokens and log raw ids.
+    # 7. Global barrier.
+    # Inputs: None (CLI). Outputs: None.
+    # Exceptions: AssertionError if the checkpoint path is missing or output types mismatch; ValueError for
+    # unsupported model configs.
+    # Side effects: initializes torch.distributed process groups, sets RNG state, reads env USE_BENCH, loads files,
+    # CUDA allocations, logging, collectives (barrier and those inside generation).
+    # KNOWN ISSUE: adding a [PAD] special token grows the tokenizer vocabulary without resizing model embeddings.
     args = get_args()
 
     assert args.ckpt_path.exists(), f"Checkpoint path {args.ckpt_path} does not exist"

@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Purpose: Generates nanotron YAML configs and SLURM scripts for parallelism scaling benchmarks (used for the
+# ultrascale playbook), optionally submits them, and records submitted experiments in a CSV.
+# Main contents: module constants ACCUMULATE_GRAD_IN_FP32 (unused here) and NUM_KEY_VALUE_HEADS (None means
+# multi-head attention), estimate_num_params, create_config, generate_slurm_script, check_params,
+# save_experiment_configs, main.
+# Import-time side effects: imports pandas, yaml, tqdm and nanotron.logging.human_format. File is excluded from
+# the formatter (fmt off).
 # fmt: off
 # Generates configs and SLURM scripts for scaling benchmarks used in https://huggingface.co/spaces/nanotron/ultrascale-playbook
 import argparse
@@ -24,6 +32,13 @@ def estimate_num_params(
     vocab,
     kv_heads=None,
 ):
+    # [FUNCTION DOC]
+    # HELPER: rough parameter count of a Llama-style model.
+    # Behavior: embeddings count vocab times hidden once if tied else twice; per layer adds 3 times hidden times
+    # intermediate (gated MLP) plus (2 plus 2 times kv_heads over heads) times hidden squared for attention.
+    # Inputs: layers, hidden_size, heads, intermediate_size (ints), tie_word_embeddings (bool), vocab (int),
+    # kv_heads (int or None meaning equal to heads).
+    # Outputs: number of parameters (int or float). Exceptions: None explicitly raised. Side effects: None.
     # params = 2*V*h + l(3*h*H + (2 + 2*q/kv_ratio)*h*h)
     # For GQA with 8 KV heads and 32 attention heads (4x ratio), it's: 2*V*h + l(3*h*H + (2 + 2/4)*h*h)
     vocab = vocab * hidden_size if tie_word_embeddings else 2 * vocab * hidden_size
@@ -50,6 +65,23 @@ def create_config(
     vocab_size: int = 32768,
     profile: bool = False,
 ) -> dict:
+    # [FUNCTION DOC]
+    # Behavior: loads the base YAML config, overwrites parallelism (dp, tp, pp, tp_mode, async TP communication only
+    # with REDUCE_SCATTER), tokens (batch accumulation, sequence length, micro batch size), model architecture (layers,
+    # hidden size, heads, KV heads from NUM_KEY_VALUE_HEADS or equal to heads, intermediate size defaulting to 4 times
+    # hidden, max position embeddings equal to seq_len, tied embeddings when intermediate size below 10000, vocab size)
+    # and optimizer zero stage; computes a human-formatted parameter count and builds a descriptive run name (with a
+    # gqa suffix when KV heads are set); sets the benchmark CSV path; when profile is set adds a profiler export path,
+    # limits training to 10 steps and suffixes the run name.
+    # Inputs: dp, tp, pp, batch_accum, seq_len (ints), benchmark_csv_path (str), micro_batch_size (1),
+    # base_config_path (examples/config_tiny_llama_bench.yaml), zero_stage (0), num_layers (24), hidden_size (2048),
+    # num_attention_heads (16), intermediate_size (None), tp_mode (REDUCE_SCATTER), vocab_size (32768), profile (False).
+    # Outputs: dictionary config.
+    # Exceptions: FileNotFoundError when the base config is missing; KeyError for missing sections.
+    # Side effects: reads the base config file.
+    # KNOWN ISSUE: tie_word_embeddings compares the raw intermediate_size argument with 10000, so passing None (the
+    # default) raises TypeError despite the 4 times hidden fallback just above.
+    # KNOWN ISSUE: the parameter estimate ignores NUM_KEY_VALUE_HEADS (kv_heads not passed).
     """Create a config with the specified parallelism settings."""
     # Load base config
     if not os.path.exists(base_config_path):
@@ -125,6 +157,16 @@ def generate_slurm_script(
     base_script_path: str = "run_multinode.sh",
     use_bash: bool = False,
 ) -> str:
+    # [FUNCTION DOC]
+    # Behavior: reads the base SLURM script, computes total GPUs (dp times tp times pp), GPUs per node (at most 8) and
+    # node count, and performs literal string replacements for nodes, time, partition, job name, JOBNAME, the config
+    # path (benchmark/configs/config_RUN.yaml) and GPUS_PER_NODE.
+    # Inputs: config (dict with general.run), dp, tp, pp (ints), time (default 00:02:00), partition (hopper-prod),
+    # base_script_path (run_multinode.sh), use_bash (bool, unused).
+    # Outputs: script text (str).
+    # Exceptions: FileNotFoundError if the base script is missing; ValueError if any expected placeholder is absent.
+    # Side effects: reads a file.
+    # KNOWN ISSUE: use_bash is accepted but ignored.
     """Generate a SLURM script for the given configuration."""
     # Check if base script exists
     if not os.path.exists(base_script_path):
@@ -160,6 +202,11 @@ def generate_slurm_script(
 
 
 def check_params(model_configs):
+    # [FUNCTION DOC]
+    # HELPER: debugging aid that prints estimated parameter counts for each model config and exits the process.
+    # Inputs: model_configs (dict name to tuple of layers, hidden, heads, intermediate). Uses vocab 131072 and 8 KV heads.
+    # Outputs: never returns. Exceptions: SystemExit always. Side effects: prints, exits.
+    # KNOWN ISSUE: the printed label says Embedding params but the value is the total parameter estimate.
     for model_name, (
         num_layers,
         hidden_size,
@@ -175,6 +222,14 @@ def check_params(model_configs):
 
 
 def save_experiment_configs(configs, output_path, job_ids=None):
+    # [FUNCTION DOC]
+    # Behavior: for each config builds a record (timestamp, run name, node count as GPUs over 8, seq len, mbs, batch
+    # accumulation, global batch in tokens, dp/pp/tp, tp mode, model dims, vocab, zero stage, job id by position) and
+    # appends the records to output_path CSV (concatenating with existing content) or creates it.
+    # Inputs: configs (list of config dicts), output_path (str), job_ids (list aligned with configs, or None).
+    # Outputs: None. Exceptions: KeyError on malformed configs; pandas I/O errors.
+    # Side effects: writes CSV, prints.
+    # KNOWN ISSUE: estimate_num_params is called but its result is discarded.
     """Save core experiment configurations for tracking"""
     records = []
 
@@ -225,6 +280,25 @@ def save_experiment_configs(configs, output_path, job_ids=None):
 
 
 def main():
+    # [FUNCTION DOC]
+    # Behavior: parses CLI (configs/scripts dirs, partition, time, base config/script, pending and benchmark CSV paths,
+    # run, debug, limit as N or start:end slice, profile, use-bash); validates base files and creates output dirs;
+    # enumerates the cartesian product of PARALLEL_CONFIGS, model configs, sequence lengths, micro batch sizes,
+    # grad accumulation, vocab sizes, zero stages and TP modes, skipping combinations outside the node range, dp 1 with
+    # zero 1, batch accumulation below pp minus 1, and too-deep pp for 1B; deduplicates and revalidates; applies debug
+    # and limit slicing; loads previous results from benchmark/results/bench_final2_mfu2.csv (Success or OOM rows) and
+    # skips runs already benchmarked (always for pp 1, otherwise only when the old job id is at least 14097150); writes
+    # each config YAML and executable SLURM script; with run, submits each via sbatch (collecting job ids) or bash
+    # (requires env SALLOC_JOBID; sets NNODES) and saves the pending CSV; otherwise prints sbatch commands.
+    # Inputs: None (sys.argv). Outputs: None.
+    # Exceptions: FileNotFoundError for missing base files or old results CSV; ValueError when SALLOC_JOBID is missing
+    # in bash mode (not caught, since only CalledProcessError is handled); per-config generation errors are printed.
+    # Side effects: creates directories and files, chmod, launches subprocesses / SLURM jobs, reads environment,
+    # prints.
+    # KNOWN ISSUE: PARALLEL_CONFIGS is a list comprehension that always yields the constant tuple (1, 2, 1), so the
+    # dp/tp/pp loops have no effect; tuples are unpacked as pp, tp, dp.
+    # KNOWN ISSUE: the limit branch for an int is unreachable because limit is always converted to a slice.
+    # KNOWN ISSUE: NNODES uses integer division by 8, giving 0 for runs with fewer than 8 GPUs.
     parser = argparse.ArgumentParser(description="Run scaling benchmarks with different parallelism configurations")
     parser.add_argument(
         "--configs-dir",

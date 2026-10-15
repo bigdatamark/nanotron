@@ -1,9 +1,22 @@
+# [MODULE DOC]
+# Purpose: Utility script for WEKA filesystems: prefetch (warm up) dataset folders to the SSD tier and report how
+# much of each folder is cached. Shells out to the weka CLI.
+# Main contents: parse_input_paths, get_warmup_percentages, warmup_datasets, and a main block that warms up then
+# checks a hard-coded list of dataset folders.
+# Import-time side effects: None.
 import glob
 import subprocess
 from typing import List, Union
 
 
 def parse_input_paths(input_data: Union[str, List[str]]) -> List[str]:
+    # [FUNCTION DOC]
+    # HELPER: normalizes a list or YAML-like dash list string into a list of paths.
+    # Behavior: returns lists unchanged; otherwise splits the string on newlines, strips whitespace and leading or
+    # trailing dash/space characters, drops empty entries.
+    # Inputs: input_data (list of str or str). Outputs: list of str.
+    # Exceptions: ValueError wrapping any parsing error. Side effects: None.
+    # KNOWN ISSUE: stripping dash characters from both ends also removes a trailing dash that belongs to a path.
     """
     Parse input paths from either a list or a YAML-style string.
 
@@ -27,6 +40,13 @@ def parse_input_paths(input_data: Union[str, List[str]]) -> List[str]:
 
 
 def get_warmup_percentages(input_paths: Union[str, List[str]]) -> dict:
+    # [FUNCTION DOC]
+    # Behavior: for each folder, globs its direct children, runs weka fs tier location on all of them with raw units
+    # and path,size,ssdRead output, sums the size and cached columns of lines with at least 5 fields, and records the
+    # cached percentage rounded to 2 decimals (0.0 when empty, -1 when the command fails).
+    # Inputs: input_paths (list or YAML-style string). Outputs: dict folder path to percentage.
+    # Exceptions: ValueError from parsing; other subprocess errors (for example missing weka binary) propagate.
+    # Side effects: runs subprocesses, prints.
     """
     Calculate the warm-up percentage for each folder by checking all files within.
 
@@ -95,6 +115,12 @@ def get_warmup_percentages(input_paths: Union[str, List[str]]) -> dict:
 
 
 def warmup_datasets(input_paths: Union[str, List[str]]) -> None:
+    # [FUNCTION DOC]
+    # Behavior: for each folder runs a shell pipeline that finds all files (following symlinks) and fetches them with
+    # weka fs tier fetch in batches of 512 with 64 parallel workers; failures are printed and skipped.
+    # Inputs: input_paths (list or YAML-style string). Outputs: None.
+    # Exceptions: ValueError from parsing. Side effects: shell subprocesses (paths are not quoted), filesystem tier
+    # fetch, prints.
     """
     Warm up datasets by fetching all files in the given folders.
     Uses find and xargs to parallelize the fetching.

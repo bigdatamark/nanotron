@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Purpose: Entry-point script to train the LlaMoE example model with nanotron's DistributedTrainer.
+# Main contents: get_args and a main block that builds the trainer with LlaMoEConfig / LlaMoEForTraining, gets a
+# dataloader from the repo-root run_train.get_dataloader, and trains.
+# Import-time side effects: appends the repository root (two levels up) to sys.path so run_train can be imported;
+# imports the local config_llamoe and llamoe modules (must be run from or with examples/moe on the path).
+# Creates a module logger.
 """
 
 You can run using command:
@@ -22,6 +29,10 @@ logger = logging.get_logger(__name__)
 
 
 def get_args():
+    # [FUNCTION DOC]
+    # Behavior: parses command-line arguments: required config-file path (YAML or python config) and optional job-id.
+    # Inputs: None (reads sys.argv). Outputs: argparse Namespace.
+    # Exceptions: SystemExit from argparse on bad arguments. Side effects: may print usage.
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-file", type=str, required=True, help="Path to the YAML or python config file")
     parser.add_argument("--job-id", type=str, help="Optional job name")

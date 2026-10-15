@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Purpose: Main nanotron training entry point (launch with torchrun). Builds a DistributedTrainer from a config
+# file, builds the dataloader for the current data stage, and trains.
+# Main contents: get_dataloader_from_data_stage (dataloader for one stage: dummy, HF datasets pretrain/SFT, or
+# TokenizedBytes/Nanoset folders), get_dataloader (stage selection and resume bookkeeping), get_args, main block.
+# Also imported by other scripts (for example examples/moe/train_moe.py) for get_dataloader.
+# Import-time side effects: tries to import huggingface_hub and transformers; on ImportError version variables are
+# None. Creates a module logger.
+# KNOWN ISSUE: on ImportError AutoTokenizer is never defined (only the version names are set to None), so the HF
+# and TokenizedBytes paths fail with NameError instead of a clear message.
 """
 Nanotron training script.
 
@@ -67,6 +77,28 @@ def get_dataloader_from_data_stage(
     num_remaining_train_steps: int,
     sanity_check_dataloader_interval: Optional[int] = None,
 ):
+    # [FUNCTION DOC]
+    # Behavior:
+    # 1. Assert non-negative consumed samples and remaining steps; find the input and output pipeline ranks of the model.
+    # 2. No dataset configured: infinite dummy random-token generator (position ids for Qwen2 models, CP group aware).
+    # 3. PretrainDatasetsArgs or SFTDatasetsArgs: inside main_rank_first on the world group (rank 0 processes and
+    #    caches first), load the HF train split, load the tokenizer with left padding, assert it has bos or eos and its
+    #    vocab fits the model; SFT goes through prepare_sft_dataset (optional debug_max_samples), pretraining through
+    #    clm_process; then build the train dataloader (drop last, sequence separator tokens for position ids) and
+    #    assert the dataset has enough tokens for the remaining steps times global batch size times sequence length.
+    # 4. NanosetDatasetsArgs: load tokenizer, assert its full length equals the model vocab size, default pad token to
+    #    eos, build TokenizedBytes datasets (with consumed sample/token offsets for resume and previous-stage token
+    #    offsets) and the matching dataloader (pin memory, doc masking per model config), log elapsed time, barrier.
+    # 5. Otherwise raise ValueError.
+    # 6. Optionally run sanity_check_dataloader.
+    # Inputs: trainer (DistributedTrainer), data (DataArgs for the stage), consumed_train_samples_stage (int, samples
+    # already consumed in this stage), consumed_tokens_per_dataset_folder (dict folder to tokens for this stage),
+    # last_stages_consumed_tokens_per_dataset_folder (dict folder to tokens from earlier stages),
+    # num_remaining_train_steps (int), sanity_check_dataloader_interval (int or None).
+    # Outputs: a dataloader or iterator of micro-batches.
+    # Exceptions: AssertionError on the checks above; ValueError on an unknown dataset type.
+    # Side effects: logging, dataset download/caching to disk, barriers / collective synchronization.
+    # KNOWN ISSUE: assertion messages say "greater than 0" while the checks allow zero.
     """
     Returns a dataloader for a given data stage.
 
@@ -312,6 +344,21 @@ def get_dataloader_from_data_stage(
 def get_dataloader(
     trainer: DistributedTrainer, sanity_check_dataloader_interval: Optional[int] = None
 ) -> Dict[str, DataLoader]:
+    # [FUNCTION DOC]
+    # Behavior: logs the training plan, always selects the LAST configured data stage. If the next step equals that
+    # stage's start step, a new DataStageMetadata (zero consumed) is appended to trainer metadata when missing; if
+    # metadata has fewer stages than config otherwise, raises ValueError. Reads consumed samples/tokens of the stage,
+    # computes remaining steps, logs them, raises NotImplementedError if the stage sequence length differs from the
+    # last metadata stage, else sums consumed tokens per folder over all previous metadata stages. Builds the stage
+    # dataloader and returns it keyed by stage name.
+    # Inputs: trainer (DistributedTrainer), sanity_check_dataloader_interval (int or None).
+    # Outputs: dictionary mapping stage name to dataloader.
+    # Exceptions: ValueError (stage start misconfigured), NotImplementedError (sequence length change), plus those of
+    # get_dataloader_from_data_stage.
+    # Side effects: may append to trainer.metadata.data_stages; logging.
+    # KNOWN ISSUE: the code after raise NotImplementedError in the sequence-length branch is unreachable dead code.
+    # KNOWN ISSUE: current_stage is taken from the same metadata list as the last metadata stage, so the sequence
+    # length comparison is typically comparing a stage with itself.
     dataloaders = {}
 
     # Print training plan
@@ -392,6 +439,9 @@ def get_dataloader(
 
 
 def get_args():
+    # [FUNCTION DOC]
+    # Behavior: parses required config-file and optional sanity-check-dataloader-interval (int, default None).
+    # Inputs: None (sys.argv). Outputs: argparse Namespace. Exceptions: SystemExit on bad args. Side effects: None.
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-file", type=str, required=True, help="Path to the YAML or python config file")
     parser.add_argument(
