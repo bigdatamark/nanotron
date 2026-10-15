@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Purpose: round-trip tests for nanotron.serialize: saving/loading model weights, optimizer states (NamedOptimizer, ZeroDistributedOptimizer, OptimizerFromGradientAccumulator with FP32 grad accumulator), random states, and TensorMetadata string serialization, across all 3D (tp, dp, pp) layouts fitting in up to 4 GPUs.
+# Main contents: pytest entries each launching an underscore-prefixed per-rank body via init_distributed with a TestContext providing an auto-removed temp directory.
+# Import-time side effects: Calls available_gpus() and get_all_3d_configurations during parametrization.
+# Shared training pattern (used by several bodies below): builds the dummy model, pulls a minibatch from dummy_infinite_data_loader 3 times, runs AllForwardAllBackwardPipelineEngine.train_batch_iter with one microbatch, syncs tied gradients, then optimizer step and zero_grad.
 import pytest
 import torch
 from helpers.context import TestContext
@@ -37,6 +42,10 @@ from torch.nn.parallel import DistributedDataParallel
 
 
 def test_save_and_load_with_changed_topolgy():
+    # [FUNCTION DOC]
+    # Summary: Placeholder for a topology-change save/load test; returns immediately.
+    # Inputs: None. Outputs: None. Exceptions: None. Side effects: None.
+    # KNOWN ISSUE: Test body is empty (always passes); name also misspells "topology".
     # TODO @thomasw21: We want to be able to support a change of topology mechanism
     return
 
@@ -51,12 +60,22 @@ def test_save_and_load_with_changed_topolgy():
 )
 @rerun_if_address_is_in_use()
 def test_save_and_load_model(tp: int, dp: int, pp: int):
+    # [FUNCTION DOC]
+    # Summary: Pytest entry over all 3D configs; launches _test_save_and_load_model with a fresh TestContext.
+    # Inputs: tp, dp, pp - ints. Outputs: None. Exceptions: Propagates worker failures. Side effects: Spawns processes; temp dirs.
     test_context = TestContext()
     # We use DP=2 as we're interested in testing that one
     init_distributed(tp=tp, dp=dp, pp=pp)(_test_save_and_load_model)(test_context=test_context)
 
 
 def _test_save_and_load_model(parallel_context: ParallelContext, test_context: TestContext):
+    # [FUNCTION DOC]
+    # HELPER: per-rank body of test_save_and_load_model.
+    # Behavior: Saves a dummy model's weights to a temp folder, builds a new dummy model and asserts its state dict differs (unless empty on this rank), loads the weights into it and asserts state dicts are exactly equal. Destroys the context.
+    # Inputs: parallel_context; test_context - TestContext.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: Writes/reads checkpoint files; collectives inside save/load; destroys process groups.
     model = init_dummy_model(parallel_context=parallel_context)
     store_folder = test_context.get_auto_remove_tmp_dir()
 
@@ -93,6 +112,9 @@ def _test_save_and_load_model(parallel_context: ParallelContext, test_context: T
 )
 @rerun_if_address_is_in_use()
 def test_save_and_load_optimizer(tp: int, dp: int, pp: int):
+    # [FUNCTION DOC]
+    # Summary: Pytest entry over all 3D configs; skips pp greater than 1; launches _test_save_and_load_optimizer.
+    # Inputs: tp, dp, pp - ints. Outputs: None. Exceptions: pytest skip; propagates worker failures. Side effects: Spawns processes.
     test_context = TestContext()
     if pp > 1:
         pytest.skip("Pipeline parallelism not supported for this test yet")
@@ -100,6 +122,13 @@ def test_save_and_load_optimizer(tp: int, dp: int, pp: int):
 
 
 def _test_save_and_load_optimizer(parallel_context: ParallelContext, test_context: TestContext):
+    # [FUNCTION DOC]
+    # HELPER: per-rank body of test_save_and_load_optimizer.
+    # Behavior: Trains a dummy model 3 steps with a NamedOptimizer over AdamW (shared pattern), saves the optimizer, barriers, builds a fresh optimizer and asserts it differs (if state non-empty), loads and asserts exact equality. Then loads into another fresh optimizer with map_location cpu and asserts every tensor state value equals the GPU value, is on CPU (except the step key) while the original is on CUDA, and non-tensor values are equal.
+    # Inputs: parallel_context; test_context.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: Checkpoint file I/O; world barrier; destroys process groups.
     store_folder = test_context.get_auto_remove_tmp_dir()
     model = init_dummy_model(parallel_context=parallel_context)
     optimizer = NamedOptimizer(
@@ -189,12 +218,22 @@ def _test_save_and_load_optimizer(parallel_context: ParallelContext, test_contex
 )
 @rerun_if_address_is_in_use()
 def test_save_zero_optimizer_and_load_optimizer(tp: int, dp: int, pp: int):
+    # [FUNCTION DOC]
+    # Summary: Pytest entry over all 3D configs; launches _test_save_zero_optimizer_and_load_optimizer.
+    # Inputs: tp, dp, pp - ints. Outputs: None. Exceptions: Propagates worker failures. Side effects: Spawns processes.
     test_context = TestContext()
     # We use DP=2 as we're interested in testing that one
     init_distributed(tp=tp, dp=dp, pp=pp)(_test_save_zero_optimizer_and_load_optimizer)(test_context=test_context)
 
 
 def _test_save_zero_optimizer_and_load_optimizer(parallel_context: ParallelContext, test_context: TestContext):
+    # [FUNCTION DOC]
+    # HELPER: per-rank body of test_save_zero_optimizer_and_load_optimizer.
+    # Behavior: Same as the NamedOptimizer round trip but with a ZeroDistributedOptimizer sharded over dp_pg for both the saved and the reloaded optimizer; asserts the reloaded state dict exactly equals the original.
+    # Inputs: parallel_context; test_context.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: Checkpoint I/O; barrier; destroys process groups.
     store_folder = test_context.get_auto_remove_tmp_dir()
     model = init_dummy_model(parallel_context=parallel_context)
     optimizer = ZeroDistributedOptimizer(
@@ -263,6 +302,9 @@ def _test_save_zero_optimizer_and_load_optimizer(parallel_context: ParallelConte
 )
 @rerun_if_address_is_in_use()
 def test_save_zero_optimizer_and_load_data_parallel_optimizer(tp: int, dp: int, pp: int):
+    # [FUNCTION DOC]
+    # Summary: Skipped pytest entry (zero and non-zero formats differ); would launch _test_save_zero_optimizer_and_load_data_parallel_optimizer.
+    # Inputs: tp, dp, pp - ints. Outputs: None. Exceptions: Propagates worker failures. Side effects: Spawns processes.
     test_context = TestContext()
     # We use DP=2 as we're interested in testing that one
     init_distributed(tp=tp, dp=dp, pp=pp)(_test_save_zero_optimizer_and_load_data_parallel_optimizer)(
@@ -273,6 +315,14 @@ def test_save_zero_optimizer_and_load_data_parallel_optimizer(tp: int, dp: int, 
 def _test_save_zero_optimizer_and_load_data_parallel_optimizer(
     parallel_context: ParallelContext, test_context: TestContext
 ):
+    # [FUNCTION DOC]
+    # HELPER: per-rank body for saving a ZeRO optimizer and loading into a plain NamedOptimizer.
+    # Behavior: Trains with ZeroDistributedOptimizer, saves, builds a NamedOptimizer, asserts it differs, loads the checkpoint into it; no post-load comparison is made.
+    # Inputs: parallel_context; test_context.
+    # Outputs: None.
+    # Exceptions: AssertionError if the fresh optimizer matches; load errors propagate.
+    # Side effects: Checkpoint I/O; barrier; destroys process groups.
+    # KNOWN ISSUE: No assertion after loading (TODO), so the test cannot detect incorrect loading.
     store_folder = test_context.get_auto_remove_tmp_dir()
     model = init_dummy_model(parallel_context=parallel_context)
     optimizer = ZeroDistributedOptimizer(
@@ -334,6 +384,9 @@ def _test_save_zero_optimizer_and_load_data_parallel_optimizer(
 )
 @rerun_if_address_is_in_use()
 def test_save_data_parallel_optimizer_and_load_zero_optimizer(tp: int, dp: int, pp: int):
+    # [FUNCTION DOC]
+    # Summary: Skipped pytest entry; would launch _test_save_data_parallel_optimizer_and_load_zero_optimizer.
+    # Inputs: tp, dp, pp - ints. Outputs: None. Exceptions: Propagates worker failures. Side effects: Spawns processes.
     test_context = TestContext()
     # We use DP=2 as we're interested in testing that one
     init_distributed(tp=tp, dp=dp, pp=pp)(_test_save_data_parallel_optimizer_and_load_zero_optimizer)(
@@ -344,6 +397,14 @@ def test_save_data_parallel_optimizer_and_load_zero_optimizer(tp: int, dp: int, 
 def _test_save_data_parallel_optimizer_and_load_zero_optimizer(
     parallel_context: ParallelContext, test_context: TestContext
 ):
+    # [FUNCTION DOC]
+    # HELPER: per-rank body for saving a plain NamedOptimizer and loading into a ZeRO optimizer.
+    # Behavior: Trains 3 steps with NamedOptimizer (without tied-gradient sync), saves, builds a ZeroDistributedOptimizer, asserts it differs, and loads; no post-load comparison.
+    # Inputs: parallel_context; test_context.
+    # Outputs: None.
+    # Exceptions: AssertionError if the fresh optimizer matches; load errors propagate.
+    # Side effects: Checkpoint I/O; barrier; destroys process groups.
+    # KNOWN ISSUE: No assertion after loading (TODO), and unlike the other bodies tied gradients are not synced during training.
     store_folder = test_context.get_auto_remove_tmp_dir()
     model = init_dummy_model(parallel_context=parallel_context)
     optimizer = NamedOptimizer(
@@ -401,6 +462,9 @@ def _test_save_data_parallel_optimizer_and_load_zero_optimizer(
 )
 @rerun_if_address_is_in_use()
 def test_save_optimizer_with_additional_state_dict_keys(tp: int, dp: int, pp: int):
+    # [FUNCTION DOC]
+    # Summary: Pytest entry over all 3D configs; launches _test_save_optimizer_with_additional_state_dict_keys.
+    # Inputs: tp, dp, pp - ints. Outputs: None. Exceptions: Propagates worker failures. Side effects: Spawns processes.
     test_context = TestContext()
     # We use DP=2 as we're interested in testing that one
     init_distributed(tp=tp, dp=dp, pp=pp)(_test_save_optimizer_with_additional_state_dict_keys)(
@@ -409,6 +473,13 @@ def test_save_optimizer_with_additional_state_dict_keys(tp: int, dp: int, pp: in
 
 
 def _test_save_optimizer_with_additional_state_dict_keys(parallel_context: ParallelContext, test_context: TestContext):
+    # [FUNCTION DOC]
+    # HELPER: per-rank body of test_save_optimizer_with_additional_state_dict_keys.
+    # Behavior: Builds a float16 dummy model (unwrapping DDP if present) and an OptimizerFromGradientAccumulator with an FP32GradientAccumulator and inner NamedOptimizer/AdamW; asserts it reports additional state dict keys. Trains 3 steps passing the grad accumulator to the engine and tied-grad sync. Saves, builds a fresh equivalent optimizer, asserts it differs when state is non-empty, loads, and asserts the "state" section, the full state dict, and the grad accumulator's per-parameter buffers dictionaries are all exactly equal.
+    # Inputs: parallel_context; test_context.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: Checkpoint I/O; barrier; destroys process groups.
     dtype = torch.float16
     store_folder = test_context.get_auto_remove_tmp_dir()
     model = init_dummy_model(parallel_context=parallel_context, dtype=dtype)
@@ -509,12 +580,23 @@ def _test_save_optimizer_with_additional_state_dict_keys(parallel_context: Paral
 @pytest.mark.skipif(available_gpus() < 2, reason="Testing test_save_and_load_random_states requires at least 2 gpus")
 @rerun_if_address_is_in_use()
 def test_save_and_load_random_states():
+    # [FUNCTION DOC]
+    # Summary: Pytest entry (needs at least 2 GPUs) with tp=2; launches _test_save_and_load_random_states.
+    # Inputs: None. Outputs: None. Exceptions: Propagates worker failures. Side effects: Spawns 2 processes.
+    # KNOWN ISSUE: The comment says DP=2 but the test uses tp=2.
     test_context = TestContext()
     # We use DP=2 as we're interested in testing
     init_distributed(tp=2, dp=1, pp=1)(_test_save_and_load_random_states)(test_context=test_context)
 
 
 def _test_save_and_load_random_states(parallel_context: ParallelContext, test_context: TestContext):
+    # [FUNCTION DOC]
+    # HELPER: per-rank body of test_save_and_load_random_states.
+    # Behavior: Picks the first group of size 2, builds RandomStates with one state synced over that group and one rank-local state, broadcasts rank 0's RandomStates and asserts other ranks differ. Saves random states, loads them back and asserts each rank recovered its own states exactly.
+    # Inputs: parallel_context; test_context.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch; StopIteration if no group of size 2.
+    # Side effects: Broadcast collective; checkpoint I/O; destroys process groups.
     pg = next(
         (pg for pg in [parallel_context.tp_pg, parallel_context.dp_pg, parallel_context.pp_pg] if pg.size() == 2)
     )
@@ -549,11 +631,21 @@ def _test_save_and_load_random_states(parallel_context: ParallelContext, test_co
 
 @rerun_if_address_is_in_use()
 def test_serialize_deserialize_tensormetadata():
+    # [FUNCTION DOC]
+    # Summary: Pytest entry with tp=2; launches _test_serialize_deserialize_tensormetadata.
+    # Inputs: None. Outputs: None. Exceptions: Propagates worker failures. Side effects: Spawns 2 processes.
     test_context = TestContext()
     init_distributed(tp=2, dp=1, pp=1)(_test_serialize_deserialize_tensormetadata)(test_context=test_context)
 
 
 def _test_serialize_deserialize_tensormetadata(parallel_context: ParallelContext, test_context: TestContext):
+    # [FUNCTION DOC]
+    # HELPER: per-rank body of test_serialize_deserialize_tensormetadata.
+    # Behavior: Creates a 16x64 CPU parameter, shards it over the TP group along dim 0 with contiguous chunks of 8 and 8, builds TensorMetadata from its sharded info and the current CHECKPOINT_VERSION, converts it to a string dictionary (asserting all keys and values are strings), parses it back and asserts equality with the original.
+    # Inputs: parallel_context; test_context.
+    # Outputs: None.
+    # Exceptions: AssertionError on failure.
+    # Side effects: RNG use; destroys process groups.
     param = torch.nn.Parameter(torch.randn(16, 64))
     split_config = SplitConfig(
         split_dim=0,

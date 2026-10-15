@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Purpose: correctness tests for nanotron tensor-parallel layers (TensorParallelColumnLinear, TensorParallelRowLinear, TensorParallelEmbedding) against unsharded torch reference modules, comparing forward outputs and gradients in ALL_REDUCE and REDUCE_SCATTER modes.
+# Main contents: three pytest entries parametrized over tp sizes 1..min(4, available GPUs) and modes, each launching an underscore-prefixed per-rank body.
+# Import-time side effects: Calls available_gpus() during parametrization.
 import os
 
 import pytest
@@ -28,6 +32,12 @@ def test_column_linear(
     async_communication: bool,
     tp_recompute_allgather: bool,
 ):
+    # [FUNCTION DOC]
+    # Summary: Pytest entry for column linear, parametrized over tp size, tp_mode, async_communication and tp_recompute_allgather. Skips ALL_REDUCE combined with async communication or with recompute allgather; otherwise launches _test_column_linear.
+    # Inputs: tp, dp, pp - ints; tp_mode - TensorParallelLinearMode; async_communication, tp_recompute_allgather - bools.
+    # Outputs: None.
+    # Exceptions: pytest skip; propagates worker failures.
+    # Side effects: Spawns tp processes.
     if tp_mode is TensorParallelLinearMode.ALL_REDUCE and async_communication:
         pytest.skip("ALL_REDUCE mode does not support async communication")
     if tp_mode is TensorParallelLinearMode.ALL_REDUCE and tp_recompute_allgather:
@@ -43,6 +53,14 @@ def _test_column_linear(
     async_communication: bool,
     tp_recompute_allgather: bool,
 ):
+    # [FUNCTION DOC]
+    # HELPER: per-rank body of test_column_linear.
+    # Behavior: If async, sets CUDA_DEVICE_MAX_CONNECTIONS to 1. Builds a column linear with in_features 2 and 3 output features per rank, plus a reference torch Linear with the full output size; all-gathers the sharded weight and bias into the reference's row chunks. Input: ALL_REDUCE uses a batch of 5 averaged across TP (identical on all ranks); REDUCE_SCATTER uses a local batch of 5 all-gathered into the full reference batch (unless tp is 1). Clones the sharded input, enables grads, runs both modules and asserts the sharded output equals this rank's slice of reference output columns (printing FAIL and barrier before re-raising on mismatch, SUCCESS plus barrier otherwise). Backpropagates sums and asserts weight/bias grads match the reference slices and that input grads match (whole input for ALL_REDUCE, this rank's batch slice for REDUCE_SCATTER). Destroys the context.
+    # Inputs: parallel_context; tp_mode; async_communication; tp_recompute_allgather.
+    # Outputs: None.
+    # Exceptions: AssertionError from torch.testing.assert_close (re-raised after barrier).
+    # Side effects: Sets an environment variable; all_gather / all_reduce / barrier collectives on TP group; prints; destroys process groups.
+    # KNOWN ISSUE: In the unsupported-mode else branches the ValueError is constructed but never raised, so an unknown mode would silently continue (and later fail with an unbound variable).
     if async_communication:
         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
     in_features = 2
@@ -174,6 +192,12 @@ def test_row_linear(
     async_communication: bool,
     tp_recompute_allgather: bool,
 ):
+    # [FUNCTION DOC]
+    # Summary: Pytest entry for row linear with the same parametrization and skip rules as test_column_linear; launches _test_row_linear.
+    # Inputs: tp, dp, pp - ints; tp_mode; async_communication, tp_recompute_allgather - bools.
+    # Outputs: None.
+    # Exceptions: pytest skip; propagates worker failures.
+    # Side effects: Spawns tp processes.
     if tp_mode is TensorParallelLinearMode.ALL_REDUCE and async_communication:
         pytest.skip("ALL_REDUCE mode does not support async communication")
     if tp_mode is TensorParallelLinearMode.ALL_REDUCE and tp_recompute_allgather:
@@ -190,6 +214,14 @@ def _test_row_linear(
     async_communication: bool,
     tp_recompute_allgather: bool,
 ):
+    # [FUNCTION DOC]
+    # HELPER: per-rank body of test_row_linear.
+    # Behavior: If async, sets CUDA_DEVICE_MAX_CONNECTIONS to 1. Builds a row linear with 2 input features per rank and 3 outputs and a reference Linear over the full input. Sums the reference weight across TP (so all ranks agree), copies this rank's column slice into the sharded weight; rank 0 copies the reference bias into its bias and the reference bias is broadcast from TP rank 0. Batch size is 5 (ALL_REDUCE) or 5 times tp (REDUCE_SCATTER), other modes raise ValueError. Builds an input averaged across TP, feeds this rank's column slice to the sharded layer and the full input to the reference. Expected output is the full reference output (ALL_REDUCE) or this rank's batch slice (REDUCE_SCATTER). Asserts outputs match, then after backward asserts weight grad equals the reference column slice, bias grad matches on rank 0 (other ranks must have no bias), and the input grad matches the reference input grad column slice. Destroys the context.
+    # Inputs: parallel_context; tp_mode; async_communication; tp_recompute_allgather.
+    # Outputs: None.
+    # Exceptions: ValueError for unsupported mode; AssertionError on mismatches.
+    # Side effects: Environment variable; all_reduce and broadcast collectives on TP group; destroys process groups.
+    # KNOWN ISSUE: tp_recompute_allgather is accepted but never passed to TensorParallelRowLinear, so that parametrization has no effect.
     if async_communication:
         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
     out_features = 3
@@ -314,10 +346,24 @@ def _test_row_linear(
 @pytest.mark.parametrize("tp_mode", list(TensorParallelLinearMode))
 @rerun_if_address_is_in_use()
 def test_tensor_parallel_embedding(tp: int, dp: int, pp: int, tp_mode: TensorParallelLinearMode):
+    # [FUNCTION DOC]
+    # Summary: Pytest entry for the tensor-parallel embedding, parametrized over tp size and mode; launches _test_tensor_parallel_embedding.
+    # Inputs: tp, dp, pp - ints; tp_mode - TensorParallelLinearMode.
+    # Outputs: None.
+    # Exceptions: Propagates worker failures.
+    # Side effects: Spawns tp processes.
     init_distributed(tp=tp, dp=dp, pp=pp)(_test_tensor_parallel_embedding)(tp_mode=tp_mode)
 
 
 def _test_tensor_parallel_embedding(parallel_context: ParallelContext, tp_mode: TensorParallelLinearMode):
+    # [FUNCTION DOC]
+    # HELPER: per-rank body of test_tensor_parallel_embedding.
+    # Behavior: Builds a vocabulary-sharded embedding with 100 rows per rank and dim 3 and a full reference embedding; sums the reference weight across TP and copies this rank's row block into the sharded weight. Batch size is 5 or 5 times tp depending on mode (others raise ValueError). Draws random token ids, averages them across TP, runs both embeddings and asserts exact equality with the full (ALL_REDUCE) or batch-sliced (REDUCE_SCATTER) reference output. Backpropagates the outputs weighted by position index and asserts the sharded weight grad exactly equals the reference grad's row block. Destroys the context.
+    # Inputs: parallel_context; tp_mode.
+    # Outputs: None.
+    # Exceptions: ValueError for unsupported mode; AssertionError on mismatch.
+    # Side effects: all_reduce collectives on TP group; RNG use; destroys process groups.
+    # KNOWN ISSUE: Averaging integer token ids with an AVG all-reduce relies on integer AVG support by the backend; ids differ per rank before averaging, so this is a fragile way to synchronize inputs (broadcast would be clearer).
     num_embeddings_per_rank = 100
     embedding_dim = 3
     num_embeddings = parallel_context.tp_pg.size() * num_embeddings_per_rank

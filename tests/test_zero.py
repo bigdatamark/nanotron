@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Purpose: tests for nanotron's ZeRO-1 optimizer (ZeroDistributedOptimizer wrapping NamedOptimizer/AdamW) and the SlicedFlatTensor view type: sharded optimizer behaviour must exactly match a non-sharded AdamW reference across data parallelism, with and without tensor parallelism.
+# Main contents: test_zero_optimizer, test_zero_optimizer_with_tp, test_sliced_flat_tensor and their per-rank bodies.
+# Import-time side effects: Calls available_gpus() during parametrization.
 import os
 
 import pytest
@@ -25,10 +29,20 @@ from torch.nn.parallel import DistributedDataParallel
 @pytest.mark.parametrize("tp,dp,pp", [pytest.param(1, i, 1) for i in range(1, min(4, available_gpus()) + 1)])
 @rerun_if_address_is_in_use()
 def test_zero_optimizer(tp: int, dp: int, pp: int):
+    # [FUNCTION DOC]
+    # Summary: Pytest entry parametrized over dp from 1 to min(4, GPUs) with tp=pp=1; launches _test_zero_optimizer.
+    # Inputs: tp, dp, pp - ints. Outputs: None. Exceptions: Propagates worker failures. Side effects: Spawns dp processes.
     init_distributed(pp=pp, dp=dp, tp=tp)(_test_zero_optimizer)()
 
 
 def _test_zero_optimizer(parallel_context: ParallelContext):
+    # [FUNCTION DOC]
+    # HELPER: per-rank body of test_zero_optimizer.
+    # Behavior: Builds a dummy model with a ZeRO optimizer (AdamW inside NamedOptimizer, sharded over dp_pg) and an identical reference model with plain AdamW, copying reference weights into the model. Pre-draws 3 batches from the dummy infinite loader. For each step: snapshots params, runs AllForwardAllBackwardPipelineEngine.train_batch_iter (1 microbatch) on both models and asserts losses are exactly equal; syncs tied gradients and DP gradients (AVG) for non-DDP models; asserts grads are equal across DP and exactly equal to the reference. Asserts the optimizer has one param group whose params are this rank's flat slices (by param_name_to_dp_rank_offsets) sharing storage with both the param and its grad. Steps and zeroes both optimizers, asserts params synced across DP, all grads cleared, params close to the reference, params changed from the snapshot, and the exp_avg/exp_avg_sq state equals the corresponding slice of the reference state. Destroys the context.
+    # Inputs: parallel_context - ParallelContext.
+    # Outputs: None.
+    # Exceptions: AssertionError on any mismatch.
+    # Side effects: Collectives over pp/dp groups; mutates model params and optimizer state; destroys process groups.
     model = init_dummy_model(parallel_context=parallel_context)
     optimizer = ZeroDistributedOptimizer(
         named_params_or_groups=model.named_parameters(),
@@ -205,6 +219,12 @@ def _test_zero_optimizer(parallel_context: ParallelContext):
 def test_zero_optimizer_with_tp(
     tp: int, dp: int, pp: int, tp_mode: TensorParallelLinearMode, async_communication: bool
 ):
+    # [FUNCTION DOC]
+    # Summary: Pytest entry with tp=2 and dp from 1 to GPUs/2, parametrized over tp_mode and async_communication; skips ALL_REDUCE with async; launches _test_zero_optimizer_with_tp.
+    # Inputs: tp, dp, pp - ints; tp_mode - TensorParallelLinearMode; async_communication - bool.
+    # Outputs: None.
+    # Exceptions: pytest skip; propagates worker failures.
+    # Side effects: Spawns tp*dp processes.
     if tp_mode is TensorParallelLinearMode.ALL_REDUCE and async_communication:
         pytest.skip("ALL_REDUCE mode does not support async communication")
     init_distributed(pp=pp, dp=dp, tp=tp)(_test_zero_optimizer_with_tp)(
@@ -215,6 +235,13 @@ def test_zero_optimizer_with_tp(
 def _test_zero_optimizer_with_tp(
     parallel_context: ParallelContext, tp_mode: TensorParallelLinearMode, async_communication: bool
 ):
+    # [FUNCTION DOC]
+    # HELPER: per-rank body of test_zero_optimizer_with_tp.
+    # Behavior: If async, sets CUDA_DEVICE_MAX_CONNECTIONS to 1. Model is column linear (5 to tp size) then sigmoid then row linear (tp size to 3), wrapped in a ZeRO optimizer; builds the inverse of the inner optimizer's id-to-name map. Reference is the equivalent torch Sequential with parameters converted to NanotronParameter and plain AdamW; reference params are averaged over the world group and copied into the model (sharded params via their local/global slice pairs). Generates 3 batches with a TP-synced RNG state (batch 2 times tp for REDUCE_SCATTER, else 7; TensorPointer on non-first pp ranks). Each step: runs the model on this rank's batch slice (REDUCE_SCATTER) or full batch, the reference on the full batch; backprops sums; compares outputs (sliced for REDUCE_SCATTER); syncs tied and DP gradients; checks DP equality and reference equality of grads (shard-aware); for params owned by this DP rank checks the optimizer's sliced params/grads share storage and match; steps both optimizers and checks DP sync, cleared grads, reference equality, that params changed, that the state dict carries a bijective "names" map, and that exp_avg/exp_avg_sq match the reference slices (assuming contiguous shards). Destroys the context.
+    # Inputs: parallel_context; tp_mode; async_communication.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: Environment variable; collectives over world/tp/dp groups; RNG state branching; destroys process groups.
     if async_communication:
         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
 
@@ -504,10 +531,20 @@ def _test_zero_optimizer_with_tp(
 
 @rerun_if_address_is_in_use()
 def test_sliced_flat_tensor():
+    # [FUNCTION DOC]
+    # Summary: Pytest entry; runs _test_sliced_flat_tensor on a single process.
+    # Inputs: None. Outputs: None. Exceptions: Propagates worker failures. Side effects: Spawns a process.
     init_distributed(1, 1, 1)(_test_sliced_flat_tensor)()
 
 
 def _test_sliced_flat_tensor(parallel_context: ParallelContext):
+    # [FUNCTION DOC]
+    # HELPER: per-rank body of test_sliced_flat_tensor.
+    # Behavior: Creates a 2x3 tensor with a grad and a SlicedFlatTensor over flat offsets 1 to 5. Asserts the slice's grad is the corresponding flat slice of the base grad, that clearing the base grad clears the slice grad and vice versa, that assigning a new grad tensor or deleting grad on the slice raises NotImplementedError, and that indexing the slice yields a plain tensor rather than a SlicedFlatTensor.
+    # Inputs: parallel_context - ParallelContext.
+    # Outputs: None.
+    # Exceptions: AssertionError on failure.
+    # Side effects: CPU RNG use; destroys process groups.
     a = torch.randn(2, 3, requires_grad=True)
     grad = torch.randn(2, 3)
     a.grad = grad

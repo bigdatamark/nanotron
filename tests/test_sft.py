@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Purpose: tests for supervised fine-tuning (SFT) loss masking in the nanotron Llama model: label_mask must restrict which tokens contribute to the loss, and right-padded input positions must not affect the loss.
+# Main contents: create_sft_dataset (unused dataset builder helper), test_sft_loss_masking / _test_sft_loss_masking, test_right_padding_mask / _test_right_padding_mask, and a __main__ block running both bodies directly.
+# Import-time side effects: None.
 import pytest
 import torch
 import torch.distributed as dist
@@ -11,6 +15,14 @@ from tests.helpers.llama_helper import TINY_LLAMA_CONFIG, create_llama_from_conf
 
 
 def create_sft_dataset(tokenizer, sequence_length=16, num_samples=10):
+    # [FUNCTION DOC]
+    # HELPER: builds a tiny instruction/input/response dataset with response-only label masks.
+    # Behavior: Creates num_samples texts formatted as Instruction/Input/Response sections, tokenizes them padded and truncated to sequence_length. For each text, tokenizes the prefix up to and including the "### Response:" marker (without special tokens) and builds a mask of zeros for prefix tokens followed by ones, truncated to sequence_length; all-zero mask if the marker is missing. Returns a HuggingFace Dataset with input_ids, input_mask (attention mask), label_ids (copy of input_ids) and label_mask.
+    # Inputs: tokenizer - HF tokenizer with padding configured; sequence_length - int, default 16; num_samples - int, default 10.
+    # Outputs: datasets.Dataset.
+    # Exceptions: None explicitly raised.
+    # Side effects: None.
+    # KNOWN ISSUE: Not used by any test in this module. Label ids are not shifted relative to input ids, and the mask marks padding tokens after the response as included in the loss.
     """Create a tiny SFT dataset for testing."""
     instructions = [f"Instruction {i}" for i in range(num_samples)]
     inputs = [f"Input {i}" for i in range(num_samples)]
@@ -60,11 +72,25 @@ def create_sft_dataset(tokenizer, sequence_length=16, num_samples=10):
 @pytest.mark.parametrize("tp,dp,pp", [(1, 1, 1)])  # Simple test with single GPU
 @rerun_if_address_is_in_use()
 def test_sft_loss_masking(tp: int, dp: int, pp: int):
+    # [FUNCTION DOC]
+    # Summary: Pytest entry on a single GPU (tp=dp=pp=1); launches _test_sft_loss_masking via init_distributed.
+    # Inputs: tp, dp, pp - integer parallel sizes.
+    # Outputs: None.
+    # Exceptions: Propagates worker failures.
+    # Side effects: Spawns a distributed process.
     """Test that loss masking works correctly for SFT (only computing loss on response tokens)."""
     init_distributed(tp=tp, dp=dp, pp=pp)(_test_sft_loss_masking)()
 
 
 def _test_sft_loss_masking(parallel_context: ParallelContext):
+    # [FUNCTION DOC]
+    # HELPER: per-rank body of test_sft_loss_masking.
+    # Behavior: Builds and randomly initializes (std 0.02) a tiny Llama on CUDA, loads the gpt2 tokenizer (unused beyond setup). Creates four random batches of length 16 with label masks: all ones, second half ones, all zeros, and only the first token. In eval mode without gradients computes losses for the all, half and single-token cases. On the last pipeline rank, prints them, asserts each is positive, asserts half and single-token losses differ from the full loss, then asserts the all-zero mask yields NaN loss. Destroys the parallel context.
+    # Inputs: parallel_context - ParallelContext.
+    # Outputs: None.
+    # Exceptions: AssertionError on failed checks.
+    # Side effects: Downloads/loads the gpt2 tokenizer; GPU allocation; prints to stdout; consumes RNG; destroys process groups.
+    # KNOWN ISSUE: Comment for case 3 says the zero mask "should raise an error" but the test expects a NaN loss.
     # Setup model config
     model_args = ModelArgs(init_method=RandomInit(std=0.02), model_config=TINY_LLAMA_CONFIG)
     config = get_llama_training_config(model_args)
@@ -160,11 +186,24 @@ def _test_sft_loss_masking(parallel_context: ParallelContext):
 @pytest.mark.parametrize("tp,dp,pp", [(1, 1, 1)])  # Simple test with single GPU
 @rerun_if_address_is_in_use()
 def test_right_padding_mask(tp: int, dp: int, pp: int):
+    # [FUNCTION DOC]
+    # Summary: Pytest entry on a single GPU; launches _test_right_padding_mask via init_distributed.
+    # Inputs: tp, dp, pp - integer parallel sizes.
+    # Outputs: None.
+    # Exceptions: Propagates worker failures.
+    # Side effects: Spawns a distributed process.
     """Test that right padding masking works correctly (changing padded input_ids shouldn't affect loss)."""
     init_distributed(tp=tp, dp=dp, pp=pp)(_test_right_padding_mask)()
 
 
 def _test_right_padding_mask(parallel_context: ParallelContext):
+    # [FUNCTION DOC]
+    # HELPER: per-rank body of test_right_padding_mask.
+    # Behavior: Builds a random tiny Llama on CUDA. Creates a batch of 2 sequences of length 16 with valid lengths 12 and 10, a right-padded boolean input mask, a float label mask equal to it, and labels equal to input ids shifted left by one (last label 123). Runs the model in eval/no-grad on the original inputs and on a copy whose padded input positions are set to 999, and asserts the two losses are close (tolerance 1e-4). Then changes the first token of each sequence to 888 and asserts the loss differs from the original. Destroys the parallel context.
+    # Inputs: parallel_context - ParallelContext.
+    # Outputs: None.
+    # Exceptions: AssertionError from torch.testing.assert_close or the final assert.
+    # Side effects: GPU allocation, prints, RNG consumption, destroys process groups.
     # Setup model config
     model_args = ModelArgs(init_method=RandomInit(std=0.02), model_config=TINY_LLAMA_CONFIG)
     config = get_llama_training_config(model_args)

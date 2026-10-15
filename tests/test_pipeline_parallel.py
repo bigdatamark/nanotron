@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Purpose: tests for nanotron pipeline parallelism: PipelineBlock rank assignment (build_and_set_rank), init_on_device_and_dtype, and the AllForwardAllBackward (AFAB) and OneForwardOneBackward (1F1B) pipeline engines, validated against a full reference model held on pipeline rank 0.
+# Main contents: pytest entries and per-rank bodies for rank building, engine training on a chain model, on a model passing a non-differentiable tensor between stages, plain forward without an engine, and a diamond-shaped (branching) model on 4 ranks.
+# Shared verification pattern: rank 0 builds an unsharded reference model, receives each stage's linear weight/bias via P2P recv_tensors (other ranks send theirs), runs each microbatch through the reference with loss divided by the number of microbatches and backpropagates; pipeline losses are gathered at rank 0 (tensors locally, TensorPointer entries received from the owning rank) and compared with tolerance 1e-6/1e-7; finally every rank asserts its params have grads and stage grads are sent to rank 0 and compared with the reference grads. Microbatch count is pp size plus 5.
+# Import-time side effects: Calls available_gpus() during parametrization; instantiates engine objects for parametrization.
 from typing import Union
 
 import pytest
@@ -22,10 +27,20 @@ from torch.nn import functional as F
 @pytest.mark.skipif(available_gpus() < 2, reason="Testing build_and_set_rank requires at least 2 gpus")
 @rerun_if_address_is_in_use()
 def test_build_and_set_rank():
+    # [FUNCTION DOC]
+    # Summary: Pytest entry (needs 2 GPUs) running _test_build_and_set_rank with pp=2.
+    # Inputs: None. Outputs: None. Exceptions: Propagates worker failures. Side effects: Spawns 2 processes.
     init_distributed(tp=1, dp=1, pp=2)(_test_build_and_set_rank)()
 
 
 def _test_build_and_set_rank(parallel_context: ParallelContext):
+    # [FUNCTION DOC]
+    # HELPER: per-rank body of test_build_and_set_rank.
+    # Behavior: Builds the helper DummyModel with a P2P over pp_pg, asserts it has one stage per pp rank, assigns stage i linear/activation to rank i and the loss to the last rank on CUDA, then asserts the local stage's blocks report the current rank and that only blocks assigned to this rank have a built pp_block attribute.
+    # Inputs: parallel_context - ParallelContext.
+    # Outputs: None.
+    # Exceptions: AssertionError on failure.
+    # Side effects: Allocates modules on CUDA; destroys process groups.
     device = torch.device("cuda")
     p2p = P2P(pg=parallel_context.pp_pg, device=device)
     model = DummyModel(p2p=p2p)
@@ -57,6 +72,9 @@ def _test_build_and_set_rank(parallel_context: ParallelContext):
 
 @pytest.mark.skipif(available_gpus() < 1, reason="Testing test_init_on_device_and_dtype requires at least 1 gpus")
 def test_init_on_device_and_dtype():
+    # [FUNCTION DOC]
+    # Summary: Asserts an nn.Linear created inside init_on_device_and_dtype with CUDA device 0 and bfloat16 has weights of that dtype and device. Requires 1 GPU.
+    # Inputs: None. Outputs: None. Exceptions: AssertionError on failure. Side effects: GPU allocation.
     device = torch.device(type="cuda", index=0)
     with init_on_device_and_dtype(device=device, dtype=torch.bfloat16):
         model = nn.Linear(10, 10)
@@ -72,10 +90,21 @@ def test_init_on_device_and_dtype():
 @pytest.mark.parametrize("pp", list(range(2, min(4, available_gpus()) + 1)))
 @rerun_if_address_is_in_use()
 def test_pipeline_engine(pipeline_engine: PipelineEngine, pp: int):
+    # [FUNCTION DOC]
+    # Summary: Pytest entry (needs 2 GPUs) parametrized over the AFAB and 1F1B engines and pp from 2 to min(4, GPUs); runs _test_pipeline_engine.
+    # Inputs: pipeline_engine - PipelineEngine instance; pp - int.
+    # Outputs: None. Exceptions: Propagates worker failures. Side effects: Spawns pp processes.
     init_distributed(tp=1, dp=1, pp=pp)(_test_pipeline_engine)(pipeline_engine=pipeline_engine)
 
 
 def _test_pipeline_engine(parallel_context: ParallelContext, pipeline_engine: PipelineEngine):
+    # [FUNCTION DOC]
+    # HELPER: per-rank body of test_pipeline_engine.
+    # Behavior: Builds the helper DummyModel with stage i on rank i and loss on the last rank, plus a reference DummyModel fully on rank 0; synchronizes weights to the reference, draws pp+5 microbatches from dummy_infinite_data_loader, runs pipeline_engine.train_batch_iter without a grad accumulator, and applies the shared verification pattern (losses and per-stage gradients versus reference).
+    # Inputs: parallel_context; pipeline_engine.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: P2P send/recv on pp_pg; backward passes; destroys process groups.
     device = torch.device("cuda")
     p2p = P2P(parallel_context.pp_pg, device=device)
     reference_rank = 0
@@ -217,6 +246,9 @@ def _test_pipeline_engine(parallel_context: ParallelContext, pipeline_engine: Pi
 @pytest.mark.parametrize("pp", list(range(2, min(4, available_gpus()) + 1)))
 @rerun_if_address_is_in_use()
 def test_pipeline_engine_with_tensor_that_does_not_require_grad(pipeline_engine: PipelineEngine, pp: int):
+    # [FUNCTION DOC]
+    # Summary: Pytest entry (needs 2 GPUs) over both engines and pp sizes; runs _test_pipeline_engine_with_tensor_that_does_not_require_grad.
+    # Inputs: pipeline_engine; pp - int. Outputs: None. Exceptions: Propagates worker failures. Side effects: Spawns pp processes.
     init_distributed(pp=pp, dp=1, tp=1)(_test_pipeline_engine_with_tensor_that_does_not_require_grad)(
         pipeline_engine=pipeline_engine
     )
@@ -225,21 +257,53 @@ def test_pipeline_engine_with_tensor_that_does_not_require_grad(pipeline_engine:
 def _test_pipeline_engine_with_tensor_that_does_not_require_grad(
     parallel_context: ParallelContext, pipeline_engine: PipelineEngine
 ):
+    # [FUNCTION DOC]
+    # HELPER: per-rank body verifying the engines handle a stage input that does not require grad.
+    # Behavior: Defines a model whose pp+1 stages each take (x, y) and return a differentiable output plus y passed through unchanged; stage i lives on rank i, an extra final stage on the last rank, loss on the last rank. Builds a reference on rank 0, syncs weights following the stage-to-rank map, generates microbatches with random differentiable and non-differentiable tensors on rank 0 (TensorPointer elsewhere), trains with the engine and applies the shared verification pattern using the stage-to-rank map.
+    # Inputs: parallel_context; pipeline_engine.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch, including requires_grad checks inside the model forward.
+    # Side effects: P2P communication; backward passes; destroys process groups.
     def activation(x: torch.Tensor, y: torch.Tensor):
+        # [FUNCTION DOC]
+        # HELPER: activation stage function.
+        # Behavior: Returns a dictionary with output equal to sigmoid of x times y, and y unchanged.
+        # Inputs: x, y - tensors of equal shape.
+        # Outputs: dictionary with keys output and y.
+        # Exceptions: None explicitly raised. Side effects: None.
         return {"output": F.sigmoid(x) * y, "y": y}
 
     class LinearWithDummyInput(nn.Linear):
+        # [CLASS DOC]
+        # HELPER: nn.Linear subclass that forwards an extra tensor untouched.
+        # Purpose: lets a PipelineBlock carry a non-differentiable tensor y alongside the linear output.
+        # Construction: in_features, out_features (bias enabled by default).
         def __init__(self, in_features, out_features):
+            # [FUNCTION DOC]
+            # Behavior: Initializes the parent Linear with the given sizes.
+            # Inputs: in_features, out_features - ints. Outputs: None. Exceptions: None explicitly raised. Side effects: Allocates parameters.
             super().__init__(in_features=in_features, out_features=out_features)
 
         def forward(self, x: torch.Tensor, y: torch.Tensor):
+            # [FUNCTION DOC]
+            # Behavior: Applies the linear layer to x and returns a dictionary with output and y passed through.
+            # Inputs: x - tensor with last dim in_features; y - any tensor.
+            # Outputs: dictionary with keys output and y.
+            # Exceptions: None explicitly raised. Side effects: None.
             return {"output": super().forward(x), "y": y}
 
     class DummyModelPassingNonDifferentiableTensor(nn.Module):
+        # [CLASS DOC]
+        # HELPER: test model that threads a non-differentiable tensor through pipeline stages.
+        # Attributes: p2p - P2P instance; mlp - Sequential of pp size plus 1 ModuleDicts, each with a linear PipelineBlock (LinearWithDummyInput 10 to 10) and an activation PipelineBlock; loss - PipelineBlock summing its input.
+        # Construction: p2p.
         def __init__(
             self,
             p2p: P2P,
         ):
+            # [FUNCTION DOC]
+            # Behavior: Stores p2p and builds the mlp stages and loss block described in the class doc (blocks are not yet assigned to ranks).
+            # Inputs: p2p - P2P. Outputs: None. Exceptions: None explicitly raised. Side effects: None beyond module creation.
             super().__init__()
             self.p2p = p2p
             self.mlp = nn.Sequential(
@@ -279,6 +343,12 @@ def _test_pipeline_engine_with_tensor_that_does_not_require_grad(
             differentiable_tensor: Union[torch.Tensor, TensorPointer],
             non_differentiable_tensor: Union[torch.Tensor, TensorPointer],
         ):
+            # [FUNCTION DOC]
+            # Behavior: For each stage, runs linear then activation passing both tensors, asserting when local that the differentiable tensor requires grad and the other does not; then applies the loss block.
+            # Inputs: differentiable_tensor, non_differentiable_tensor - tensors or TensorPointer.
+            # Outputs: loss tensor or TensorPointer.
+            # Exceptions: AssertionError if requires_grad flags are wrong.
+            # Side effects: P2P communication via PipelineBlocks.
             for non_linear in self.mlp:
                 linear_output = non_linear.linear(x=differentiable_tensor, y=non_differentiable_tensor)
                 output = non_linear.activation(x=linear_output["output"], y=linear_output["y"])
@@ -350,6 +420,12 @@ def _test_pipeline_engine_with_tensor_that_does_not_require_grad(
     def dummy_infinite_data_loader_with_non_differentiable_tensor(
         pp_pg: dist.ProcessGroup, dtype=torch.float, input_pp_rank=0
     ):
+        # [FUNCTION DOC]
+        # HELPER: infinite microbatch generator.
+        # Behavior: Forever yields dictionaries with differentiable_tensor and non_differentiable_tensor, each a random 3x10 CUDA tensor on input_pp_rank or a TensorPointer to it on other ranks.
+        # Inputs: pp_pg - process group (unused); dtype - default float; input_pp_rank - default 0.
+        # Outputs: generator of dictionaries.
+        # Exceptions: None explicitly raised. Side effects: Consumes CUDA RNG.
         micro_batch_size = 3
         # We assume the first linear is always built on the first rank.
         while True:
@@ -448,18 +524,38 @@ def _test_pipeline_engine_with_tensor_that_does_not_require_grad(
 @pytest.mark.parametrize("pp", list(range(2, min(4, available_gpus()) + 1)))
 @rerun_if_address_is_in_use()
 def test_pipeline_forward_without_engine(pp: int):
+    # [FUNCTION DOC]
+    # Summary: Pytest entry over pp from 2 to min(4, GPUs); runs _test_pipeline_forward_without_engine.
+    # Inputs: pp - int. Outputs: None. Exceptions: Propagates worker failures. Side effects: Spawns pp processes.
     init_distributed(pp=pp, dp=1, tp=1)(_test_pipeline_forward_without_engine)()
 
 
 def _test_pipeline_forward_without_engine(parallel_context: ParallelContext):
+    # [FUNCTION DOC]
+    # HELPER: per-rank body testing plain forward through PipelineBlocks without an engine.
+    # Behavior: Defines a local DummyModel with one stage per rank (Linear then activation carrying y), builds it with stage i on rank i and a reference on rank 0, syncs weights, generates pp+5 microbatches, runs each through the model in inference mode, runs the reference, gathers losses at rank 0 (receiving TensorPointer-owned losses) and compares them. No backward is done.
+    # Inputs: parallel_context.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: P2P communication; destroys process groups.
     def activation(x: torch.Tensor, y: torch.Tensor):
+        # [FUNCTION DOC]
+        # HELPER: activation stage function; returns output equal to sigmoid of x times y, plus y.
+        # Inputs: x, y - tensors. Outputs: dictionary with output and y. Exceptions: None. Side effects: None.
         return {"output": F.sigmoid(x) * y, "y": y}
 
     class DummyModel(nn.Module):
+        # [CLASS DOC]
+        # HELPER: local chain model (shadows the imported DummyModel inside this function).
+        # Attributes: p2p; mlp - Sequential of pp size ModuleDicts with a Linear(10,10) block and an activation block; loss - summing block.
+        # Construction: p2p.
         def __init__(
             self,
             p2p: P2P,
         ):
+            # [FUNCTION DOC]
+            # Behavior: Stores p2p and builds the stage blocks and loss block.
+            # Inputs: p2p - P2P. Outputs: None. Exceptions: None explicitly raised. Side effects: None.
             super().__init__()
             self.p2p = p2p
             self.mlp = nn.Sequential(
@@ -499,6 +595,11 @@ def _test_pipeline_forward_without_engine(parallel_context: ParallelContext):
             differentiable_tensor: Union[torch.Tensor, TensorPointer],
             non_differentiable_tensor: Union[torch.Tensor, TensorPointer],
         ):
+            # [FUNCTION DOC]
+            # Behavior: For each stage applies the linear block to the differentiable tensor, then the activation with y; finally applies the loss block.
+            # Inputs: differentiable_tensor, non_differentiable_tensor - tensors or TensorPointer.
+            # Outputs: loss tensor or TensorPointer.
+            # Exceptions: None explicitly raised. Side effects: P2P communication.
             for non_linear in self.mlp:
                 differentiable_tensor = non_linear.linear(input=differentiable_tensor)["output"]
                 output = non_linear.activation(x=differentiable_tensor, y=non_differentiable_tensor)
@@ -557,6 +658,11 @@ def _test_pipeline_forward_without_engine(parallel_context: ParallelContext):
     def dummy_infinite_data_loader_with_non_differentiable_tensor(
         pp_pg: dist.ProcessGroup, dtype=torch.float, input_pp_rank=0
     ):
+        # [FUNCTION DOC]
+        # HELPER: infinite microbatch generator identical to the one in the non-differentiable engine test.
+        # Inputs: pp_pg (unused); dtype default float; input_pp_rank default 0.
+        # Outputs: generator of dictionaries with differentiable_tensor and non_differentiable_tensor.
+        # Exceptions: None. Side effects: Consumes CUDA RNG.
         micro_batch_size = 3
         # We assume the first linear is always built on the first rank.
         while True:
@@ -623,13 +729,30 @@ def _test_pipeline_forward_without_engine(parallel_context: ParallelContext):
 )
 @rerun_if_address_is_in_use()
 def test_pipeline_engine_diamond(pipeline_engine: PipelineEngine):
+    # [FUNCTION DOC]
+    # Summary: Pytest entry (needs 4 GPUs) over both engines; runs _test_pipeline_engine_diamond with pp=4.
+    # Inputs: pipeline_engine. Outputs: None. Exceptions: Propagates worker failures. Side effects: Spawns 4 processes.
     init_distributed(pp=4, dp=1, tp=1)(_test_pipeline_engine_diamond)(pipeline_engine=pipeline_engine)
     pass
 
 
 def _test_pipeline_engine_diamond(parallel_context: ParallelContext, pipeline_engine: PipelineEngine):
+    # [FUNCTION DOC]
+    # HELPER: per-rank body testing engines on a branching (diamond) model.
+    # Behavior: Builds DiamondModel with dense_bottom, dense_left, dense_right, dense_top on pp ranks 0 to 3 and loss on rank 3, plus a reference on rank 0; asserts pp size is 4; syncs weights, generates pp+5 microbatches of a random 3x10 x on rank 0, trains with the engine and applies the shared verification pattern per named submodule.
+    # Inputs: parallel_context; pipeline_engine.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch or wrong pp size.
+    # Side effects: P2P communication; backward passes; destroys process groups.
     class DiamondModel(nn.Module):
+        # [CLASS DOC]
+        # HELPER: diamond-shaped test model.
+        # Attributes: p2p; dense_bottom, dense_left, dense_right - ModuleDicts with Linear(10,10) and ReLU PipelineBlocks; dense_top - Bilinear(10,10 to 10) and ReLU blocks; loss - summing block.
+        # Construction: p2p.
         def __init__(self, p2p: P2P):
+            # [FUNCTION DOC]
+            # Behavior: Stores p2p and builds the four dense ModuleDicts and loss block.
+            # Inputs: p2p - P2P. Outputs: None. Exceptions: None explicitly raised. Side effects: None.
             super().__init__()
             self.p2p = p2p
             self.dense_bottom = nn.ModuleDict(
@@ -714,6 +837,11 @@ def _test_pipeline_engine_diamond(parallel_context: ParallelContext, pipeline_en
             )
 
         def forward(self, x):
+            # [FUNCTION DOC]
+            # Behavior: Applies bottom (linear then ReLU), feeds the result to both left and right branches, combines them with the bilinear top block followed by ReLU, then applies the loss block.
+            # Inputs: x - tensor or TensorPointer.
+            # Outputs: loss tensor or TensorPointer.
+            # Exceptions: None explicitly raised. Side effects: P2P communication.
             x = self.dense_bottom.activation(input=self.dense_bottom.linear(input=x)["output"])["output"]
             y = self.dense_left.activation(input=self.dense_left.linear(input=x)["output"])["output"]
             z = self.dense_right.activation(input=self.dense_right.linear(input=x)["output"])["output"]
@@ -778,6 +906,12 @@ def _test_pipeline_engine_diamond(parallel_context: ParallelContext, pipeline_en
     def dummy_infinite_data_loader_with_non_differentiable_tensor(
         pp_pg: dist.ProcessGroup, dtype=torch.float, input_pp_rank=0
     ):
+        # [FUNCTION DOC]
+        # HELPER: infinite microbatch generator yielding a dictionary with x, a random 3x10 CUDA tensor on input_pp_rank or a TensorPointer elsewhere.
+        # Inputs: pp_pg (unused); dtype default float; input_pp_rank default 0.
+        # Outputs: generator of dictionaries.
+        # Exceptions: None. Side effects: Consumes CUDA RNG.
+        # KNOWN ISSUE: Name mentions a non-differentiable tensor but it yields only a single differentiable input (copy-paste naming).
         micro_batch_size = 3
         # We assume the first linear is always built on the first rank.
         while True:

@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Purpose: pytest test checking that nanotron's parametrization-aware weight initialization (spectral muP) produces parameters with the expected standard deviations on a tiny Llama model.
+# Main contents: test_parametrization (pytest entry, currently skipped) and _test_parametrization (per-rank body launched via init_distributed).
+# Fits in nanotron: exercises nanotron.scaling.parametrization and the model's init_model_randomly path under tensor parallelism.
+# Import-time side effects: None beyond imports of test helpers.
 import math
 from typing import Union
 
@@ -16,6 +21,13 @@ from tests.helpers.llama_helper import TINY_LLAMA_CONFIG, create_llama_from_conf
 @pytest.mark.skip
 @rerun_if_address_is_in_use()
 def test_parametrization(tp: int, dp: int, pp: int, parametrization_method: ParametrizationMethod):
+    # [FUNCTION DOC]
+    # Summary: Pytest entry point, parametrized over (tp, dp, pp) = (2, 1, 1) and the SPECTRAL_MUP method; marked skip and rerun on address-in-use. Chooses an init method config (RandomInit with std 1.0 for STANDARD, SpectralMupInit with use_mup enabled for SPECTRAL_MUP) and launches _test_parametrization on tp*dp*pp processes via init_distributed.
+    # Inputs: tp, dp, pp - integer parallel sizes; parametrization_method - ParametrizationMethod enum value.
+    # Outputs: None.
+    # Exceptions: Propagates failures from the spawned workers.
+    # Side effects: Spawns distributed worker processes.
+    # KNOWN ISSUE: If parametrization_method is neither STANDARD nor SPECTRAL_MUP, init_method is never assigned and a NameError/UnboundLocalError would occur.
     if parametrization_method == ParametrizationMethod.STANDARD:
         init_method = RandomInit(std=1.0)
     elif parametrization_method == ParametrizationMethod.SPECTRAL_MUP:
@@ -32,7 +44,23 @@ def _test_parametrization(
     init_method: Union[RandomInit, SpectralMupInit],
     parametrization_method: ParametrizationMethod,
 ):
+    # [FUNCTION DOC]
+    # HELPER: per-rank body of test_parametrization.
+    # Behavior: Builds ModelArgs with the given init method and TINY_LLAMA_CONFIG, derives a training config, creates a tiny Llama on CUDA, and calls init_model_randomly with the parametrization method. Builds a table mapping parameter-name substrings to expected std: 0 for layer norms, 1 for token embedding, and the spectral std (1/sqrt(fan_in) times min(1, sqrt(fan_out/fan_in))) for qkv_proj, o_proj (fan_in is the per-rank in_features times tp size), gate_up_proj and down_proj. Iterates over all named parameters except lm_head and asserts each parameter's std matches its expected value within an absolute tolerance of 0.05.
+    # Inputs: parallel_context - ParallelContext; init_method - RandomInit or SpectralMupInit config; parametrization_method - ParametrizationMethod.
+    # Outputs: None.
+    # Exceptions: AssertionError if a parameter has no expected std or its std deviates beyond tolerance.
+    # Side effects: Allocates a model on the CUDA device; consumes RNG state.
+    # KNOWN ISSUE: qkv_proj expected std uses fan_out equal to intermediate_size, but the qkv projection outputs roughly hidden-size-related dimensions, not the MLP intermediate size; the expectation looks wrong (the test is skipped).
+    # KNOWN ISSUE: The local variable name interdimte_size is a typo of intermediate size (cosmetic).
     def spectral_std(fan_in: int, fan_out: int):
+        # [FUNCTION DOC]
+        # HELPER: computes the expected spectral muP init std.
+        # Behavior: Returns 1/sqrt(fan_in) multiplied by the minimum of 1 and sqrt(fan_out/fan_in), as a scalar tensor.
+        # Inputs: fan_in, fan_out - integer layer dimensions.
+        # Outputs: 0-dim float torch tensor.
+        # Exceptions: ZeroDivisionError if fan_in is 0.
+        # Side effects: None.
         return torch.tensor((1.0 / math.sqrt(fan_in)) * min(1, math.sqrt(fan_out / fan_in)))
 
     model_args = ModelArgs(init_method=init_method, model_config=TINY_LLAMA_CONFIG)
@@ -62,6 +90,13 @@ def _test_parametrization(
     }
 
     def find_expected_std(param_name):
+        # [FUNCTION DOC]
+        # HELPER: maps a parameter name to its expected std.
+        # Behavior: Returns the value for the first key of NAME_TO_EXPECTED_STD (in insertion order) that is a substring of param_name.
+        # Inputs: param_name - string parameter name.
+        # Outputs: tensor expected std, or None if no key matches (implicit).
+        # Exceptions: None explicitly raised.
+        # Side effects: None.
         for name in NAME_TO_EXPECTED_STD:
             if name in param_name:
                 return NAME_TO_EXPECTED_STD[name]

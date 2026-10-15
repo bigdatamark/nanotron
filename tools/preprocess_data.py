@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Purpose: command-line tool that tokenizes a text dataset (HuggingFace dataset or jsonl files) into nanotron-compatible tokenized files using datatrove.
+# Main contents: get_args (CLI parsing) and main (builds and runs a datatrove LocalPipelineExecutor). Usage examples are in the module docstring below.
+# Fits in nanotron: produces pre-tokenized data consumed by nanotron's datatrove/nanoset data loaders.
+# Import-time side effects: None; runs main only when executed as a script.
 """
 To process HuggingFace Datasets:
     python3 tools/preprocess_data.py --tokenizer-name-or-path meta-llama/Meta-Llama-3-8B --output-folder datasets/emotion --n-tasks 16 hf --dataset dair-ai/emotion
@@ -13,6 +18,12 @@ from datatrove.pipeline.tokens import DocumentTokenizer
 
 
 def get_args():
+    # [FUNCTION DOC]
+    # Summary: Builds and parses the CLI. Common options: --tokenizer-name-or-path (required), --eos-token (default None), --output-folder (required), --logging-dir (default None), --n-tasks (default 8). A required subcommand selects the reader: "hf" with --dataset (required), --column (default text), --split (default train); or "jsonl" with --dataset (required), --column (default text), --glob-pattern (default None). The chosen subcommand is stored in the "readers" attribute.
+    # Inputs: None (reads sys.argv).
+    # Outputs: argparse Namespace.
+    # Exceptions: SystemExit on invalid arguments or help.
+    # Side effects: May print usage/help to stdout/stderr.
     parser = argparse.ArgumentParser()
 
     group = parser.add_argument_group(title="Tokenizer")
@@ -78,6 +89,12 @@ def get_args():
 
 
 def main(args):
+    # [FUNCTION DOC]
+    # Summary: Creates a HuggingFaceDatasetReader (with the split as dataset option) when readers is "hf", otherwise a JsonlReader with the glob pattern; then runs a LocalPipelineExecutor with that reader followed by a DocumentTokenizer (output folder, tokenizer, eos token, no shuffling, max 1e9 tokens per file) over n_tasks tasks with the given logging dir.
+    # Inputs: args - Namespace from get_args.
+    # Outputs: None.
+    # Exceptions: None explicitly raised; datatrove/tokenizer errors propagate.
+    # Side effects: Reads the dataset (possibly downloading), writes tokenized files and logs to disk, may spawn worker processes.
     # Build datatrove reader
     if args.readers == "hf":
         datatrove_reader = HuggingFaceDatasetReader(
