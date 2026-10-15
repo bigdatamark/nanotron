@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Purpose: create NanotronParameters carrying sharding metadata (which slices of the unsharded tensor each rank
+# owns), used for tensor-parallel layers and checkpoint (de)serialization.
+# Main contents: SplitConfig, create_sharded_parameter, create_sharded_parameter_from_config,
+# mark_all_parameters_in_module_as_sharded.
+# Import-time side effects: None.
 import dataclasses
 from typing import List, Optional, Tuple
 
@@ -10,6 +16,10 @@ from nanotron.parallel.parameters import NanotronParameter, SlicesPair
 
 @dataclasses.dataclass
 class SplitConfig:
+    # [CLASS DOC]
+    # Purpose: dataclass describing how a parameter is split across a process group.
+    # Attributes: split_dim (int dimension that is sharded); contiguous_chunks (optional tuple of chunk sizes along
+    # the unsharded split_dim, each chunk sharded evenly and independently, e.g. fused QKV; None means one chunk).
     split_dim: int
     # contiguous_chunks is a tuple of chunk sizes along the split_dim
     # sharding happens inside each chunk
@@ -23,6 +33,12 @@ def create_sharded_parameter(
     local_global_slices_pairs: Tuple[SlicesPair, ...],
     unsharded_shape: Tuple[int, ...],
 ) -> NanotronParameter:
+    # [FUNCTION DOC]
+    # Behavior: wraps parameter as a NanotronParameter if needed (sharing storage) and marks it as sharded.
+    # Inputs: parameter (nn.Parameter), global_ranks (tuple of ints), local_global_slices_pairs (tuple of
+    # SlicesPair), unsharded_shape (tuple of ints).
+    # Outputs: NanotronParameter.
+    # Exceptions: ValueError if already marked sharded. Side effects: mutates the parameter's metadata.
     if not isinstance(parameter, NanotronParameter):
         parameter = NanotronParameter(tensor=parameter)
     parameter.mark_as_sharded(
@@ -38,6 +54,17 @@ def create_sharded_parameter_from_config(
     pg: dist.ProcessGroup,
     split_config: SplitConfig,
 ) -> NanotronParameter:
+    # [FUNCTION DOC]
+    # Behavior: with rank r in pg of size n and local length L on split_dim: if no chunks, the local tensor maps to
+    # global range r*L to (r+1)*L on split_dim and the unsharded size is n*L. With chunks (global sizes c_i at global
+    # offsets G_i, local offsets G_i/n), each chunk must be divisible by n and contributes a pair mapping local range
+    # G_i/n to G_(i+1)/n onto global range G_i + r*c_i/n to G_i + (r+1)*c_i/n; unsharded size on split_dim is the
+    # total of chunks. Other dims use full slices. Then calls create_sharded_parameter with pg's global ranks.
+    # Inputs: parameter (local shard), pg (ProcessGroup), split_config (SplitConfig).
+    # Outputs: NanotronParameter.
+    # Exceptions: AssertionError if split_dim out of range or a chunk is not divisible by group size; ValueError from
+    # zip strict on length mismatch (never in practice) or if already sharded.
+    # Side effects: metadata mutation.
     current_rank = dist.get_rank(pg)
     param_num_dims = len(parameter.shape)
     global_ranks = dist.get_global_ranks(pg)
@@ -101,6 +128,13 @@ def create_sharded_parameter_from_config(
 
 
 def mark_all_parameters_in_module_as_sharded(module: nn.Module, pg: dist.ProcessGroup, split_config: SplitConfig):
+    # [FUNCTION DOC]
+    # Behavior: for every submodule, replaces each direct parameter with its sharded NanotronParameter version
+    # (created from split_config over pg) via setattr.
+    # Inputs: module (nn.Module), pg (ProcessGroup), split_config (SplitConfig). Outputs: None.
+    # Exceptions: as create_sharded_parameter_from_config.
+    # Side effects: mutates module parameters (new Parameter objects for non-Nanotron params).
+    # KNOWN ISSUE: shared parameters reachable from several submodules get marked multiple times and raise ValueError on the second marking.
     """
     Mark parameters as sharded within a module. We assume that parameters are equally shardable across the process group.
 

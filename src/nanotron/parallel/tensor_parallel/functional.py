@@ -1,4 +1,16 @@
 # coding=utf-8
+# [MODULE DOC]
+# Purpose: tensor-parallel functional ops (Megatron-LM derived): vocab-sharded cross entropy (optionally with
+# z-loss), column-parallel and row-parallel linear with ALL_REDUCE or REDUCE_SCATTER (sequence parallel) modes,
+# including async variants that overlap communication with matmuls.
+# Main contents: _ShardedCrossEntropy, _ShardedCrossEntropyWithZLoss, sharded_cross_entropy,
+# _ColumnLinearAsyncCommunication, _ColumnLinearNoAsyncCommunicationReduceScatterMode, column_linear,
+# _RowLinearAsyncCommunication, row_linear.
+# Conventions: in REDUCE_SCATTER mode activations are sharded along dim 0 across the TP group (rank r owns block
+# r); weights of column linear are sharded on output features, of row linear on input features.
+# Overlap relies on CUDA_DEVICE_MAX_CONNECTIONS=1 so collectives are scheduled before following matmuls.
+# "allgather"/"allgather2" buffers come from the global MemoryBuffer to save memory.
+# Import-time side effects: None.
 # Copyright (c) 2020, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -29,6 +41,9 @@ from nanotron.parallel.utils import MemoryBuffer
 
 
 class _ShardedCrossEntropy(torch.autograd.Function):
+    # [CLASS DOC]
+    # Purpose: cross entropy over logits whose vocab (last) dimension is sharded across a TP group; rank r holds vocab
+    # range r*V_local to (r+1)*V_local. Inheritance: torch.autograd.Function.
     @staticmethod
     def forward(
         ctx,
@@ -36,6 +51,14 @@ class _ShardedCrossEntropy(torch.autograd.Function):
         target,  # (*)
         group: dist.ProcessGroup,
     ):
+        # [FUNCTION DOC]
+        # Behavior: all-reduce MAX of per-row max logits and subtract it; mask targets outside this shard and shift
+        # in-shard targets to local indices; gather local target logits (zero for masked) and all-reduce SUM to get the
+        # target logit everywhere; exponentiate logits in place, sum and all-reduce SUM to get the partition Z; loss is
+        # log Z minus target logit; normalize exponentials into softmax and save softmax, mask and local targets.
+        # Inputs: ctx, sharded_logits ([..., V_local]), target (integer tensor [...], global vocab ids), group.
+        # Outputs: per-token loss with target's shape.
+        # Exceptions: None explicitly raised. Side effects: three all-reduces on group.
         # Maximum value along last dimension across all GPUs.
         logits_max = torch.max(sharded_logits, dim=-1)[0]
         dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=group)
@@ -88,6 +111,11 @@ class _ShardedCrossEntropy(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        # [FUNCTION DOC]
+        # Behavior: gradient is softmax minus one-hot of the target (only for in-shard targets), multiplied by grad_output
+        # broadcast over the vocab dim; computed in place on the saved softmax.
+        # Inputs: ctx, grad_output (shape of target). Outputs: (grad for logits, None, None).
+        # Exceptions: None. Side effects: overwrites saved softmax (backward cannot run twice).
         # Retrieve tensors from the forward path.
         softmax, target_mask, masked_target_1d = ctx.saved_tensors
 
@@ -108,6 +136,9 @@ class _ShardedCrossEntropy(torch.autograd.Function):
 
 
 class _ShardedCrossEntropyWithZLoss(torch.autograd.Function):
+    # [CLASS DOC]
+    # Purpose: same as _ShardedCrossEntropy plus z-loss regularization z_loss_coef times log(Z) squared.
+    # Inheritance: torch.autograd.Function.
     @staticmethod
     def forward(
         ctx,
@@ -116,6 +147,13 @@ class _ShardedCrossEntropyWithZLoss(torch.autograd.Function):
         group: dist.ProcessGroup,
         z_loss_coef: float = 0.0,  # Coefficient for z-loss regularization
     ):
+        # [FUNCTION DOC]
+        # Behavior: as _ShardedCrossEntropy forward; additionally computes log Z, and if z_loss_coef is positive adds
+        # z_loss_coef times the square of log Z clamped to between -20 and 20 to the loss (else z_loss is zeros); saves
+        # softmax, mask, local targets and log Z, and the coefficient on ctx.
+        # Inputs: ctx, sharded_logits, target, group, z_loss_coef (float, default 0.0).
+        # Outputs: tuple (total loss including z-loss, z_loss) each shaped like target.
+        # Exceptions: None. Side effects: all-reduces on group.
         # Maximum value along last dimension across all GPUs.
         logits_max = torch.max(sharded_logits, dim=-1)[0]
         dist.all_reduce(logits_max, op=dist.ReduceOp.MAX, group=group)
@@ -182,6 +220,13 @@ class _ShardedCrossEntropyWithZLoss(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output, grad_z_loss=None):
+        # [FUNCTION DOC]
+        # Behavior: clones softmax, subtracts in-shard one-hot targets, and if z_loss_coef is positive adds 2 * coef *
+        # log Z * softmax; scales by grad_output.
+        # Inputs: ctx, grad_output (for the total loss), grad_z_loss (ignored). Outputs: (grad logits, None, None, None).
+        # Exceptions: None. Side effects: None.
+        # KNOWN ISSUE: gradient of the z-loss uses unclamped log Z although forward clamps it, so gradients disagree with the forward when the clamp is active.
+        # KNOWN ISSUE: gradient flowing into the second output (z_loss) is ignored, so using z_loss itself in a loss produces no gradient.
         # Retrieve tensors from the forward path.
         softmax, target_mask, masked_target_1d, log_z = ctx.saved_tensors
         z_loss_coef = ctx.z_loss_coef
@@ -224,6 +269,13 @@ def sharded_cross_entropy(
     dtype: torch.dtype = None,
     z_loss_coef: float = 0.0,
 ):
+    # [FUNCTION DOC]
+    # Behavior: optionally casts logits to dtype, then applies the z-loss variant when z_loss_coef is positive, else
+    # the plain variant.
+    # Inputs: sharded_logits, target, group (TP group), dtype (optional), z_loss_coef (float, default 0.0).
+    # Outputs: loss tensor, or tuple (loss, z_loss) when z_loss_coef is positive.
+    # Exceptions: None explicitly raised. Side effects: collectives.
+    # KNOWN ISSUE: return type differs by branch (tensor versus tuple), so callers must know which was used.
     """Helper function for the cross entropy."""
     if dtype is not None:
         # Cast input to specific dtype.
@@ -235,10 +287,24 @@ def sharded_cross_entropy(
 
 
 class _ColumnLinearAsyncCommunication(torch.autograd.Function):
+    # [CLASS DOC]
+    # Purpose: column-parallel linear with communication overlapped with compute (adapted from Megatron-LM).
+    # Inheritance: torch.autograd.Function.
     """Adapted from https://github.com/NVIDIA/Megatron-LM/blob/e6d7e09845590d0a36bc7f29eb28db974fb8da4e/megatron/core/tensor_parallel/layers.py#L215"""
 
     @staticmethod
     def forward(ctx, tensor, weight, bias, group, tp_mode, tp_recompute_allgather):
+        # [FUNCTION DOC]
+        # Behavior: saves mode, group, recompute flag and input shape. ALL_REDUCE: plain linear, saving input and weight.
+        # REDUCE_SCATTER with group size 1: same. Otherwise: makes input contiguous, starts an async all-gather of inputs
+        # along dim 0 (into the shared "allgather" buffer when recomputing, else a fresh tensor), meanwhile computes this
+        # rank's output block from the local input, waits, saves either the local input (recompute) or gathered input, then
+        # computes the output blocks before and after the local block from the gathered input; bias added via addmm.
+        # Inputs: ctx, tensor ([b_local, ..., h_in] or full in ALL_REDUCE), weight ([h_out_local, h_in]), bias (or None),
+        # group, tp_mode, tp_recompute_allgather (bool).
+        # Outputs: tensor [b_local * group size, ..., h_out_local] (REDUCE_SCATTER) or [..., h_out_local].
+        # Exceptions: ValueError for unknown mode. Side effects: async all-gather; MemoryBuffer use.
+        # KNOWN ISSUE: the group-None fallback is unreachable because group.size is called earlier.
         ctx.use_bias = bias is not None
         ctx.tp_mode = tp_mode
         ctx.group = group
@@ -383,6 +449,13 @@ class _ColumnLinearAsyncCommunication(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        # [FUNCTION DOC]
+        # Behavior: in REDUCE_SCATTER with recompute, async re-all-gathers the input into the shared buffer. Computes input
+        # gradient grad_output times weight; launches async reduce-scatter of it (REDUCE_SCATTER, size above 1) or async
+        # all-reduce (ALL_REDUCE). Computes bias grad as sum over rows, waits for the gather, computes weight grad
+        # grad_output transposed times gathered input, waits for the reduction.
+        # Inputs: ctx, grad_output. Outputs: (input grad, weight grad, bias grad or None, None, None, None).
+        # Exceptions: ValueError for unknown mode. Side effects: async collectives.
         tensor, weight = ctx.saved_tensors
         group = ctx.group
         use_bias = ctx.use_bias
@@ -462,6 +535,9 @@ class _ColumnLinearAsyncCommunication(torch.autograd.Function):
 
 
 class _ColumnLinearNoAsyncCommunicationReduceScatterMode(torch.autograd.Function):
+    # [CLASS DOC]
+    # Purpose: synchronous column-parallel linear for REDUCE_SCATTER mode with optional all-gather recomputation in
+    # backward. Inheritance: torch.autograd.Function.
     """
     Column linear with memory_buffer for the allgather, context parallel
     enabled (i.e. tp_mode = TensorParallelLinearMode.REDUCE_SCATTER) and
@@ -478,6 +554,11 @@ class _ColumnLinearNoAsyncCommunicationReduceScatterMode(torch.autograd.Function
         tp_recompute_allgather: bool,
     ):
 
+        # [FUNCTION DOC]
+        # Behavior: all-gathers input along dim 0 (into the shared buffer if recomputing, else a new tensor; no-op for size
+        # 1), saves local input (recompute) or gathered input plus weight and bias, returns linear of the gathered input.
+        # Inputs: ctx, input ([b_local, ...]), weight, bias (optional), group, tp_recompute_allgather (bool).
+        # Outputs: tensor [b_local * group size, ..., h_out_local]. Exceptions: None. Side effects: all-gather.
         # Do allgather.
         sharded_batch_size, *rest_size = input.shape
         unsharded_batch_size = sharded_batch_size * group.size()
@@ -505,6 +586,13 @@ class _ColumnLinearNoAsyncCommunicationReduceScatterMode(torch.autograd.Function
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
+        # [FUNCTION DOC]
+        # Behavior: obtains the gathered input (from saved tensors or by re-all-gathering), flattens to 2D, computes weight
+        # grad and input grad; reduce-scatters input grad along dim 0 back to the local shape (size above 1); bias grad is
+        # sum over rows.
+        # Inputs: ctx, grad_output. Outputs: (input grad, weight grad, bias grad or None, None, None).
+        # Exceptions: None. Side effects: collectives.
+        # KNOWN ISSUE: total_input is first assigned an integer that is immediately overwritten (dead assignment).
         # Either allgather the inputs again or get them from context.
         group = ctx.group
         tp_recompute_allgather = ctx.tp_recompute_allgather
@@ -553,6 +641,12 @@ def column_linear(
     async_communication: bool,
     tp_recompute_allgather: bool = True,
 ):
+    # [FUNCTION DOC]
+    # Behavior: dispatch: async_communication uses _ColumnLinearAsyncCommunication; else ALL_REDUCE applies
+    # differentiable_identity (all-reduce in backward) then linear; REDUCE_SCATTER uses the no-async function.
+    # Inputs: input, weight, bias (optional), group (TP group), tp_mode, async_communication (bool),
+    # tp_recompute_allgather (bool, default True).
+    # Outputs: output tensor. Exceptions: ValueError on unknown mode. Side effects: collectives.
     if async_communication:
         return _ColumnLinearAsyncCommunication.apply(input, weight, bias, group, tp_mode, tp_recompute_allgather)
 
@@ -567,8 +661,18 @@ def column_linear(
 
 
 class _RowLinearAsyncCommunication(torch.autograd.Function):
+    # [CLASS DOC]
+    # Purpose: row-parallel linear in REDUCE_SCATTER mode with backward all-gather of grad_output overlapped with the
+    # input-gradient matmul. Inheritance: torch.autograd.Function.
     @staticmethod
     def forward(ctx, tensor, weight, bias, group, tp_mode):
+        # [FUNCTION DOC]
+        # Behavior: asserts REDUCE_SCATTER mode; defaults group; computes linear and (size above 1) reduce-scatters it
+        # along dim 0; saves input and weight.
+        # Inputs: ctx, tensor ([b, ..., h_in_local]), weight ([h_out, h_in_local]), bias (optional; expected only on one
+        # rank since it is summed by the reduction), group, tp_mode.
+        # Outputs: tensor [b / group size, ..., h_out].
+        # Exceptions: AssertionError for other modes. Side effects: reduce-scatter collective.
         assert (
             tp_mode is TensorParallelLinearMode.REDUCE_SCATTER
         ), f"async communication in RowLinear only supports REDUCE_SCATTER, got {tp_mode}"
@@ -589,6 +693,13 @@ class _RowLinearAsyncCommunication(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        # [FUNCTION DOC]
+        # Behavior: starts async all-gather of grad_output into the shared "allgather2" buffer; computes the local block of
+        # the input gradient from local grad_output while waiting, then the before/after blocks from the gathered gradient;
+        # computes weight grad from the full gathered grad_output and input, bias grad as its row sum.
+        # Inputs: ctx, grad_output ([b / n, ..., h_out]). Outputs: (input grad [b, ..., h_in_local], weight grad, bias grad
+        # or None, None, None).
+        # Exceptions: None explicitly raised. Side effects: async all-gather; MemoryBuffer use.
         tensor, weight = ctx.saved_tensors
         group = ctx.group
         use_bias = ctx.use_bias
@@ -703,6 +814,11 @@ def row_linear(
     tp_mode: TensorParallelLinearMode,
     async_communication: bool,
 ):
+    # [FUNCTION DOC]
+    # Behavior: async_communication uses _RowLinearAsyncCommunication; else computes linear then differentiable
+    # all-reduce (ALL_REDUCE) or differentiable reduce-scatter (REDUCE_SCATTER).
+    # Inputs: input, weight, bias (optional), group, tp_mode, async_communication (bool).
+    # Outputs: tensor. Exceptions: ValueError on unknown mode. Side effects: collectives.
     if async_communication:
         return _RowLinearAsyncCommunication.apply(input, weight, bias, group, tp_mode)
 

@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Purpose: pipeline-parallel schedules that drive forward/backward of a PipelineBlock-based model over
+# microbatches.
+# Main contents: PipelineEngine (abstract base with shared forward/backward helpers and validation),
+# AllForwardAllBackwardPipelineEngine ("afab"), OneForwardOneBackwardPipelineEngine ("1f1b", Megatron
+# PipeDream-flush style).
+# How it fits: the trainer picks an engine from config and calls train_batch_iter / validate_batch_iter; the
+# engine attaches a PipelineTrainBatchState to all blocks so P2P sends/recvs are queued and executed lazily.
+# Import-time side effects: creates a module logger.
 from abc import ABC, abstractmethod
 from typing import Dict, Iterable, Optional, Union
 
@@ -22,7 +31,13 @@ logger = logging.get_logger(__name__)
 
 
 class PipelineEngine(ABC):
+    # [CLASS DOC]
+    # Purpose: abstract pipeline schedule. Key state: nb_microbatches (int or None, set by batch iterators and used
+    # to normalize losses and decide DDP sync).
+    # Subclasses implement train_batch_iter. String form is the class name.
     def __init__(self):
+        # [FUNCTION DOC]
+        # Sets nb_microbatches to None. Inputs/Outputs: None. Exceptions/Side effects: None.
         self.nb_microbatches: Optional[int] = None
         pass
 
@@ -33,6 +48,15 @@ class PipelineEngine(ABC):
         micro_batch: Dict[str, Union[torch.Tensor, TensorPointer]],
         model: torch_nn.Module,
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
+        # [FUNCTION DOC]
+        # Behavior: increments state.nb_forwards, logs at debug, opens a new microbatch in the state, runs the model on
+        # micro_batch inside context, wraps a non-dict output as {"loss": output}, divides a local loss by
+        # nb_microbatches, asserts it requires grad and registers it as an activation requiring backward.
+        # Inputs: context (ContextManagers), state (PipelineTrainBatchState), micro_batch (dict of tensors or
+        # TensorPointers), model (nn.Module).
+        # Outputs: output dict (loss is a tensor on the last stage, a TensorPointer elsewhere).
+        # Exceptions: AssertionError if a local loss does not require grad; TypeError if nb_microbatches is None.
+        # Side effects: mutates state; model forward queues P2P communications; logging.
         # Increment the number of backwards
         state.nb_forwards += 1
         log_rank(
@@ -62,6 +86,11 @@ class PipelineEngine(ABC):
 
     @staticmethod
     def _get_fwd_context(model: torch_nn.Module):
+        # [FUNCTION DOC]
+        # HELPER: forward context for one microbatch.
+        # Behavior: for a DDP model returns ContextManagers with model.no_sync (sync is triggered explicitly in backward),
+        # else an empty ContextManagers.
+        # Inputs: model. Outputs: ContextManagers. Exceptions/Side effects: None.
         is_ddp = isinstance(model, DistributedDataParallel)
         # We never to trigger a DDP sync in the next backward pass
         context = ContextManagers([model.no_sync()] if is_ddp else [])
@@ -70,6 +99,13 @@ class PipelineEngine(ABC):
     def backward(
         self, context: ContextManagers, state: PipelineTrainBatchState, grad_accumulator: Optional[GradientAccumulator]
     ):
+        # [FUNCTION DOC]
+        # Behavior: increments state.nb_backwards, logs, pops the last microbatch's activations requiring backward; if
+        # none returns; else inside context backpropagates their sum, through grad_accumulator.backward when given.
+        # Inputs: context (ContextManagers), state, grad_accumulator (or None).
+        # Outputs: None. Exceptions: None explicitly raised.
+        # Side effects: autograd backward (which triggers queued P2P grad sends/recvs and DDP hooks); logging.
+        # KNOWN ISSUE: the debug log reports state.nb_forwards instead of state.nb_backwards as the backward micro batch id.
         # Increment the number of backwards
         state.nb_backwards += 1
         log_rank(
@@ -103,6 +139,13 @@ class PipelineEngine(ABC):
         nb_backwards: int,
         grad_accumulator: Optional[GradientAccumulator],
     ):
+        # [FUNCTION DOC]
+        # HELPER: backward context deciding gradient sync.
+        # Behavior: asserts nb_microbatches is set. For DDP models: before the last microbatch adds grad_accumulator.no_sync
+        # (if an accumulator exists); on the last microbatch (nb_backwards equals nb_microbatches - 1) adds
+        # ddp_trigger_sync_in_bwd so DDP all-reduces. Non-DDP models get an empty context.
+        # Inputs: model, nb_backwards (int, backwards done so far), grad_accumulator (or None).
+        # Outputs: ContextManagers. Exceptions: AssertionError if nb_microbatches is None. Side effects: None until entered.
         assert (
             self.nb_microbatches is not None
         ), "You must call `train_batch_iter` first and set `self.nb_microbatches`"
@@ -127,6 +170,11 @@ class PipelineEngine(ABC):
         nb_microbatches: int,
         grad_accumulator: Optional[GradientAccumulator],
     ) -> Iterable[Dict[str, Union[torch.Tensor, TensorPointer]]]:
+        # [FUNCTION DOC]
+        # Abstract: run training forward and backward for all microbatches of a batch.
+        # Inputs: model, pg (PP process group), batch (iterable of microbatch dicts), nb_microbatches (int),
+        # grad_accumulator (or None). Outputs: list of per-microbatch output dicts (detached on the last stage).
+        # Exceptions/Side effects: implementation-defined (P2P communication, autograd).
         """If model returns tensor, we use it as a loss to backpropagate. If model returns a dict, we assume that the key "loss" is the loss to backpropagate."""
         ...
 
@@ -137,6 +185,14 @@ class PipelineEngine(ABC):
         batch: Iterable[Dict[str, Union[torch.Tensor, TensorPointer]]],
         nb_microbatches: int,
     ) -> Iterable[Dict[str, Union[torch.Tensor, TensorPointer]]]:
+        # [FUNCTION DOC]
+        # Behavior: under inference mode, sets nb_microbatches, attaches a fresh PipelineTrainBatchState, runs forward
+        # for each microbatch and immediately executes queued activation sends, and collects detached outputs.
+        # Inputs: model, batch (iterable of microbatch dicts), nb_microbatches (int).
+        # Outputs: list of output dicts (losses normalized by nb_microbatches).
+        # Exceptions: AssertionError from forward.
+        # Side effects: P2P communication; mutates nb_microbatches.
+        # KNOWN ISSUE: forward asserts the local loss requires grad, which can never hold under inference mode, so validation on the stage producing the loss fails unless the model returns TensorPointers there.
         # Assign a new state for the current batch
         state = PipelineTrainBatchState()  # TODO: do i need state?
         self.nb_microbatches = nb_microbatches
@@ -166,17 +222,28 @@ class PipelineEngine(ABC):
         return outputs
 
     def __str__(self):
+        # [FUNCTION DOC]
+        # Returns the class name. Outputs: str.
         return self.__class__.__name__
 
     def __format__(self, format_spec):
+        # [FUNCTION DOC]
+        # Returns str of self regardless of format_spec. Inputs: format_spec. Outputs: str.
         return str(self)
 
 
 class AllForwardAllBackwardPipelineEngine(PipelineEngine):
+    # [CLASS DOC]
+    # Purpose: GPipe-like schedule: forward every microbatch, then backward every microbatch.
+    # Inheritance: PipelineEngine. String form "afab".
     def __init__(self):
+        # [FUNCTION DOC]
+        # Calls parent constructor. Inputs/Outputs: None.
         super().__init__()
 
     def __str__(self):
+        # [FUNCTION DOC]
+        # Returns "afab". Outputs: str.
         return "afab"
 
     def train_batch_iter(
@@ -187,6 +254,14 @@ class AllForwardAllBackwardPipelineEngine(PipelineEngine):
         nb_microbatches: int,
         grad_accumulator: Optional[GradientAccumulator],
     ) -> Iterable[Dict[str, Union[torch.Tensor, TensorPointer]]]:
+        # [FUNCTION DOC]
+        # Behavior: creates a new state, sets nb_microbatches, attaches state. For each microbatch: forward, execute queued
+        # activation sends, store output (detached if local loss). Then for each stored backward group: build backward
+        # context, backward, execute queued gradient sends. Finally checks all state buffers are empty.
+        # Inputs: model, pg (unused), batch, nb_microbatches, grad_accumulator.
+        # Outputs: list of output dicts.
+        # Exceptions: AssertionError from state checks or forward.
+        # Side effects: P2P communication, autograd, DDP sync on last backward, gradient accumulation.
         # Assign a new state for the current batch
         state = PipelineTrainBatchState()
         self.nb_microbatches = nb_microbatches
@@ -233,10 +308,18 @@ class AllForwardAllBackwardPipelineEngine(PipelineEngine):
 
 
 class OneForwardOneBackwardPipelineEngine(PipelineEngine):
+    # [CLASS DOC]
+    # Purpose: 1F1B schedule (Narayanan et al. 2021): warm-up forwards, steady-state one forward plus one backward,
+    # then cool-down backwards, bounding activation memory by PP size.
+    # Inheritance: PipelineEngine. String form "1f1b".
     def __init__(self):
+        # [FUNCTION DOC]
+        # Calls parent constructor. Inputs/Outputs: None.
         super().__init__()
 
     def __str__(self):
+        # [FUNCTION DOC]
+        # Returns "1f1b". Outputs: str.
         return "1f1b"
 
     def train_batch_iter(
@@ -247,6 +330,17 @@ class OneForwardOneBackwardPipelineEngine(PipelineEngine):
         nb_microbatches: int,
         grad_accumulator: Optional[GradientAccumulator],
     ) -> Iterable[Dict[str, Union[torch.Tensor, TensorPointer]]]:
+        # [FUNCTION DOC]
+        # Behavior: sets nb_microbatches and asserts it is at least PP size - 1. Warm-up: rank r runs PP size - r - 1
+        # forwards, flushing activation sends after each. Steady state: for every remaining microbatch, forward (sends are
+        # flushed lazily by the next block or backward) then one backward. Asserts the remaining backward count equals the
+        # warm-up count and no activation sends/recvs remain. Cool-down: flushes pending gradient sends, then for each
+        # remaining microbatch runs backward and flushes gradient sends. Checks buffers are empty.
+        # Inputs: model, pg (PP process group), batch (iterable), nb_microbatches (int), grad_accumulator.
+        # Outputs: list of output dicts.
+        # Exceptions: AssertionError on too few microbatches or inconsistent state; StopIteration if batch is shorter than the warm-up.
+        # Side effects: P2P communication, autograd, DDP/accumulator sync on the last backward.
+        # KNOWN ISSUE: in the warm-up loop activation sends are flushed twice in a row; the second loop is always a no-op.
         """Check https://arxiv.org/abs/2104.04473 for diagrams for the pipeline engine"""
         self.nb_microbatches = nb_microbatches
         assert (

@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Purpose: PipelineBlock, the unit of pipeline-parallel model placement: a lazily built sub-module that lives
+# on exactly one PP rank, with activations routed between ranks via TensorPointers and P2P communication.
+# Main contents: PipelineBlock, get_min_max_rank, get_sort_key.
+# Import-time side effects: None.
 from typing import Any, Callable, Dict, Optional, Set, Tuple, Union
 
 import torch
@@ -14,6 +19,14 @@ from nanotron.parallel.pipeline_parallel.tensor_pointer import TensorPointer
 
 
 class PipelineBlock(nn.Module):
+    # [CLASS DOC]
+    # Purpose: wraps a module builder; every rank holds the wrapper but only the assigned PP rank builds the module
+    # (pp_block). Forward on other ranks sends their locally-held inputs to the compute rank and returns
+    # TensorPointers; forward on the compute rank receives remote inputs, runs pp_block and returns its output dict.
+    # Key state: p2p (P2P over the PP group), pipeline_state (PipelineBatchState or None for plain forward/backward),
+    # module_builder, module_kwargs, module_input_keys, module_output_keys (sets), rank (assigned PP rank, after
+    # build_and_set_rank), pp_block (built module, only on that rank).
+    # Inheritance: nn.Module.
     """Most granular pipeline block, ie within this module, everything will be part of a single rank, ie the entire computation within this block will happen on a specific device.
 
     Current limitations:
@@ -32,6 +45,11 @@ class PipelineBlock(nn.Module):
         module_input_keys: Set[str],
         module_output_keys: Set[str],
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores p2p, builder, kwargs, and input/output key sets; pipeline_state starts None.
+        # Inputs: p2p (P2P), module_builder (callable returning a module/callable producing a tensor or dict of tensors),
+        # module_kwargs (dict), module_input_keys (set of str), module_output_keys (set of str).
+        # Outputs: None. Exceptions: None. Side effects: None.
         super().__init__()
         # Module follows a restrictive API: module.forward return a `Dict[str, torch.Tensor]`
         self.p2p = p2p
@@ -44,6 +62,10 @@ class PipelineBlock(nn.Module):
         self.module_output_keys = set(module_output_keys)
 
     def build_and_set_rank(self, pp_rank: int):
+        # [FUNCTION DOC]
+        # Behavior: asserts pp_rank is in range, records it, and if this process is that PP rank builds pp_block.
+        # Inputs: pp_rank (int). Outputs: None. Exceptions: AssertionError if out of range.
+        # Side effects: sets self.rank and possibly self.pp_block (allocates module).
         """This method is used to define on which rank computation is going to happen"""
         assert pp_rank < self.p2p.pg.size()
         self.rank = pp_rank
@@ -52,12 +74,32 @@ class PipelineBlock(nn.Module):
             self.pp_block = self.module_builder(**self.module_kwargs)
 
     def extra_repr(self) -> str:
+        # [FUNCTION DOC]
+        # Returns "pp_rank=N" when assigned, else empty. Outputs: str. Exceptions/Side effects: None.
         return f"pp_rank={self.rank}" if hasattr(self, "rank") else ""
 
     def set_pipeline_state(self, pipeline_state: Optional[PipelineBatchState]):
+        # [FUNCTION DOC]
+        # Sets self.pipeline_state. Inputs: pipeline_state (or None). Outputs: None. Side effects: mutates self.
         self.pipeline_state = pipeline_state
 
     def forward(self, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: asserts the kwargs names equal module_input_keys; sorts kwargs by (owning rank, name), local tensors
+        # counting as the current rank, so earlier ranks are served first.
+        # On a non-compute rank: for each real tensor, either registers it to be sent via the pipeline state (engine mode)
+        # or, without engine, rejects tensors requiring grad and batch-sends it to the compute rank; TensorPointers are
+        # skipped. Flushes, then returns a TensorPointer to the compute rank for each output key.
+        # On the compute rank: for each TensorPointer, in train-state mode first executes all queued activation sends
+        # (needed for interleaved schedules), then receives via the pipeline state (engine mode) or schedules a batched
+        # receive; real tensors pass through. Flushes receives, rejects received tensors requiring grad when no engine,
+        # runs pp_block, wraps a bare tensor output into a dict with the single output key, and validates output keys.
+        # Inputs: kwargs (name to tensor, TensorPointer, or other pass-through values).
+        # Outputs: dict output name to tensor (compute rank) or TensorPointer (other ranks).
+        # Exceptions: AssertionError on key mismatches, non-dict outputs, or receive count mismatch; ValueError when sending
+        # or receiving grad-requiring tensors without a pipeline engine.
+        # Side effects: P2P send/recv over the PP group; mutates pipeline_state queues; runs the wrapped module.
+        # KNOWN ISSUE: non-tensor non-pointer kwargs on a non-compute rank hit an assertion that they are tensors, contradicting the docstring's pass-through claim.
         """Forward pass
 
         We use a mechanism using TensorPointers to pass Tensors around
@@ -164,15 +206,26 @@ class PipelineBlock(nn.Module):
 
 
 def get_min_max_rank(module: torch.nn.Module) -> Tuple[int, int]:
+    # [FUNCTION DOC]
+    # Behavior: collects the assigned rank of all PipelineBlocks inside module and returns min and max.
+    # Inputs: module (nn.Module). Outputs: tuple (min rank, max rank).
+    # Exceptions: ValueError if no PipelineBlocks; AttributeError if a block has no rank yet. Side effects: None.
     """Finds min and max PP ranks of the underlying PipelineBlocks"""
     ranks = [module.rank for module in module.modules() if isinstance(module, PipelineBlock)]
     return min(ranks), max(ranks)
 
 
 def get_sort_key(current_rank: int):
+    # [FUNCTION DOC]
+    # HELPER: builds a sort key for PipelineBlock.forward kwargs ordering.
+    # Inputs: current_rank (int). Outputs: function mapping (name, value) to (rank, name), where rank is the
+    # TensorPointer group_rank or current_rank for local values. Exceptions/Side effects: None.
     """The idea is to free earlier ranks earlier."""
 
     def sort_key(elt: Tuple[str, Union[torch.Tensor, TensorPointer]]):
+        # [FUNCTION DOC]
+        # HELPER: returns (owning rank, name) for one kwargs item. Inputs: elt (name, value pair). Outputs: tuple.
+        # Exceptions/Side effects: None.
         name, tensor = elt
         rank: int
         if isinstance(tensor, TensorPointer):

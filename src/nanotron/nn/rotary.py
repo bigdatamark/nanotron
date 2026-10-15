@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Purpose: rotary position embedding (RoPE) implementations used by nanotron attention layers.
+# Main contents: RotaryEmbedding (a self-contained RoPE module that produces frequency tables and applies them,
+# optionally through the flash-attn fused kernel) and FlashRotaryEmbedding (a subclass of flash-attn's
+# RotaryEmbedding adding linear sequence-length interpolation).
+# Import-time side effects: imports flash_attn (fails if flash-attn is not installed); creates a module logger.
+# Exports: RotaryEmbedding, FlashRotaryEmbedding.
 import torch
 from flash_attn.layers.rotary import apply_rotary_emb as flash_apply_rotary_emb
 from torch import nn
@@ -9,6 +16,14 @@ logger = logging.get_logger(__name__)
 
 
 class RotaryEmbedding(nn.Module):
+    # [CLASS DOC]
+    # Purpose: computes RoPE angle tables for positions and rotates query/key tensors with them.
+    # Key state: dim, max_seq_len (updated on every forward to the last length used), interleaved (pairs adjacent
+    # dims instead of halves), seq_len_scaling_factor (positions are divided by it), fused (use flash-attn kernel),
+    # non-persistent buffers freqs_cis (inverse frequencies, length dim/2, on CUDA), cos_values and sin_values
+    # (lazily filled caches).
+    # Inheritance: torch.nn.Module.
+    # Invariant: freqs_cis lives on CUDA.
     def __init__(
         self,
         dim: int,
@@ -18,6 +33,14 @@ class RotaryEmbedding(nn.Module):
         seq_len_scaling_factor: float = None,
         fused: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores configuration, registers inverse frequencies 1 / base^(2i/dim) for i in 0..dim/2 as float32
+        # on CUDA, registers empty cos/sin caches, then asserts the buffer is on CUDA.
+        # Inputs: dim (int, rotary dimension, even), max_seq_len (int, default sequence length), base (float, default
+        # 10000.0), interleaved (bool, default False), seq_len_scaling_factor (float or None), fused (bool, default False).
+        # Outputs: None.
+        # Exceptions: AssertionError if freqs_cis is not on CUDA; CUDA errors if no GPU.
+        # Side effects: allocates CUDA memory.
         super().__init__()
         self.dim = dim
         self.max_seq_len = max_seq_len  # we set it as max_position_embeddings in init. but we ignore it of we provide `seq_length` in forward
@@ -37,6 +60,20 @@ class RotaryEmbedding(nn.Module):
         assert self.freqs_cis.device.type == "cuda"
 
     def forward(self, seq_length=None, position_offset=0, position_ids=None):
+        # [FUNCTION DOC]
+        # Behavior: casts freqs_cis to float32. If position_ids is given, uses them as positions (seq_length must be None
+        # and position_offset 0) and sets max_seq_len to max position + 1; otherwise uses a range of seq_length (or
+        # max_seq_len) plus position_offset and sets max_seq_len to that length. Divides positions by
+        # seq_len_scaling_factor when set. Takes the outer product with freqs_cis. If fused, returns that [N, dim/2]
+        # table; else duplicates it to [N, dim] by concatenation (non-interleaved) or by repeating each element twice
+        # (interleaved).
+        # Inputs: seq_length (int or None), position_offset (int, default 0), position_ids (tensor of positions, any
+        # shape that flattens to N, or None).
+        # Outputs: float32 tensor of angles, shape [N, dim/2] if fused else [N, dim].
+        # Exceptions: AssertionError if position_ids is combined with seq_length or a non-zero position_offset.
+        # Side effects: mutates self.freqs_cis and self.max_seq_len.
+        # KNOWN ISSUE: docstring promises shape [seq_length, 1, 1, dim]; actual output is 2D.
+        # KNOWN ISSUE: torch.outer requires 1D positions, so a 2D [batch, seq] position_ids would fail despite the docstring.
         """Generate rotary position embeddings.
 
         Args:
@@ -86,6 +123,13 @@ class RotaryEmbedding(nn.Module):
         return embeddings  # [b*s, dim] or [seq_length, dim] or [b*s, dim/2] or [seq_length, dim/2]
 
     def rotate_half(self, x):
+        # [FUNCTION DOC]
+        # Behavior: for interleaved layout, returns concatenation of negated odd dims and even dims; otherwise returns
+        # concatenation of negated second half and first half of the last dimension.
+        # Inputs: x (tensor, last dim even).
+        # Outputs: tensor with same shape as x.
+        # Exceptions: None explicitly raised.
+        # Side effects: None.
         """Rotates half the hidden dimensions of the input tensor."""
         if self.interleaved:
             even_dims = x[..., ::2]
@@ -97,6 +141,19 @@ class RotaryEmbedding(nn.Module):
             return torch.cat((-second_half, first_half), dim=-1)
 
     def apply_rotary_pos_emb(self, tensor, freqs, multi_latent_attention=False, mscale=1.0, seq_length=None):
+        # [FUNCTION DOC]
+        # Behavior: optionally de-interleaves the rotary part for multi-latent attention (evens then odds). On first call,
+        # caches cos(freqs)*mscale and sin(freqs)*mscale in the input dtype. Reshapes the rotary part to
+        # [batch, seq_length, nheads, head_dim]. If fused, applies flash-attn apply_rotary_emb in place; else computes
+        # x*cos + rotate_half(x)*sin with cos/sin broadcast over heads. Concatenates any pass-through part.
+        # Inputs: tensor ([batch*seq, nheads, dim]), freqs (angles from forward), multi_latent_attention (bool, default
+        # False), mscale (float, default 1.0), seq_length (int, required in practice).
+        # Outputs: rotated tensor of shape [batch, seq_length, nheads, dim].
+        # Exceptions: None explicitly raised; reshape errors if seq_length is None or does not divide the leading dim.
+        # Side effects: fills self.cos_values/self.sin_values on first call; the fused path modifies the input in place.
+        # KNOWN ISSUE: rotary_dim is set from freqs.shape[-1] and then compared to itself, so the partial-rotary split branch is dead and pass_through_part is always None.
+        # KNOWN ISSUE: cos/sin caches are computed once and never invalidated, so later calls with different freqs, mscale, sequence length or dtype silently reuse stale values.
+        # KNOWN ISSUE: non-fused path unsqueezes cos/sin at dim 1 giving [N,1,dim], which only broadcasts against [b,s,h,d] when batch is 1 or N matches; likely shape bug.
         """Apply rotary positional embedding to input tensor.
 
         Args:
@@ -148,6 +205,10 @@ class RotaryEmbedding(nn.Module):
     
 class FlashRotaryEmbedding(OrigFlashRotaryEmbedding):
 
+    # [CLASS DOC]
+    # Purpose: flash-attn RotaryEmbedding with an optional fixed linear position interpolation factor.
+    # Key state: seq_len_interpolation_factor plus all parent state (inv_freq, caches, scale).
+    # Inheritance: overrides the parent's cache-building method only.
     def __init__(
         self,
         dim: int,
@@ -158,6 +219,14 @@ class FlashRotaryEmbedding(OrigFlashRotaryEmbedding):
         device=None,
         seq_len_interpolation_factor=None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: forwards dim, base, interleaved, scale_base, pos_idx_in_fp32, device to the parent; stores
+        # seq_len_interpolation_factor.
+        # Inputs: dim (int); base (default 10000.0); interleaved (default False); scale_base (None for no XPos scaling);
+        # pos_idx_in_fp32 (default True); device (default None); seq_len_interpolation_factor (float or None).
+        # Outputs: None.
+        # Exceptions: None explicitly raised.
+        # Side effects: parent allocates inv_freq buffer.
         super().__init__(
             dim,
             base,
@@ -169,6 +238,16 @@ class FlashRotaryEmbedding(OrigFlashRotaryEmbedding):
         self.seq_len_interpolation_factor = seq_len_interpolation_factor
 
     def _update_cos_sin_cache(self, seqlen, device=None, dtype=None):
+        # [FUNCTION DOC]
+        # HELPER: rebuilds cos/sin caches used by the parent forward.
+        # Behavior: rebuilds when seqlen exceeds cached length, cache is empty, device or dtype differ, or training with
+        # an inference-mode cache. Builds positions in fp32 (recomputing inv_freq in fp32 if needed) or in inv_freq dtype,
+        # divides positions by seq_len_interpolation_factor when set (warning once on rank 0), takes the outer product, and
+        # stores cos/sin (and when XPos scale is set, scaled cos/sin for queries and inverse-scaled for keys) in dtype.
+        # Inputs: seqlen (int), device, dtype.
+        # Outputs: None.
+        # Exceptions: None explicitly raised.
+        # Side effects: mutates cached tensors and _seq_len_cached; logs a warning.
         # Reset the tables if the sequence length has changed,
         # if we're on a new device (possibly due to tracing for instance),
         # or if we're switching from inference mode to training

@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Purpose: context manager to temporarily attach a pipeline engine state to every PipelineBlock of a model.
+# Main contents: attach_pipeline_state_to_model.
+# Import-time side effects: None.
 from contextlib import contextmanager
 
 from nanotron.parallel.pipeline_parallel.block import PipelineBlock
@@ -7,6 +11,13 @@ from torch import nn as torch_nn
 
 @contextmanager
 def attach_pipeline_state_to_model(model: torch_nn.Module, pipeline_state: PipelineBatchState):
+    # [FUNCTION DOC]
+    # Behavior: for every PipelineBlock in model asserts it currently has no state, records it, and sets
+    # pipeline_state; yields; finally restores each block's previous state (None).
+    # Inputs: model (nn.Module), pipeline_state (PipelineBatchState).
+    # Outputs: generator yielding once.
+    # Exceptions: AssertionError if a block already has a state (blocks set before the failure are not restored).
+    # Side effects: mutates blocks' pipeline_state.
     """Attach the pipeline state to all the PipelineBlocks within `model`"""
     old_pipeline_states = []
 

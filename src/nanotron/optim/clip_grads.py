@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Purpose: global gradient-norm clipping across a model-parallel replica (TP x PP ranks).
+# Main contents: clip_grad_norm.
+# Import-time side effects: creates a module logger.
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -18,6 +22,20 @@ def clip_grad_norm(
     grad_accumulator: Optional[GradientAccumulator],
     norm_type: float = 2.0,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior: materializes named_parameters; asserts every parameter requires grad. Collects gradients, from
+    # param.grad or from grad_accumulator's fp32 buffers, skipping tied parameters on ranks that are not the first
+    # global rank of the tie so each tied gradient is counted once. For norm_type infinity: local max of per-grad
+    # inf norms (zero scalar if no grads), then all-reduce MAX over mp_pg. Otherwise: sums per-grad p-norms raised to
+    # p (zero if no grads), all-reduce SUM over mp_pg, then takes the 1/p root. Computes clip coefficient
+    # max_norm / (total_norm + 1e-6) clamped to at most 1 and multiplies every parameter's gradient (all
+    # parameters, including tied copies) in place by it, without a host sync.
+    # Inputs: mp_pg (process group of one model replica), named_parameters (iterable of name, NanotronParameter),
+    # max_norm (float), grad_accumulator (GradientAccumulator or None), norm_type (float, default 2.0, may be inf).
+    # Outputs: total gradient norm as a float32 scalar tensor (pre-clipping).
+    # Exceptions: AssertionError if any parameter does not require grad.
+    # Side effects: all-reduce collective on mp_pg; in-place scaling of gradients or accumulator buffers; CUDA allocation.
+    # KNOWN ISSUE: parameters whose grad is None (when grad_accumulator is None) would crash when collecting devices and scaling.
     """Clips gradients. Adapted from torch.nn.utils.clip_grad_norm_.
     Norms are computed in fp32 precision to retain most accuracy.
 

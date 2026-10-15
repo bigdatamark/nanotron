@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Purpose: point-to-point tensor transfer between pipeline-parallel ranks, including shipping tensor metadata
+# (shape, stride, dtype, storage size, requires_grad) so the receiver can allocate matching buffers.
+# Main contents: metadata encoding tables (ID_TO_DTYPE, DTYPE_TO_ID, requires-grad and contiguity id tables,
+# FIRST_METADATA_SIZE of 7 longs, SECOND_METADATA_SIZE initial 1024 longs), P2PTensorMetaData, view_as_contiguous,
+# P2P (blocking/async send and recv of tensor lists), BatchTensorSendRecvState (batched isend/irecv in three phases).
+# Protocol: first metadata is 7 longs: number of shape dims, number of stride dims, contiguity id, untyped
+# storage size in bytes, storage offset, dtype id, requires_grad id. Second metadata is shape followed by stride.
+# Then the data (whole storage for non-contiguous tensors; complex sent as real views).
+# Import-time side effects: creates a module logger.
 import dataclasses
 from typing import List, Sequence, Tuple
 
@@ -34,6 +44,10 @@ IS_CONTIGUOUS_TO_ID = {value: id_ for id_, value in enumerate(ID_TO_IS_CONTIGUOU
 
 @dataclasses.dataclass
 class P2PTensorMetaData:
+    # [CLASS DOC]
+    # Purpose: dataclass describing a tensor to be received; can allocate a receive buffer and reinterpret it.
+    # Attributes: shape, stride (sequences of ints), is_contiguous, untyped_storage_size (bytes), storage_offset,
+    # dtype, requires_grad.
     shape: Sequence[int]
     stride: Sequence[int]
     is_contiguous: bool
@@ -43,6 +57,12 @@ class P2PTensorMetaData:
     requires_grad: bool
 
     def create_empty_storage(self, device: torch.device) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: allocates an int8 buffer of untyped_storage_size bytes on device, views it as dtype, sets requires_grad,
+        # and if contiguous applies as_strided with shape, stride and storage offset; complex buffers are viewed as real.
+        # Inputs: device. Outputs: receive buffer tensor.
+        # Exceptions: None explicitly raised (view errors if size not divisible by element size).
+        # Side effects: device allocation.
         buffer = torch.empty(
             size=(self.untyped_storage_size,),
             requires_grad=False,
@@ -64,6 +84,10 @@ class P2PTensorMetaData:
         return buffer
 
     def reshape(self, buffer):
+        # [FUNCTION DOC]
+        # Behavior: views a real buffer back as complex for complex dtypes; if non-contiguous applies as_strided with the
+        # recorded shape, stride and offset.
+        # Inputs: buffer (tensor). Outputs: tensor in the original layout. Exceptions/Side effects: None.
         """Changes the way we view buffer in order to fit metadata"""
         # TODO @thomasw21: Find the issue with send/recv complex tensors
         buffer = torch.view_as_complex(buffer) if self.dtype.is_complex else buffer
@@ -78,6 +102,10 @@ class P2PTensorMetaData:
 
     @staticmethod
     def to_first_metadata(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: encodes the 7-element first metadata of tensor as a long tensor on device.
+        # Inputs: tensor, device. Outputs: long tensor of length 7.
+        # Exceptions: KeyError for unsupported dtypes. Side effects: device allocation.
         # TODO @nouamane: avoid having two metadata comms, and preallocate shape/stride instead
         return torch.tensor(
             [
@@ -95,10 +123,19 @@ class P2PTensorMetaData:
 
     @staticmethod
     def to_second_metadata(tensor: torch.Tensor, device: torch.device) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: encodes shape followed by stride as a long tensor on device.
+        # Inputs: tensor, device. Outputs: long tensor. Exceptions/Side effects: None.
         return torch.tensor(tensor.shape + tensor.stride(), dtype=torch.long, device=device)
 
     @classmethod
     def from_metadata(cls, first_metadata: List[int], second_metadata: List[int]):
+        # [FUNCTION DOC]
+        # Behavior: decodes first metadata (list of 7 ints) and second metadata (shape then stride, split in half) into
+        # a P2PTensorMetaData.
+        # Inputs: first_metadata, second_metadata (lists of ints). Outputs: P2PTensorMetaData.
+        # Exceptions: ValueError on wrong length; IndexError on unknown ids. Side effects: None.
+        # KNOWN ISSUE: splits shape and stride by half the length instead of using the transmitted dim counts; correct only because counts are always equal.
         shape_and_stride = second_metadata
         (
             num_shape,
@@ -121,6 +158,12 @@ class P2PTensorMetaData:
 
 
 def view_as_contiguous(tensor: torch.Tensor):
+    # [FUNCTION DOC]
+    # Behavior: asserts the tensor covers at least its whole untyped storage, then returns a flat tensor of the
+    # tensor's dtype over the entire storage.
+    # Inputs: tensor. Outputs: 1D tensor sharing storage.
+    # Exceptions: AssertionError if the tensor is a view of only part of its storage. Side effects: None.
+    # KNOWN ISSUE: assertion message says storage should be smaller than the tensor, which is the opposite of the intended "tensor must cover its storage" reading; also rejects all sliced views.
     """Given a tensor, we want to view the tensor as a contiguous storage"""
     tensor_numel = tensor.numel()
     tensor_element_size = tensor.element_size()
@@ -135,13 +178,22 @@ def view_as_contiguous(tensor: torch.Tensor):
 
 
 class P2P:
+    # [CLASS DOC]
+    # Purpose: P2P sender/receiver bound to one process group (typically PP group) and device.
+    # Key state: pg, device, first_metadata (reusable 7-long buffer), second_metadata (reusable, grown as needed).
     def __init__(self, pg: dist.ProcessGroup, device: torch.device):
+        # [FUNCTION DOC]
+        # Behavior: stores pg and device and preallocates metadata buffers on device.
+        # Inputs: pg (ProcessGroup), device (torch.device). Outputs: None. Exceptions: None. Side effects: device allocation.
         self.pg = pg
         self.device = device
         self.first_metadata = torch.empty(FIRST_METADATA_SIZE, dtype=torch.long, device=self.device)
         self.second_metadata = torch.empty(SECOND_METADATA_SIZE, dtype=torch.long, device=self.device)
 
     def _send_first_metadata_p2p_op(self, tensor: torch.Tensor, to_rank: int, tag: int = 0) -> dist.P2POp:
+        # [FUNCTION DOC]
+        # HELPER: builds an isend P2POp of the first metadata of tensor to group rank to_rank.
+        # Inputs: tensor, to_rank (group rank), tag (default 0). Outputs: P2POp. Exceptions/Side effects: allocation only.
         first_metadata = P2PTensorMetaData.to_first_metadata(tensor=tensor, device=self.device)
         return dist.P2POp(
             op=dist.isend,
@@ -152,6 +204,9 @@ class P2P:
         )
 
     def _recv_first_metadata_p2p_op(self, from_rank: int, tag: int = 0) -> Tuple[torch.Tensor, dist.P2POp]:
+        # [FUNCTION DOC]
+        # HELPER: allocates a 7-long buffer and an irecv P2POp from group rank from_rank.
+        # Inputs: from_rank, tag. Outputs: (buffer, P2POp). Exceptions/Side effects: allocation only.
         first_metadata_buffer = torch.empty((FIRST_METADATA_SIZE,), dtype=torch.long, device=self.device)
         return first_metadata_buffer, dist.P2POp(
             op=dist.irecv,
@@ -162,6 +217,8 @@ class P2P:
         )
 
     def _send_second_metadata_p2p_op(self, tensor: torch.Tensor, to_rank: int, tag: int = 0) -> dist.P2POp:
+        # [FUNCTION DOC]
+        # HELPER: builds an isend P2POp of shape+stride of tensor. Inputs: tensor, to_rank, tag. Outputs: P2POp.
         second_metadata = P2PTensorMetaData.to_second_metadata(tensor=tensor, device=self.device)
         return dist.P2POp(
             op=dist.isend,
@@ -174,6 +231,9 @@ class P2P:
     def _recv_second_metadata_p2p_op(
         self, shape_length: int, stride_length: int, from_rank: int, tag: int = 0
     ) -> Tuple[torch.Tensor, dist.P2POp]:
+        # [FUNCTION DOC]
+        # HELPER: allocates a buffer of shape_length + stride_length longs and an irecv P2POp.
+        # Inputs: shape_length, stride_length, from_rank, tag. Outputs: (buffer, P2POp).
         second_metadata_buffer = torch.empty((shape_length + stride_length,), dtype=torch.long, device=self.device)
         return second_metadata_buffer, dist.P2POp(
             op=dist.irecv,
@@ -184,6 +244,8 @@ class P2P:
         )
 
     def _send_data_p2p_op(self, tensor: torch.Tensor, to_rank: int, tag: int = 0) -> dist.P2POp:
+        # [FUNCTION DOC]
+        # HELPER: builds an isend P2POp of tensor. Inputs: tensor, to_rank, tag. Outputs: P2POp.
         return dist.P2POp(
             op=dist.isend,
             tensor=tensor,
@@ -195,6 +257,9 @@ class P2P:
     def _recv_data_p2p_op(
         self, tensor_metadata: P2PTensorMetaData, from_rank: int, tag: int = 0
     ) -> Tuple[torch.Tensor, dist.P2POp]:
+        # [FUNCTION DOC]
+        # HELPER: allocates a receive buffer from metadata and builds an irecv P2POp.
+        # Inputs: tensor_metadata, from_rank, tag. Outputs: (buffer, P2POp). Side effects: device allocation.
         tensor_buffer = tensor_metadata.create_empty_storage(self.device)
         return tensor_buffer, dist.P2POp(
             op=dist.irecv,
@@ -205,6 +270,13 @@ class P2P:
         )
 
     def _send_meta(self, tensor: torch.Tensor, to_rank: int, tag: int):
+        # [FUNCTION DOC]
+        # HELPER: blocking send of first then second metadata for tensor.
+        # Behavior: fills the reusable first metadata buffer and sends it; asserts dim counts; grows the second buffer if
+        # needed, fills and sends shape+stride.
+        # Inputs: tensor, to_rank (group rank), tag. Outputs: None.
+        # Exceptions: AssertionError on inconsistent counts; KeyError for unsupported dtype.
+        # Side effects: blocking sends; may reallocate self.second_metadata.
         cpu_tensor = torch.tensor(
             [
                 len(tensor.shape),
@@ -243,6 +315,12 @@ class P2P:
         )
 
     def _recv_meta(self, from_rank: int, tag: int) -> P2PTensorMetaData:
+        # [FUNCTION DOC]
+        # HELPER: blocking receive of first and second metadata into reusable buffers.
+        # Behavior: receives 7 longs, grows second buffer if needed, receives shape+stride, builds P2PTensorMetaData.
+        # Inputs: from_rank, tag. Outputs: P2PTensorMetaData.
+        # Exceptions: IndexError on unknown ids. Side effects: blocking receives; may reallocate buffer.
+        # KNOWN ISSUE: shape and stride are views into the reusable second_metadata buffer (device tensors), so a later receive overwrites the metadata of earlier received tensors still referencing them; also the scalar fields stay 0-d tensors rather than ints.
         dist.recv(
             self.first_metadata,
             src=dist.get_global_rank(group=self.pg, group_rank=from_rank),
@@ -287,6 +365,13 @@ class P2P:
         )
 
     def isend_tensors(self, tensors: List[torch.Tensor], to_rank: int, tag: int = 0) -> List[dist.Work]:
+        # [FUNCTION DOC]
+        # Behavior: for each tensor sends metadata (blocking), then async-sends the tensor (or the whole storage if
+        # non-contiguous; complex as real view) to to_rank.
+        # Inputs: tensors (list), to_rank (group rank), tag (default 0). Outputs: list of Work handles.
+        # Exceptions: ValueError if to_rank is the current rank; AssertionError from view_as_contiguous.
+        # Side effects: P2P communication; debug logging.
+        # KNOWN ISSUE: a contiguous tensor that is a view on a larger storage is sent with only its numel elements, while the receiver allocates and receives the whole storage size, causing size mismatch.
         futures = []
         current_rank = dist.get_rank(self.pg)
         logger.debug(f"Current rank {current_rank} sending to rank {to_rank}. Nb_tensors: {len(tensors)}")
@@ -317,6 +402,11 @@ class P2P:
     def irecv_tensors(
         self, num_tensors: int, from_rank: int, tag: int = 0
     ) -> Tuple[List[torch.Tensor], List[dist.Work]]:
+        # [FUNCTION DOC]
+        # Behavior: for each expected tensor receives metadata (blocking), allocates a buffer, posts an async receive, and
+        # reshapes the buffer per metadata.
+        # Inputs: num_tensors (int), from_rank, tag. Outputs: (list of buffers, list of Work handles).
+        # Exceptions: ValueError if from_rank is the current rank. Side effects: P2P communication; allocation.
         futures = []
         buffers = []
         current_rank = dist.get_rank(self.pg)
@@ -345,11 +435,17 @@ class P2P:
         return buffers, futures
 
     def send_tensors(self, tensors: List[torch.Tensor], to_rank: int, tag: int = 0):
+        # [FUNCTION DOC]
+        # Blocking variant of isend_tensors (waits on all handles). Inputs: tensors, to_rank, tag. Outputs: None.
+        # Exceptions: as isend_tensors. Side effects: P2P communication.
         futures = self.isend_tensors(tensors=tensors, to_rank=to_rank, tag=tag)
         for future in futures:
             future.wait()
 
     def recv_tensors(self, num_tensors: int, from_rank: int, tag: int = 0) -> List[torch.Tensor]:
+        # [FUNCTION DOC]
+        # Blocking variant of irecv_tensors. Inputs: num_tensors, from_rank, tag. Outputs: list of received tensors.
+        # Exceptions: as irecv_tensors. Side effects: P2P communication.
         buffers, futures = self.irecv_tensors(num_tensors=num_tensors, from_rank=from_rank, tag=tag)
         for future in futures:
             future.wait()
@@ -357,6 +453,11 @@ class P2P:
 
 
 class BatchTensorSendRecvState:
+    # [CLASS DOC]
+    # Purpose: accumulate sends and receives and execute them together with batch_isend_irecv in flush.
+    # Key state: p2p, first_metadata_p2p_ops (send and recv ops), second_metadata_p2p_ops (sends only),
+    # data_p2p_ops (sends only), recv_first_metadata_buffers, recv_from_ranks.
+    # Invariant: recv buffers and recv ranks have equal length; state is cleared after each flush.
     """
     This class is used to register send/recv batches of tensors, and
     then executes send/recv in `flush()` calls. This is useful for
@@ -372,10 +473,14 @@ class BatchTensorSendRecvState:
     recv_from_ranks: List[int]
 
     def __init__(self, p2p: P2P):
+        # [FUNCTION DOC]
+        # Stores p2p and resets lists. Inputs: p2p. Outputs: None.
         self.p2p = p2p
         self._reset()
 
     def _reset(self):
+        # [FUNCTION DOC]
+        # HELPER: clears all queued ops and receive bookkeeping. Outputs: None. Side effects: mutates self.
         self.first_metadata_p2p_ops: List[dist.P2POp] = []
         self.second_metadata_p2p_ops: List[dist.P2POp] = []
         self.data_p2p_ops: List[dist.P2POp] = []
@@ -383,9 +488,15 @@ class BatchTensorSendRecvState:
         self.recv_from_ranks: List[int] = []
 
     def __str__(self):
+        # [FUNCTION DOC]
+        # Returns a summary with counts of queued ops and the receive ranks. Outputs: str.
         return f"BatchTensorSendRecvState(first_metadata_p2p_ops={len(self.first_metadata_p2p_ops)}, second_metadata_p2p_ops={len(self.second_metadata_p2p_ops)}, data_p2p_ops={len(self.data_p2p_ops)}, recv_first_metadata_buffers={len(self.recv_first_metadata_buffers)}, recv_from_ranks={self.recv_from_ranks})"
 
     def add_send(self, tensor: torch.Tensor, to_rank: int, tag: int = 0):
+        # [FUNCTION DOC]
+        # Behavior: queues first-metadata, second-metadata and data (whole storage via view_as_contiguous) send ops.
+        # Inputs: tensor, to_rank (group rank), tag (default 0). Outputs: None.
+        # Exceptions: AssertionError from view_as_contiguous. Side effects: allocates metadata tensors.
         self.first_metadata_p2p_ops.append(
             self.p2p._send_first_metadata_p2p_op(tensor=tensor, to_rank=to_rank, tag=tag)
         )
@@ -397,6 +508,10 @@ class BatchTensorSendRecvState:
         )
 
     def add_recv(self, from_rank: int, tag: int = 0) -> int:
+        # [FUNCTION DOC]
+        # Behavior: queues only the first-metadata receive (later phases need its result) and records the source.
+        # Inputs: from_rank, tag. Outputs: index of the receive (position in returned list of flush).
+        # Exceptions: None. Side effects: allocation.
         """
         Only add p2p ops for the first operation, as `_recv_second_metadata` and `_recv_data_p2p_op`
         require results from the first metadata to be transfered first.
@@ -409,6 +524,9 @@ class BatchTensorSendRecvState:
         return len(self.recv_first_metadata_buffers) - 1
 
     def _send_recv_first_metadata(self) -> List[List[int]]:
+        # [FUNCTION DOC]
+        # HELPER: runs all first-metadata ops, waits, and copies receive buffers to host lists (early sync).
+        # Outputs: list of 7-int lists. Side effects: communication and device sync.
         # Send/Recv first metadata
         reqs = dist.batch_isend_irecv(self.first_metadata_p2p_ops)
         for req in reqs:
@@ -420,6 +538,10 @@ class BatchTensorSendRecvState:
         return first_metadatas
 
     def _send_recv_second_metadata(self, first_metadata: List[List[int]]) -> List[List[int]]:
+        # [FUNCTION DOC]
+        # HELPER: builds second-metadata receives sized from first metadata, runs them with queued second-metadata sends,
+        # waits and returns host lists.
+        # Inputs: first_metadata (list of lists). Outputs: list of int lists. Side effects: communication.
         # turn a list of tuple into a tuple of list
         recv_second_metadata_buffers, recv_second_metadata_ops = zip(
             *(
@@ -441,6 +563,11 @@ class BatchTensorSendRecvState:
         return second_metadatas
 
     def _send_recv_data(self, tensor_metadatas: List[P2PTensorMetaData]) -> List[torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: allocates data receive buffers from metadata, runs them with queued data sends, waits, and returns
+        # buffers as_strided to recorded shape and stride.
+        # Inputs: tensor_metadatas (list of P2PTensorMetaData). Outputs: list of tensors. Side effects: communication.
+        # KNOWN ISSUE: the final as_strided ignores storage_offset and, for complex dtypes, is applied to the real view with complex shape/stride, giving wrong results.
         # turn a list of tuples into a tuple of list
         recv_data_buffers, recv_data_ops = zip(
             *(
@@ -461,6 +588,12 @@ class BatchTensorSendRecvState:
         ]
 
     def flush(self) -> List[torch.Tensor]:
+        # [FUNCTION DOC]
+        # Behavior: asserts bookkeeping consistency. Returns empty list if nothing queued. If there are only sends,
+        # issues all three phases' ops in one batch, waits, resets, returns empty list. Otherwise runs the three phases
+        # (first metadata, second metadata, data), builds metadata objects, resets, and returns received tensors in add_recv order.
+        # Inputs: none. Outputs: list of received tensors.
+        # Exceptions: AssertionError on inconsistent bookkeeping. Side effects: P2P communication; debug logging; resets state.
         """
         Run all communication in a batch.
         Return `torch.Tensor` in the case of recv.
