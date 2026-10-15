@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Purpose: Runtime sanity checks run by the trainer around each training step (before/after the
+# pipeline engine train_batch_iter, before/after the optimizer step) to catch desynchronized weights,
+# gradients or optimizer states across data/context-parallel replicas and tied groups, plus a
+# dataloader inspection helper.
+# Main contents: assert_tensor_synced_across_pg, assert_fail_except_rank_with,
+# before_tbi_sanity_checks, after_tbi_sanity_checks, before_optim_step_sanity_checks,
+# after_optim_step_sanity_checks, check_optim_state_in_sync, sanity_check_dataloader.
+# All step checks are skipped when config.general.ignore_sanity_checks is true.
+# Import-time side effects: creates a module logger.
 from contextlib import contextmanager
 from typing import Callable, Optional
 
@@ -22,6 +32,14 @@ def assert_tensor_synced_across_pg(
     msg: Optional[Callable[[str], str]] = None,
     reference_rank: int = 0,
 ):
+    # [FUNCTION DOC]
+    # Behavior: the reference rank broadcasts its tensor to all ranks of pg (others receive into an empty
+    # buffer); every rank then compares its own tensor with the reference using torch.testing.assert_close.
+    # Inputs: tensor (torch.Tensor), pg (ProcessGroup), msg (optional callable building the error message),
+    # reference_rank (group rank, default 0).
+    # Outputs: None.
+    # Exceptions: AssertionError when tensors differ.
+    # Side effects: broadcast collective on pg (must be called by all ranks of pg).
     """Assert that `tensor` is synced across `pg` with reference rank. Note that this always passes for reference rank"""
     if dist.get_rank(pg) == reference_rank:
         reference_tensor = tensor
@@ -40,6 +58,15 @@ def assert_tensor_synced_across_pg(
 # TODO @nouamanetazi: remove this with SANITY_CHECKS
 @contextmanager
 def assert_fail_except_rank_with(exception_class, rank_exception, pg):
+    # [FUNCTION DOC]
+    # HELPER: test-style context manager asserting that every rank except one raises a given exception.
+    # Behavior: runs the body; if exception_class is raised it errors when the rank is rank_exception and
+    # otherwise swallows it; any other exception becomes an AssertionError; if nothing was raised on a rank
+    # other than rank_exception, raises AssertionError.
+    # Inputs: exception_class (exception type), rank_exception (group rank expected not to raise), pg.
+    # Outputs: yields None.
+    # Exceptions: AssertionError on any expectation mismatch.
+    # Side effects: None.
     try:
         yield
     except exception_class:
@@ -61,6 +88,16 @@ def before_tbi_sanity_checks(
     grad_accumulator: GradientAccumulator,
     lr_scheduler: torch.optim.lr_scheduler.LRScheduler,
 ) -> None:
+    # [FUNCTION DOC]
+    # Behavior: unless ignored, checks that all parameters (sorted by name) are synced across the dp_cp
+    # group; tied parameters are synced across their tied groups; model grads are None or exactly zero;
+    # grad accumulator fp32 buffers are exactly zero; the first optimizer param group's lr equals the
+    # scheduler's last lr; then calls the model's own before_tbi_sanity_checks.
+    # Inputs: config (Config), parallel_context, unwrapped_model (NanotronModel), grad_accumulator
+    # (optional GradientAccumulator), lr_scheduler.
+    # Outputs: None.
+    # Exceptions: AssertionError on any failed check.
+    # Side effects: broadcast collectives on dp_cp and tied groups.
     if not config.general.ignore_sanity_checks:
         # SANITY CHECK: Check that the model params are synchronized across dp_cp
         for name, param in sorted(unwrapped_model.named_parameters(), key=lambda x: x[0]):
@@ -128,6 +165,15 @@ def after_tbi_sanity_checks(
     unwrapped_model: NanotronModel,
     grad_accumulator: GradientAccumulator,
 ) -> None:
+    # [FUNCTION DOC]
+    # Behavior: unless ignored, for every parameter requiring grad, resolves its (tied full) name, fetches
+    # the gradient from the accumulator buffer or the param, raises if it contains NaN or Inf, logs an
+    # error if it is missing; then calls the model's after_tbi_sanity_checks.
+    # Inputs: config, parallel_context, unwrapped_model, grad_accumulator (optional).
+    # Outputs: None.
+    # Exceptions: ValueError on NaN/Inf gradients.
+    # Side effects: logging.
+    # KNOWN ISSUE: the None check comes after calling isnan on the gradient, so a missing gradient raises TypeError instead of being logged.
     if not config.general.ignore_sanity_checks:
         # SANITY CHECK: Check that gradient flow on the entire model
         # SANITY CHECK: Check that all parameters that required gradients, have actually a gradient
@@ -167,6 +213,15 @@ def before_optim_step_sanity_checks(
     grad_accumulator: GradientAccumulator,
     optimizer: optim.BaseOptimizer,
 ) -> None:
+    # [FUNCTION DOC]
+    # Behavior: unless ignored, checks tied gradients are non-None and synced across tied groups, all
+    # gradients are non-None and synced across dp_cp, parameters synced across dp_cp, tied parameters
+    # synced across tied groups, optimizer states synced across dp_cp, then calls the model's
+    # before_optim_step_sanity_checks.
+    # Inputs: config, parallel_context, unwrapped_model, grad_accumulator (optional), optimizer (BaseOptimizer).
+    # Outputs: None.
+    # Exceptions: AssertionError on missing or unsynced data.
+    # Side effects: broadcast collectives.
     if not config.general.ignore_sanity_checks:
         # SANITY CHECK: Test tied weights gradients are synchronized
         for (name, group_ranks), param in sorted(
@@ -247,6 +302,11 @@ def after_optim_step_sanity_checks(
     unwrapped_model: NanotronModel,
     grad_accumulator: GradientAccumulator,
 ) -> None:
+    # [FUNCTION DOC]
+    # Behavior: unless ignored, logs an error for each parameter requiring grad that still has a gradient,
+    # then calls the model's after_optim_step_sanity_checks.
+    # Inputs: config, parallel_context, unwrapped_model, grad_accumulator (unused).
+    # Outputs: None. Exceptions: None explicitly raised. Side effects: logging.
     if not config.general.ignore_sanity_checks:
         # SANITY CHECK: Check that gradients is cleared
         for name, param in unwrapped_model.named_parameters():
@@ -265,6 +325,11 @@ def after_optim_step_sanity_checks(
 
 
 def check_optim_state_in_sync(optim_state_dict: dict, pg: dist.ProcessGroup):
+    # [FUNCTION DOC]
+    # Behavior: iterates optimizer states sorted by parameter index and asserts every state tensor except
+    # "step" is synced across pg.
+    # Inputs: optim_state_dict (optimizer state dict with a "state" entry), pg (ProcessGroup).
+    # Outputs: None. Exceptions: AssertionError if out of sync. Side effects: broadcast collectives.
     for _, optim_state in sorted(optim_state_dict["state"].items(), key=lambda x: x[0]):
         for name, tensor in optim_state.items():
             if name == "step":
@@ -275,6 +340,17 @@ def check_optim_state_in_sync(optim_state_dict: dict, pg: dist.ProcessGroup):
 
 
 def sanity_check_dataloader(dataloader, tokenizer_path, sanity_check_dataloader_interval=None):
+    # [FUNCTION DOC]
+    # Behavior: no-op when the interval is None. Otherwise loads the tokenizer; on global rank 0 truncates
+    # sanity_check.txt, iterates the dataloader and for every batch index divisible by the interval prints
+    # the batch and decoded samples (first 400 chars) and appends full texts to the file, stopping after 10
+    # inspected batches, then raises AssertionError to stop training. Other ranks wait on a barrier.
+    # Inputs: dataloader (iterable of dicts containing input_ids), tokenizer_path (str),
+    # sanity_check_dataloader_interval (optional int).
+    # Outputs: None.
+    # Exceptions: AssertionError always raised on rank 0 when enabled.
+    # Side effects: file writes in the working directory, printing, tokenizer download, global barrier.
+    # KNOWN ISSUE: rank 0 raises before reaching the barrier, so other ranks block on the barrier forever.
     """
     Debug function to check dataloader samples.
     Args:

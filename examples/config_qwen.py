@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Purpose: Example script that generates a YAML training config for a Qwen2 model of a chosen preset size, to be used with nanotron's run_train.py.
+# Main contents: MODEL_SIZES preset table (layers, hidden, heads, kv_heads, ffn size), get_args (CLI), get_model_config, calculate_parameters, a module-level data_stages list (one stable stage reading a Nanoset folder), and create_config.
+# Main entry (run as script): parses CLI args, builds model config and full Config, prints param count, saves YAML to the --out path, and prints a suggested torchrun command (world size dp*tp*pp*cp) if at most 8 GPUs, else points to slurm_launcher.py.
+# Side effects at import: none beyond building data_stages. As script: creates ./checkpoints, writes YAML, prints.
+# KNOWN ISSUE: printed world size ignores expert parallel size (ep).
 """ Example python script to generate a YAML config file which can be used to run a training with nanotron. Refer to "examples" section in the `/README.md` for more information."""
 import argparse
 import os
@@ -43,6 +49,12 @@ MODEL_SIZES: Dict[str, Tuple[int, int, int, int, int]] = {
 
 
 def get_args():
+    # [FUNCTION DOC]
+    # Behavior: Builds an argparse parser with model size choice (default "3b"), output path (default this file with .py replaced by .yaml), run name, steps (32000), no-sanity flag, log level, parallelism group (dp=2, tp=1, pp=1, cp=1, ep=1, zero in 0/1), tokens group (seq 4096, mbs 3, acc 1), and checkpoint save interval (10); parses sys.argv.
+    # Inputs: None (reads command line).
+    # Outputs: argparse Namespace with the parsed options.
+    # Exceptions: SystemExit from argparse on invalid arguments or --help.
+    # Side effects: reads sys.argv; may print usage.
     parser = argparse.ArgumentParser(description="Generate Qwen model configuration YAML file")
     parser.add_argument(
         "--model",
@@ -85,6 +97,13 @@ def get_args():
 
 
 def get_model_config(model_size: str) -> Qwen2Config:
+    # [FUNCTION DOC]
+    # Behavior: Looks up the preset tuple for model_size and returns a Qwen2Config with those layer/hidden/heads/kv_heads/intermediate sizes and fixed other values (silu, vocab 128256, max positions 4096, tied embeddings, rms eps 1e-6, flash_attention_2, document masking on, bos 1, eos 2).
+    # Inputs: model_size: string key of MODEL_SIZES.
+    # Outputs: Qwen2Config.
+    # Exceptions: ValueError if model_size is not a known preset.
+    # Side effects: None.
+    # KNOWN ISSUE: inline comment mentions "tiny model with MoE layers" but no MoE settings are configured.
     """Get a Qwen2Config for the specified model size."""
     if model_size not in MODEL_SIZES:
         raise ValueError(f"Model size '{model_size}' not found. Available sizes: {list(MODEL_SIZES.keys())}")
@@ -117,6 +136,13 @@ def get_model_config(model_size: str) -> Qwen2Config:
 
 
 def calculate_parameters(model_config: Qwen2Config) -> str:
+    # [FUNCTION DOC]
+    # Behavior: Approximates parameter count as 2*vocab*hidden (embeddings and head) plus layers times (3*hidden*intermediate + 4*hidden^2), then formats with human_format.
+    # Inputs: model_config: Qwen2Config.
+    # Outputs: human-readable string (e.g. "3.1B").
+    # Exceptions: None explicitly raised.
+    # Side effects: None.
+    # KNOWN ISSUE: ignores tied embeddings and grouped-query KV heads, so the estimate is approximate.
     """Calculate the number of parameters in a model."""
     params = model_config.vocab_size * model_config.hidden_size * 2 + model_config.num_hidden_layers * (  # Embeddings
         3 * model_config.hidden_size * model_config.intermediate_size  # MLP
@@ -157,6 +183,12 @@ data_stages = [
 
 
 def create_config(model_config: Qwen2Config, args: argparse.Namespace) -> Config:
+    # [FUNCTION DOC]
+    # Behavior: Builds a cosine LR scheduler (3e-4, 2000 linear warmup steps, min 0), ParallelismArgs from args (dp, pp, tp, cp, ep; 1f1b, REDUCE_SCATTER, async TP), TokensArgs from args, AdamW OptimizerArgs (ZeRO stage from args, weight decay 0.1, clip 1.0, fp32 grad accumulation, fused), ensures ./checkpoints exists, and assembles a Config with project "debug", random init std 0.025, logging levels from args, and the module-level data_stages.
+    # Inputs: model_config: Qwen2Config; args: Namespace from get_args.
+    # Outputs: nanotron Config.
+    # Exceptions: None explicitly raised (Config validation may raise).
+    # Side effects: creates ./checkpoints directory.
     learning_rate = LRSchedulerArgs(
         learning_rate=3e-4, lr_warmup_steps=2000, lr_warmup_style="linear", lr_decay_style="cosine", min_decay_lr=0
     )

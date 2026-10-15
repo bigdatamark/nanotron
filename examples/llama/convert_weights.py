@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Purpose: Shared utilities for converting Llama-style checkpoints between HuggingFace and nanotron formats: parameter-name mappings, config-field mappings, a single-rank parallel config, and a nanotron model loader.
+# Main contents: get_weight_mapping, get_config_mapping, make_parallel_config, load_nanotron_model. Used by convert_hf_to_nanotron.py and convert_nanotron_to_hf.py.
+# Import-time side effects: None.
 import json
 from pathlib import Path
 from typing import Optional
@@ -18,6 +22,12 @@ from nanotron.trainer import mark_tied_parameters
 
 
 def get_weight_mapping(config: NanotronLlamaConfig, nt_to_hf: bool = True) -> dict[str, str]:
+    # [FUNCTION DOC]
+    # Behavior: Builds an HF-to-nanotron parameter name mapping: lm_head, token embedding and final norm, then per layer q/k/v weights all mapping to the fused qkv_proj weight, o_proj, gate and up weights and biases mapping to the fused gate_up_proj, down_proj weight and bias, and the two layer norms. If nt_to_hf, inverts it, collecting several HF names into a list when they share one nanotron name (qkv gets three, gate_up two).
+    # Inputs: config: nanotron Llama-like config (uses num_hidden_layers); nt_to_hf: bool, default True.
+    # Outputs: dictionary from string to string, or (nt_to_hf) to a string or list of strings.
+    # Exceptions: None explicitly raised. Side effects: None.
+    # KNOWN ISSUE: the embedding entry is assigned twice (harmless duplicate); attention q/k/v biases are not mapped, so models with attention_bias cannot be converted.
     """Returns the nanotron to huggingface parameter mapping if `nt_to_hf`, otherwise the
     huggingface to nanotron mapping."""
 
@@ -61,6 +71,9 @@ def get_weight_mapping(config: NanotronLlamaConfig, nt_to_hf: bool = True) -> di
 
 
 def get_config_mapping(nt_to_hf: bool = True) -> dict[str, str]:
+    # [FUNCTION DOC]
+    # Behavior: Returns the identity mapping of config field names shared by HF LlamaConfig and nanotron configs (token ids, sizes, heads, norms, rope, tying, cache, vocab, attention_bias), inverted when nt_to_hf (identical since names match).
+    # Inputs: nt_to_hf: bool, default True. Outputs: dictionary of field name to field name. Exceptions: None. Side effects: None.
     """Returns either the nanotron to huggingface (if `nt_to_hf`)
     configuration mapping, or the huggingface to nanotron."""
 
@@ -98,6 +111,11 @@ def make_parallel_config(
     tp_mode: TensorParallelLinearMode = TensorParallelLinearMode.REDUCE_SCATTER,
     tp_linear_async_communication: bool = True,
 ):
+    # [FUNCTION DOC]
+    # HELPER: builds ParallelismArgs for conversion.
+    # Behavior: Returns ParallelismArgs with the given sizes, pipeline engine, TP mode and async flag.
+    # Inputs: dp, pp, tp (default 1 each); pp_engine (default one-forward-one-backward); tp_mode (default REDUCE_SCATTER); tp_linear_async_communication (default True).
+    # Outputs: ParallelismArgs. Exceptions: from ParallelismArgs validation. Side effects: None.
     parallel_config = ParallelismArgs(
         dp=dp,
         pp=pp,
@@ -116,6 +134,13 @@ def load_nanotron_model(
     checkpoint_path: Optional[Path] = None,
     config_cls: Optional[NanotronConfigs] = NanotronLlamaConfig,
 ) -> LlamaForTraining:
+    # [FUNCTION DOC]
+    # Behavior: If model_config is None, asserts checkpoint_path and reads model_config.json into config_cls. Builds a single-rank ParallelContext, builds LlamaForTraining when config_cls is the nanotron LlamaConfig, otherwise Qwen2ForTraining, on the given device/dtype; marks tied parameters; if checkpoint_path is given, loads weights from it.
+    # Inputs: model_config (optional nanotron config); device (default cuda); dtype (default bfloat16); checkpoint_path (optional Path); config_cls (default nanotron LlamaConfig).
+    # Outputs: the nanotron model (randomly initialized if no checkpoint).
+    # Exceptions: AssertionError if neither config nor checkpoint is given; file/loading errors.
+    # Side effects: initializes torch.distributed process groups; GPU allocation; checkpoint reads.
+    # KNOWN ISSUE: the model class is chosen from config_cls, not from the type of model_config, so passing a Qwen2Config model_config with the default config_cls builds LlamaForTraining (which convert_hf_to_nanotron does).
     """
     Creates and returns a nanotron model.
     If `model_config` is None, then `checkpoint_path` must be set, in which case

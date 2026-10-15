@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Purpose: constants for the FP8 subsystem.
+# Contents: FP8_GPU_NAMES (lowercase substrings of GPU names that support FP8: h100, rtx 4090);
+# INITIAL_AMAX and INITIAL_SCALING_FACTOR (both 1.0); FP8_DTYPES, FP8E4M3_DTYPE, FP8E5M2_DTYPE,
+# which stand in for real FP8 torch dtypes using int8 (e4m3) and uint8 (e5m2) storage;
+# DTYPE_TO_FP8_MAX mapping each DTypes member to its maximum representable normal value
+# (448 for E4M3, 57344 for E5M2, 65504 for float16).
+# Import-time side effects: imports torch. No other side effects.
 import torch
 
 from nanotron.fp8.dtypes import DTypes

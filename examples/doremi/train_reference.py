@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Purpose: Entry script for training the DoReMi reference model. Parses --config-file, loads a DoReMiConfig, loads per-domain datasets from disk, picks initial domain weights (from config or proportional to dataset sizes), asserts they sum to 1, builds ReferenceTrainer, the DoReMi dataloader, and trains.
+# Side effects (as script): disk reads, distributed initialization, training.
+# KNOWN ISSUE: the docstring usage line points to train_doremi.py instead of this script.
+# KNOWN ISSUE: reads config.data.dataset, but the config uses data_stages (train_doremi.py uses data_stages[0]), so this likely raises AttributeError.
+# KNOWN ISSUE: ReferenceTrainer construction fails with TypeError because of how it builds DoReMiContext (see doremi/trainer.py).
 """
 DoReMi training script.
 
@@ -19,6 +25,9 @@ from nanotron.config import get_config_from_file
 
 
 def get_args():
+    # [FUNCTION DOC]
+    # Behavior: Parses the required --config-file argument.
+    # Inputs: None. Outputs: argparse Namespace. Exceptions: SystemExit on missing argument. Side effects: reads sys.argv.
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-file", type=str, required=True, help="Path to the YAML or python config file")
     return parser.parse_args()

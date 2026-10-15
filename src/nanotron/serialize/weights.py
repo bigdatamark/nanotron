@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Purpose: Save and load model weights as one safetensors file per (parameter, shard), with
+# TensorMetadata in the file header so that weights can be reloaded under a different TP topology.
+# Main contents: save_weights, CheckpointVersionFromShardFileException, version readers
+# (read_checkpoint_version_from_shard_file, read_checkpoint_version_from_meta, get_checkpoint_version),
+# load_sharded_param_latest, load_weights, get_checkpoint_paths_list.
+# Fits in nanotron: called by serialize.main.save and by the trainer/model loading code; load_weights
+# returns per-parameter shard metadata consumed by serialize.optimizer.load_optimizer.
+# Import-time side effects: creates a module logger.
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -28,6 +37,17 @@ logger = logging.get_logger(__name__)
 
 
 def save_weights(model: nn.Module, parallel_context: ParallelContext, root_folder: Path):
+    # [FUNCTION DOC]
+    # Behavior: only dp_cp rank 0 saves. Builds a module-id-to-prefix map, then for each state_dict entry:
+    # on expert ranks other than 0 skips non-expert tensors; requires a NanotronParameter; for tied params
+    # uses the tied full name and only lets group rank 0 of the tied group save; for sharded params derives
+    # expert/tp/pp rank info and header metadata (slices pairs and unsharded shape); builds the file path
+    # with get_path under root_folder/model, creates directories and writes the tensor under key "data"
+    # (logging and re-raising on error).
+    # Inputs: model (nn.Module), parallel_context, root_folder (checkpoint Path).
+    # Outputs: None.
+    # Exceptions: NotImplementedError for buffers or non-NanotronParameter entries; re-raised save errors.
+    # Side effects: directory creation and file writes; progress bar; logging.
     root_folder = root_folder / "model"
 
     # We save only `dist.get_rank(parallel_context.dp_cp_pg) == 0`
@@ -109,10 +129,16 @@ def save_weights(model: nn.Module, parallel_context: ParallelContext, root_folde
 
 
 class CheckpointVersionFromShardFileException(Exception):
+    # [CLASS DOC]
+    # Purpose: Raised when a shard file header lacks valid TensorMetadata (older checkpoints), signalling fallback to the meta file.
     """Raise when loading checkpoint version from shard file fails"""
 
 
 def read_checkpoint_version_from_shard_file(param_save_path: Path) -> Version:
+    # [FUNCTION DOC]
+    # Behavior: opens the safetensors file on CPU, parses its header metadata as TensorMetadata and returns its version.
+    # Inputs: param_save_path (Path). Outputs: Version.
+    # Exceptions: CheckpointVersionFromShardFileException on missing or unexpected metadata keys. Side effects: file read.
     try:
         with safe_open(param_save_path, framework="pt", device=str("cpu")) as fi:
             param_metadata = fi.metadata()
@@ -124,12 +150,20 @@ def read_checkpoint_version_from_shard_file(param_save_path: Path) -> Version:
 
 
 def read_checkpoint_version_from_meta(parallel_context: ParallelContext, root_folder: Path) -> Version:
+    # [FUNCTION DOC]
+    # Behavior: loads checkpoint metadata and returns its version.
+    # Inputs: parallel_context, root_folder. Outputs: Version.
+    # Exceptions: see load_meta. Side effects: file read.
     checkpoint_metadata: CheckpointMetadata = load_meta(parallel_context=parallel_context, root_folder=root_folder)
     checkpoint_version = checkpoint_metadata.version
     return checkpoint_version
 
 
 def get_checkpoint_version(parallel_context, root_folder, param_save_path: Path) -> Version:
+    # [FUNCTION DOC]
+    # Behavior: tries the shard file header; on failure logs an error on rank 0 and reads the meta file.
+    # Inputs: parallel_context, root_folder, param_save_path. Outputs: Version.
+    # Exceptions: propagates meta read errors. Side effects: file reads; logging.
     try:
         checkpoint_version = read_checkpoint_version_from_shard_file(param_save_path=param_save_path)
     except CheckpointVersionFromShardFileException:
@@ -151,6 +185,17 @@ def load_sharded_param_latest(
     shards_path: List[Path],
     param_shard_metadata: Optional[Dict] = None,
 ):
+    # [FUNCTION DOC]
+    # Behavior: for each shard file, reads its tensor and header metadata, collects (tensor, slices pairs),
+    # asserts all shards agree on the unsharded shape, and records the metadata in param_shard_metadata keyed
+    # by the (pp_rank, tp_rank) strings parsed from the path; then allocates an unsharded tensor and fills
+    # param_or_buffer in place with this rank's slice via merge_and_shard_tp_tensors.
+    # Inputs: param_or_buffer (destination tensor, current local shard), sharded_info (ShardedInfo of the
+    # current parameter), shards_path (list of shard file paths), param_shard_metadata (optional dictionary to fill).
+    # Outputs: param_shard_metadata (possibly None).
+    # Exceptions: AssertionError on shape disagreement or if no shards were given.
+    # Side effects: file reads; mutates param_or_buffer and param_shard_metadata; allocates a full-size tensor.
+    # KNOWN ISSUE: the unsharded buffer is allocated with the default dtype (float32) rather than the parameter's dtype, wasting memory.
     checkpoint_unsharded_shape = None
     shards_and_slices_maps: List[Tuple[torch.Tensor, Tuple[SlicesPair, ...]]] = []
 
@@ -192,6 +237,19 @@ def load_weights(
     root_folder: Path,
     filtered_state_dict: Optional[Dict[str, Any]] = None,
 ):
+    # [FUNCTION DOC]
+    # Behavior: for every entry of filtered_state_dict (default the model's state_dict): requires a
+    # NanotronParameter; resolves the base name (tied full name if tied); for sharded params computes the
+    # rank info used at save time (group rank 0 of the tied group for tied params, own rank in the shard
+    # group otherwise); builds the expected path. If it exists, copies its "data" tensor in place. If its
+    # folder does not exist, raises. Otherwise assumes a topology change: requires the param to be sharded,
+    # globs all shard files for that name, determines and checks the checkpoint version consistency, and
+    # loads via load_sharded_param_latest while recording old shard metadata.
+    # Inputs: model, parallel_context, root_folder (checkpoint Path), filtered_state_dict (optional dictionary of name to tensor).
+    # Outputs: dictionary from parameter name to a dictionary from (pp_rank, tp_rank) string pair to TensorMetadata (empty for params loaded directly).
+    # Exceptions: ValueError for missing folders/shards, non-sharded missing params or unsupported newer
+    # version; AssertionError on version mismatch; NotImplementedError for non-NanotronParameter entries.
+    # Side effects: file reads; in-place parameter writes; progress bar on world rank 0; logging.
     """Load weights from a checkpoint
 
     Args:
@@ -327,6 +385,15 @@ def get_checkpoint_paths_list(
     only_list_current_process: bool = True,
     filtered_state_dict: Optional[Dict[str, Any]] = None,
 ):
+    # [FUNCTION DOC]
+    # Behavior: intended to list the files (or folders when only_list_folders) that the current process
+    # reads in a checkpoint, mirroring the path logic of load_weights.
+    # Inputs: model, parallel_context, root_folder, only_list_folders (default False),
+    # only_list_current_process (default True), filtered_state_dict (optional).
+    # Outputs: list of Paths.
+    # Exceptions: see known issues. Side effects: progress bar.
+    # KNOWN ISSUE: iterates over the state dict values (tensors) and uses them as names, so get_parameter always fails and nothing is listed (or AttributeError when only_list_current_process is False since param is None).
+    # KNOWN ISSUE: calls get_path without the required is_expert_sharded argument (TypeError), and passes a list to joinpath for folders.
     """Return the list of all the files or folders created/accessed by the current process in a checkpoint
 
     Args:

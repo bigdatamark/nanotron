@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Purpose: Script converting a HuggingFace Llama checkpoint into nanotron format (weights plus model_config.json).
+# Main contents: _handle_attention_block, convert_hf_to_nt, get_nanotron_config, convert_checkpoint_and_save, and a CLI main (--checkpoint_path, --save_path).
+# Usage: torchrun with one process.
+# Import-time side effects: None.
+# KNOWN ISSUE: uses a relative import of convert_weights, so running the file directly as in the docstring fails; it must be run as a module from the repo root.
+# KNOWN ISSUE: CLI defaults look swapped (save_path default "llama-7b-hf" for a nanotron output).
 """
 Converts a HF model to nanotron format
 Command:
@@ -37,7 +44,17 @@ def _handle_attention_block(
     # This function handles the concatenation of the q, k, v weights and proper permutation
     # to ensure correct transformation.
 
+    # [FUNCTION DOC]
+    # HELPER: fuses HF q/k/v weights into nanotron's qkv_proj layout.
+    # Behavior: Optionally permutes q and k per head from the HF half-split rotary layout to the interleaved even/odd layout (each head reshaped as two halves then transposed), then concatenates q, k, v along the output dimension.
+    # Inputs: q, k, v: weight tensors [heads*d_qk, hidden]; n_q_heads, n_kv_heads (unused); d_qk: head dimension; interleave: bool.
+    # Outputs: fused tensor [(n_q + 2*n_kv)*d_qk, hidden].
+    # Exceptions: errors on reshape if shapes are inconsistent. Side effects: None.
     def interleave_weight(w: torch.Tensor):
+        # [FUNCTION DOC]
+        # HELPER: per-head rotary permutation.
+        # Behavior: Splits rows into heads of d_qk, reorders each head's rows from first-half/second-half to interleaved pairs, and concatenates.
+        # Inputs: w: tensor [heads*d_qk, hidden]. Outputs: tensor of same shape. Exceptions: reshape errors. Side effects: None.
         w_new = []
         for head_w in w.split(d_qk):
             head_w = head_w.view(2, d_qk // 2, -1).transpose(0, 1).reshape(d_qk, -1)
@@ -52,6 +69,12 @@ def _handle_attention_block(
 def convert_hf_to_nt(
     model_hf: LlamaForCausalLM, model_nt: LlamaForTraining, config: NanotronLlamaConfig, interleave_qkv: bool = False
 ):
+    # [FUNCTION DOC]
+    # Behavior: Gets the HF state dict and the nanotron-to-HF mapping; for every direct parameter of every nanotron module: if in a qkv_proj, sorts the three mapped names (k, q, v alphabetically) and fuses them; if in gate_up_proj, sorts the two names (gate, up) and concatenates; otherwise looks up the single HF tensor; copies into the nanotron parameter under no_grad.
+    # Inputs: model_hf: LlamaForCausalLM; model_nt: LlamaForTraining; config: nanotron config; interleave_qkv: bool, default False.
+    # Outputs: None.
+    # Exceptions: KeyError for unmapped nanotron parameters; shape errors from copy.
+    # Side effects: mutates model_nt parameters in place.
     """Converts the weights from the model_hf to model_nt, making modifications
     in-place."""
 
@@ -92,12 +115,23 @@ def convert_hf_to_nt(
 
 
 def get_nanotron_config(config: HFLlamaConfig) -> NanotronQwen2Config:
+    # [FUNCTION DOC]
+    # Behavior: Copies each mapped field from the HF config into a nanotron Qwen2Config.
+    # Inputs: config: HF LlamaConfig. Outputs: nanotron Qwen2Config.
+    # Exceptions: AttributeError if the HF config lacks a field. Side effects: None.
+    # KNOWN ISSUE: docstring and function name say nanotron configuration for a Llama model, but a Qwen2Config is returned (used with a LlamaForTraining model by load_nanotron_model).
     """Converts a huggingface configuration to nanotron configuration."""
     attrs = {key: getattr(config, value) for key, value in get_config_mapping(nt_to_hf=True).items()}
     return NanotronQwen2Config(**attrs)
 
 
 def convert_checkpoint_and_save(checkpoint_path: Path, save_path: Path):
+    # [FUNCTION DOC]
+    # Behavior: Loads the HF Llama model from checkpoint_path, derives the nanotron config, builds a random nanotron model, creates a single-rank ParallelContext, copies weights, saves nanotron weights to save_path and writes model_config.json, then prints.
+    # Inputs: checkpoint_path: Path to HF checkpoint or hub id; save_path: Path for output.
+    # Outputs: None.
+    # Exceptions: loading/saving errors; KeyError from conversion.
+    # Side effects: distributed initialization (a second ParallelContext in addition to the one in load_nanotron_model); GPU/CPU memory; file writes; stdout.
     """Loads the huggingface checkpoint in `checkpoint_path`, creates
     a new nanotron instance, copies the weights from the huggingface checkpoint
     and saves the transformed nanotron to `save_path`."""

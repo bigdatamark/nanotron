@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Purpose: Example script producing a YAML config to resume/fine-tune training from a converted SmolLM2-135M nanotron checkpoint (see examples/llama/convert_hf_to_nanotron.py).
+# Behavior at import time: reads CHECKPOINT_PATH/model_config.json, drops the "is_llama_config" key, builds a Qwen2Config from it, computes and prints a rough parameter count (2*vocab*hidden + layers*3*hidden*intermediate + layers*4*hidden^2), and builds LR scheduler, AdamW optimizer (ZeRO 0), parallelism (dp=2, pp=1, tp=1, cp=1), tokens (seq 256, 15 steps, mbs 2), one Nanoset data stage, and a Config whose CheckpointsArgs resume from CHECKPOINT_PATH without loading LR scheduler or optimizer states. Tokenizer is HuggingFaceTB/SmolLM2-135M.
+# Main entry (run as script): saves the config as config_resume_training.yaml next to this file and prints its path.
+# Exports: CHECKPOINT_PATH, TOKENIZER_PATH, model_config, num_params, config and the intermediate argument objects.
+# Side effects at import: file read (raises FileNotFoundError if the checkpoint is missing; the file handle is not closed explicitly), prints, creates ./checkpoints.
+# KNOWN ISSUE: a Llama-converted checkpoint config is loaded into Qwen2Config; works only because the fields overlap.
 """ Example python script to generate a YAML config file which can be used to run a training with nanotron. Refer to "examples" section in the `/README.md` for more information.
 
 Usage:

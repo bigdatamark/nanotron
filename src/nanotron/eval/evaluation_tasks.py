@@ -1,3 +1,19 @@
+# [MODULE DOC]
+# Purpose: LightEval custom-task definitions used by nanotron's evaluation runner (passed to LightEval
+# as a custom tasks file). Exposes TASKS_TABLE, the list of LightevalTaskConfig objects LightEval loads.
+# Contents: TASKS_TABLE starts with LightEval's multilingual task table, then adds English tasks, each
+# in three formulations (MCF multiple-choice letters, CF cloze, Hybrid) named
+# "<task>_<formulation>[:subset]" in suite "custom" with pinned dataset revisions:
+# ARC Easy/Challenge (test split, train few-shots), HellaSwag (validation), CommonsenseQA,
+# OpenBookQA, Winogrande xl (continuation prompts; fixed metric list with no/token/char normalization
+# regardless of formulation), PIQA, MMLU for each of the 57 subjects in MMLU_SUBSETS (test split, dev
+# few-shots) and MMLU-Pro (test split, validation few-shots). Metrics are log-likelihood accuracy with
+# token, character and (for some tasks) PMI normalization, adapted to the formulation by
+# get_metrics_for_formulation. Lambdas adapt each dataset row to question/choices/gold index.
+# Import-time side effects: builds all task configs (imports lighteval). As a script, prints the
+# task names and count.
+# KNOWN ISSUE: the script branch prints a generator object rather than the task names.
+# KNOWN ISSUE: Winogrande uses a metric list that ignores the formulation, unlike the other tasks.
 from functools import partial
 
 from lighteval.metrics.dynamic_metrics import (

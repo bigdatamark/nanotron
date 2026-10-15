@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Purpose: Unit tests for DoReMiContext (initialization, domain count/name lookup, weight history recording).
+# Import-time side effects: appends the repo root to sys.path via set_system_path.
 from copy import deepcopy
 
 import torch
@@ -9,6 +12,9 @@ from examples.doremi.doremi.doremi_context import DoReMiContext
 
 
 def test_initialization():
+    # [FUNCTION DOC]
+    # Behavior: Builds a context with two domains and explicit step size and smoothing param; asserts uniform weights [0.5, 0.5] and that all fields are stored.
+    # Inputs: None. Outputs: None. Exceptions: AssertionError on failure. Side effects: None.
     domain_keys = ["domain1", "domain2"]
     step_size, smoothing_param = 0.01, 0.001
     is_proxy = False
@@ -22,12 +28,18 @@ def test_initialization():
 
 
 def test_num_domains():
+    # [FUNCTION DOC]
+    # Behavior: Asserts num_domains equals 2 for two domain keys.
+    # Inputs: None. Outputs: None. Exceptions: AssertionError on failure. Side effects: None.
     domain_keys = ["domain1", "domain2"]
     context = DoReMiContext(domain_keys, False)
     assert context.num_domains == 2
 
 
 def test_get_domain_name():
+    # [FUNCTION DOC]
+    # Behavior: Asserts get_domain_name maps indices 0 and 1 to the corresponding keys.
+    # Inputs: None. Outputs: None. Exceptions: AssertionError on failure. Side effects: None.
     domain_keys = ["domain1", "domain2"]
     context = DoReMiContext(domain_keys, False)
     assert context.get_domain_name(0) == "domain1"
@@ -35,6 +47,9 @@ def test_get_domain_name():
 
 
 def test_record_domain_weights_history():
+    # [FUNCTION DOC]
+    # Behavior: Adds two weight vectors at steps 1 and 2, asserts the current domain_weights are unchanged, and that the history holds the initial uniform weights at step 0 followed by the two added vectors with matching steps.
+    # Inputs: None. Outputs: None. Exceptions: AssertionError on failure. Side effects: None.
     domain_weights = [torch.tensor([0.1, 0.3, 0.6]), torch.tensor([0.2, 0.3, 0.5])]
     domain_keys = ["domain1", "domain2", "domain3"]
 

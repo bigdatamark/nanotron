@@ -1,3 +1,10 @@
+# [PACKAGE DOC]
+# Purpose: nanotron.logging package - public logging API.
+# Exports: log level constants, CategoryFilter, LoggerWriter, LogItem, NewLineStreamHandler and the
+# helper functions from base.py (get_logger, log_rank, warn_once, set_* verbosity/format helpers,
+# human_format, log_memory, log_libraries_versions); TimerRecord, Timers, nanotron_timer from timers;
+# LogMixin, LoggingCollectorMixin from logmixin.
+# Import-time side effects: importing base.py configures the library root logger (see base.py).
 # Export logging functionality from base.py
 from nanotron.logging.base import (
     # Constants

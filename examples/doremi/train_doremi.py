@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Purpose: Entry script for DoReMi proxy training. Parses --config-file, loads a DoReMiConfig, loads one on-disk HF dataset per domain from the first data stage's dataset path joined with each domain name, builds DoReMiTrainer (which loads the reference model), builds the DoReMi dataloader and trains.
+# Usage: torchrun with CUDA_DEVICE_MAX_CONNECTIONS=1, run with examples/doremi as the working directory or on the path (imports the local doremi package).
+# Side effects (as script): disk reads, distributed initialization, training, checkpoint writes.
 """
 DoReMi training script.
 
@@ -16,6 +20,9 @@ from doremi.trainer import DoReMiTrainer
 
 
 def get_args():
+    # [FUNCTION DOC]
+    # Behavior: Parses the required --config-file argument.
+    # Inputs: None. Outputs: argparse Namespace. Exceptions: SystemExit on missing argument. Side effects: reads sys.argv.
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-file", type=str, required=True, help="Path to the YAML or python config file")
     return parser.parse_args()

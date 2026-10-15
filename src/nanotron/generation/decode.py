@@ -1,3 +1,15 @@
+# [MODULE DOC]
+# Purpose: autoregressive text generation for nanotron models under data, tensor and pipeline
+# parallelism. Inputs are split into micro-batches (one per DP rank in round robin), up to as many
+# micro-batches as pipeline stages are kept in flight so stages work concurrently, the last stage
+# (decoder_logit_rank) samples the next token with a TP-aware sampler and sends it back via
+# point-to-point to the first stage (decoder_input_rank), which appends it to the sequence. At the end
+# results are broadcast across the pipeline group and yielded.
+# Main contents: dataclasses GenerationInput, GenerationInputs, GenerationOutput, GenerationStates,
+# TokenizerConfig; helpers chunks, micro_batcher, micro_splitter, get_position_ids,
+# broadcast_tensors; entry points decode_text (from raw text, with optional benchmarking) and
+# decode_tokenized (from pre-tokenized tensors, using the KV-cache store).
+# Import-time side effects: creates a module logger; imports the Llama model and pipeline modules.
 import dataclasses
 import time
 from itertools import chain, islice
@@ -34,17 +46,25 @@ logger = logging.get_logger(__name__)
 
 @dataclasses.dataclass
 class GenerationInput:
+    # [CLASS DOC]
+    # Purpose: one raw prompt; field text (str).
     text: str
 
 
 @dataclasses.dataclass
 class GenerationInputs:
+    # [CLASS DOC]
+    # Purpose: one micro-batch of model inputs: input_ids (batch, seq) and input_masks (bool, same shape),
+    # each a tensor on the input pipeline rank or a TensorPointer elsewhere.
     input_ids: Union[torch.Tensor, TensorPointer]  # [B, S]
     input_masks: Union[torch.Tensor, TensorPointer]
 
 
 @dataclasses.dataclass
 class GenerationOutput:
+    # [CLASS DOC]
+    # Purpose: one generated sample: input_ids (prompt tokens without padding), generation_ids (prompt plus
+    # generated tokens, masked), optional return_logits (unused, default None). TensorPointer on non-input ranks.
     input_ids: Union[torch.Tensor, TensorPointer]
     generation_ids: Union[torch.Tensor, TensorPointer]
     return_logits: Optional[Union[torch.Tensor, TensorPointer]] = None
@@ -52,6 +72,10 @@ class GenerationOutput:
 
 @dataclasses.dataclass
 class GenerationStates:
+    # [CLASS DOC]
+    # Purpose: per micro-batch decoding state: new_input_ids/new_input_mask (latest tokens fed to the
+    # model), store (KV-cache Store), generation_ids/generation_mask (lists of all chunks so far, to be
+    # concatenated along the sequence dimension).
     new_input_ids: Union[torch.Tensor, TensorPointer]
     new_input_mask: Union[torch.Tensor, TensorPointer]
     store: Store
@@ -63,12 +87,19 @@ class GenerationStates:
 
 @dataclasses.dataclass
 class TokenizerConfig:
+    # [CLASS DOC]
+    # Purpose: tokenization options: max_input_length (optional int), truncation and padding (optional
+    # str or bool, defaulted by micro_batcher).
     max_input_length: Optional[int]
     truncation: Optional[Union[str, bool]] = None
     padding: Optional[Union[str, bool]] = None
 
 
 def chunks(iterable, chunk_size: int) -> Generator[List, None, None]:
+    # [FUNCTION DOC]
+    # HELPER: groups an iterable into lists of chunk_size (last may be shorter).
+    # Inputs: iterable; chunk_size - int at least 1. Outputs: generator of lists.
+    # Exceptions: AssertionError if chunk_size is below 1. Side effects: consumes the iterable lazily.
     """Yield successive n-sized chunks from `iterable`"""
     assert chunk_size >= 1
     iterator = iter(iterable)
@@ -84,6 +115,18 @@ def micro_batcher(
     parallel_context: ParallelContext,
     input_rank: int,
 ) -> Generator[GenerationInputs, None, None]:
+    # [FUNCTION DOC]
+    # HELPER: tokenizes prompts into micro-batches for decode_text.
+    # Behavior: defaults padding to "max_length" when max_input_length is set else True, and truncation to
+    # True when max_input_length is set else None (mutating tokenizer_config). Chunks inputs into groups
+    # of max_micro_batch_size; micro-batch number i is handled only by the DP rank equal to i modulo DP
+    # size. On the pipeline rank input_rank, tokenizes the texts to padded tensors, converts the attention
+    # mask to bool, moves everything to CUDA and yields GenerationInputs; other pipeline ranks yield
+    # TensorPointers to input_rank.
+    # Inputs: input_iter - iterable of GenerationInput; tokenizer - HF tokenizer; max_micro_batch_size;
+    # tokenizer_config; parallel_context; input_rank - pipeline rank holding inputs.
+    # Outputs: generator of GenerationInputs. Exceptions: None explicitly raised.
+    # Side effects: mutates tokenizer_config; CUDA allocations.
     """
     Returns:
         input_ids: [max_micro_batch_size, max_input_length]
@@ -130,6 +173,14 @@ def micro_splitter(
     parallel_context: ParallelContext,
     input_rank: int,
 ) -> Generator[GenerationInputs, None, None]:
+    # [FUNCTION DOC]
+    # HELPER: splits pre-tokenized tensors into micro-batches for decode_tokenized.
+    # Behavior: splits input_ids and input_mask along the batch into pieces of max_micro_batch_size; on
+    # input_rank yields clones (mask converted to bool on CUDA), elsewhere TensorPointers. All DP ranks
+    # process all micro-batches (DP sharding is commented out).
+    # Inputs: input_ids, input_mask - (batch, seq) tensors; max_micro_batch_size; parallel_context; input_rank.
+    # Outputs: generator of GenerationInputs. Exceptions: None explicitly raised. Side effects: CUDA copies.
+    # KNOWN ISSUE: the second move of the mask to CUDA discards its result (no-op), and input_ids are not moved to CUDA.
     """
     Returns:
         input_ids: [max_micro_batch_size, max_input_length]
@@ -158,6 +209,14 @@ def micro_splitter(
 
 @torch.inference_mode()
 def get_position_ids(input_ids, tokenizer):
+    # [FUNCTION DOC]
+    # HELPER: computes position ids for left-padded batches.
+    # Behavior: treats tokens equal to the tokenizer's eos id as padding; for each row containing padding,
+    # the content start is one past the last padding token; positions are 0 up to the start and then
+    # count up from 0 for the remaining tokens. Runs under inference mode.
+    # Inputs: input_ids - (batch, seq) tensor; tokenizer - provides eos_token_id.
+    # Outputs: int32 tensor (batch, seq). Exceptions: None explicitly raised. Side effects: None.
+    # KNOWN ISSUE: any eos token inside the content (e.g. a previously generated eos) is treated as padding, resetting positions after it.
     # Find where padding ends for each sequence
     batch_size, seq_length = input_ids.shape
     padding_token_id = tokenizer.eos_token_id
@@ -207,6 +266,36 @@ def decode_text(
     is_bench: bool = False,
     logits_are_batch_first: bool = True,
 ) -> Generator[GenerationOutput, None, None]:
+    # [FUNCTION DOC]
+    # Behavior: finds the first and last pipeline ranks holding the model (get_min_max_rank). Chooses the
+    # sampler type from generation_config (string or enum; GREEDY when no config). If n_samples is set,
+    # replicates each prompt n_samples times (only allowed for TOP_P and TOP_K). Inside a pipeline eval
+    # state, takes groups of up to pipeline-depth micro-batches from micro_batcher; for each of
+    # max_new_tokens iterations and each micro-batch: concatenates all tokens so far (no KV cache, full
+    # recompute), computes position ids, runs the model, reshapes logits to (batch, seq, vocab shard)
+    # (optionally transposing if not batch-first), runs a schedule-dependent number of pending pipeline
+    # communications, and on the last stage samples the next token from the final position's logits with a
+    # default-parameter sampler over the TP group plus an all-true mask, keeping them locally if first and
+    # last stage coincide or sending both to the first stage. The first stage then receives (or reuses)
+    # the new tokens and new states are built by appending them. With is_bench, measures time and logs
+    # throughput, TFLOPs and bandwidth via log_throughput. Finally flushes communications, and for each
+    # micro-batch broadcasts generated ids/masks and inputs from the first stage over the pipeline group,
+    # flushes the store, validates shapes and yields one GenerationOutput per sample (real tensors on the
+    # first stage, TensorPointers elsewhere).
+    # Inputs: input_iter - iterable of GenerationInput (all ranks receive all inputs); tokenizer; model -
+    # pipelined LlamaModel; parallel_context; generation_config - GenerationArgs or None; tokenizer_config;
+    # max_micro_batch_size; max_new_tokens; is_bench - default False; logits_are_batch_first - default True.
+    # Outputs: generator of GenerationOutput.
+    # Exceptions: ValueError for n_samples with other samplers; NotImplementedError if use_cache is set or
+    # for an unknown sampler; AssertionError on pipeline bookkeeping or shape mismatches.
+    # Side effects: P2P and collective communication across PP, TP groups; CUDA work; RNG; logging; tqdm progress output.
+    # KNOWN ISSUE: SamplerType is built by value from an upper-cased string, but enum values are auto integers, so string samplers raise ValueError (lookup by name was likely intended).
+    # KNOWN ISSUE: accessing use_cache on generation_config fails when generation_config is None, despite the None handling above.
+    # KNOWN ISSUE: the code after raising NotImplementedError for use_cache is unreachable.
+    # KNOWN ISSUE: samplers are built with default parameters, ignoring top_k, top_p and temperature from generation_config (unlike decode_tokenized).
+    # KNOWN ISSUE: on ranks other than the input rank the inputs are TensorPointers, yet get_position_ids and view are called on them, which would fail for pipeline depth above 1.
+    # KNOWN ISSUE: the first-iteration time is computed as start minus now (negative and taken at the start of iteration 0), so it is not excluded from the throughput time as the comment intends.
+    # KNOWN ISSUE: the sequence-length assertion message prints the mask's batch dimension instead of its sequence dimension.
     """We assume the following:
     - Everyone receives ALL the input text. # TODO @thomasw21: technically only specific ranks need to receive input.
     - Only a specific rank will output the generated text_ids as `torch.Tensor`, the others return a `TensorPointer`. # TODO @thomasw21: Maybe all ranks should return the text.
@@ -402,6 +491,11 @@ def decode_text(
                     else:
 
                         def generator():
+                            # [FUNCTION DOC]
+                            # HELPER: on the first stage, yields new token ids and masks received from the last stage.
+                            # Behavior: for each micro-batch registers two receives from decoder_logit_rank, runs communication
+                            # until two activations are buffered, and pops ids then mask.
+                            # Inputs/Outputs: yields tuples (ids, mask). Exceptions: None. Side effects: P2P communication.
                             for _ in range(number_states_in_buffer):
                                 pipeline_state.register_recv_activation(from_rank=decoder_logit_rank, p2p=p2p)
                                 pipeline_state.register_recv_activation(from_rank=decoder_logit_rank, p2p=p2p)
@@ -544,6 +638,21 @@ def decode_tokenized(
     tokenizer: "PreTrainedTokenizer",
     returns_logits: Optional[bool] = False,
 ) -> Generator[GenerationOutput, None, None]:
+    # [FUNCTION DOC]
+    # Behavior: same pipelined generation loop as decode_text but starting from pre-tokenized tensors
+    # split by micro_splitter, without benchmarking or prompt replication, feeding only the newest tokens
+    # each step with the micro-batch's Store attached (KV-cache path), always transposing logits from
+    # sequence-first to batch-first, and constructing TOP_K and TOP_P samplers with top_k, top_p and
+    # temperature from generation_config.
+    # Inputs: input_ids, input_mask - (batch, seq) tensors; model; parallel_context; generation_config;
+    # max_micro_batch_size; max_new_tokens; tokenizer (for position ids); returns_logits - must be False.
+    # Outputs: generator of GenerationOutput.
+    # Exceptions: NotImplementedError if returns_logits or for an unknown sampler; AssertionError on
+    # bookkeeping/shape mismatches.
+    # Side effects: P2P and collective communication; CUDA work; RNG; populates and flushes Stores.
+    # KNOWN ISSUE: same string-to-SamplerType conversion problem as decode_text.
+    # KNOWN ISSUE: position ids are recomputed from only the new tokens each step, so generated tokens get position 0 rather than continuing the sequence.
+    # KNOWN ISSUE: same sequence-length assertion message issue as decode_text.
     """We assume the following:
     - Everyone receives ALL the input text. # TODO @thomasw21: technically only specific ranks need to receive input.
     - Only a specific rank will output the generated text_ids as `torch.Tensor`, the others return a `TensorPointer`. # TODO @thomasw21: Maybe all ranks should return the text.
@@ -720,6 +829,9 @@ def decode_tokenized(
                     else:
 
                         def generator():
+                            # [FUNCTION DOC]
+                            # HELPER: identical to decode_text's receiving generator (receive ids and mask per micro-batch from the last stage).
+                            # Inputs/Outputs: yields tuples (ids, mask). Exceptions: None. Side effects: P2P communication.
                             for _ in range(number_states_in_buffer):
                                 pipeline_state.register_recv_activation(from_rank=decoder_logit_rank, p2p=p2p)
                                 pipeline_state.register_recv_activation(from_rank=decoder_logit_rank, p2p=p2p)
@@ -818,6 +930,17 @@ def decode_tokenized(
 def broadcast_tensors(
     tensors: List[Union[torch.Tensor, TensorPointer]], group_src: int, group: Optional[ProcessGroup] = None
 ) -> List[torch.Tensor]:
+    # [FUNCTION DOC]
+    # HELPER: broadcasts tensors from one rank of group to all others, which hold TensorPointers.
+    # Behavior: for each tensor, the source sends its metadata (dtype, requires_grad, shape, storage size,
+    # stride, contiguity, offset) via broadcast_object_list; receivers allocate empty CUDA storage from
+    # that metadata while the source takes a contiguous view; the data is broadcast and every rank returns
+    # the tensor re-strided to the original shape and stride.
+    # Inputs: tensors - list of tensors (source) or TensorPointers (others); group_src - source rank within
+    # group; group - ProcessGroup (default None meaning world).
+    # Outputs: list of tensors, one per input, on every rank.
+    # Exceptions: AssertionError if the source lacks a tensor or another rank lacks a TensorPointer.
+    # Side effects: collective communication (object and tensor broadcasts); CUDA allocations.
     result = []
     for tensor in tensors:
         if dist.get_rank(group) == group_src:

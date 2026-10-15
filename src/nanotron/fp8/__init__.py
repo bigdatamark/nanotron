@@ -1,3 +1,10 @@
+# [PACKAGE DOC]
+# Purpose: nanotron.fp8 package - experimental FP8 training primitives built on NVIDIA Transformer Engine.
+# Exports: DTypes, FP8Linear, FP8Parameter, FP8Tensor.
+# Import-time side effects: imports the submodules (which themselves import transformer_engine and
+# fail hard if it is missing); then tries to import transformer_engine and transformer_engine_extensions
+# again and emits a warnings.warn message if that import fails.
+# KNOWN ISSUE: the guarded import comes after unguarded submodule imports that already require transformer_engine, so the warning path is effectively unreachable (an ImportError is raised first).
 import warnings
 
 from nanotron.fp8.dtypes import DTypes  # noqa

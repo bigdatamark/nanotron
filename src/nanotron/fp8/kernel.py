@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Purpose: thin wrapper around the Transformer Engine FP8 GEMM (te_gemm) used by FP8Linear.
+# Contents: fp8_matmul_kernel. Import-time side effects: imports transformer_engine and its
+# extensions (fails if not installed).
 import torch
 import transformer_engine as te  # noqa
 import transformer_engine_extensions as tex
@@ -14,6 +18,22 @@ def fp8_matmul_kernel(
     transpose_b: bool,
     use_split_accumulator: bool,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # Behavior (runs under no_grad): checks both inputs are not on CPU; allocates a float32 output of
+    # shape (rows of mat_a, columns of mat_b), a 32 MiB int8 cuBLAS workspace, an empty bias and empty
+    # scale/amax placeholders. Because TE only supports A transposed and B not transposed, it physically
+    # transposes mat_a with fp8_transpose when transpose_a is False, and mat_b when transpose_b is True.
+    # Then calls te_gemm with each operand's inverse scale and TE dtype, float32 output, no accumulation,
+    # the given split-accumulator flag and 0 SM margin.
+    # Inputs: mat_a, mat_b - FP8Tensor on CUDA carrying fp8_meta; transpose_a, transpose_b - whether the
+    # logical operation should use the transposed operand; use_split_accumulator - TE flag for higher
+    # precision accumulation (used in backward).
+    # Outputs: float32 torch tensor holding the GEMM result.
+    # Exceptions: AssertionError if either tensor is reported as on CPU.
+    # Side effects: allocates CUDA memory; launches CUDA kernels.
+    # KNOWN ISSUE: the CPU check compares a torch.device to the string "cpu", which may never be equal, so the assertion may not catch CPU tensors.
+    # KNOWN ISSUE: output shape is always taken from the untransposed shapes of mat_a and mat_b regardless of the transpose flags, which only matches some call patterns.
+    # KNOWN ISSUE: the empty bias tensor is created on CPU while all other operands are on CUDA.
     assert (
         mat_a.device != "cpu" and mat_b.device != "cpu"
     ), "The tensors must be on a CUDA device in order to use the FP8 kernel!!"

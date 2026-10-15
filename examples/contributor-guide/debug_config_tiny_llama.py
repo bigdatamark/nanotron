@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Purpose: Contributor-guide debugging config: a tiny Llama model (hidden 16, 2 layers, vocab 50277) trained with tp=2 on a small alpaca dataset with the gpt2 tokenizer, for stepping through nanotron with a debugger.
+# Behavior at import time: builds LlamaConfig, prints an approximate parameter count, builds LR scheduler, optimizer, parallelism (dp=1, pp=1, tp=2), tokens (seq 32, 10 steps, mbs 2), dataset HuggingFaceH4/testing_alpaca_small (column "completion") and a Config with two data stages (stable from step 1, annealing from step 10) using the same dataset.
+# Main entry (run as script): saves debug_config_tiny_llama.yaml next to this file.
+# Side effects at import: prints; creates a "checkpoints" directory in the examples folder (parent of this file's directory).
+# KNOWN ISSUE: OptimizerArgs is given adam_eps/adam_beta1/adam_beta2/torch_adam_is_fused directly and no optimizer_factory; the current OptimizerArgs dataclass rejects these, so import fails with TypeError.
+# KNOWN ISSUE: inline comment claims 1.62M parameters, inconsistent with this config.
 """ Example python script to generate a YAML config file which can be used to run a training with nanotron. Refer to "examples" section in the `/README.md` for more information."""
 import os
 

@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Purpose: Example/benchmark script that builds a nanotron Config for a default LlamaConfig (Llama-2-7b sized) and launches a short training run.
+# Behavior at import time: instantiates a default LlamaConfig, computes and prints an approximate parameter count (embeddings twice plus per-layer 3*hidden*intermediate MLP and 4*hidden^2 attention terms, formatted with human_format and dots replaced by "p"), builds LR scheduler, optimizer (ZeRO 0, fused Adam, fp32 grad accumulation), parallelism (dp=2, pp=1, tp=4, 1f1b, REDUCE_SCATTER with async TP comms), tokens (seq 8192, 5 steps, mbs 1, accumulation 8), an openwebtext-10k HF dataset, and a Config object with tokenizer meta-llama/Llama-2-7b-hf.
+# Main entry (run as script): saves the config as config_llama.yaml next to this file and launches torchrun with dp*pp*tp processes on run_train.py.
+# Exports: model_config, num_params, seed, learning_rate, optimizer, parallelism, tokens, dataset, checkpoints_path, config.
+# Side effects at import: prints parameter count; creates a "checkpoints" directory in the repo root (parent of examples). As script: writes YAML file, spawns shell processes.
+# KNOWN ISSUE: OptimizerArgs is given adam_eps/adam_beta1/adam_beta2/torch_adam_is_fused directly and no optimizer_factory; the current OptimizerArgs dataclass has no such fields, so import fails with TypeError.
+# KNOWN ISSUE: the comment says "6.74M parameters" but the default LlamaConfig is ~7B.
+# KNOWN ISSUE: running "export CUDA_DEVICE_MAX_CONNECTIONS=1" via a separate os.system call has no effect on the later torchrun subprocess (each call is its own shell).
+# KNOWN ISSUE: torchrun is invoked with "run_train.py" relative to the current working directory, not to the repo root.
 """
 Benchmarking script for the Llama-2-7b model
 """

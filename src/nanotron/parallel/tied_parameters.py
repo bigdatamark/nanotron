@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Purpose: Utilities to tie parameters (share one weight between several modules, possibly living on
+# different pipeline stages / ranks) and keep tied copies synchronized.
+# Main contents: create_tied_parameter, tie_parameters, create_pg_for_tied_weights,
+# get_tied_id_to_param, sync_tied_weights_gradients.
+# Fits in nanotron: used by models (e.g. tied input/output embeddings) and by the trainer/optimizer
+# flow to all-reduce tied gradients after backward; TiedLinear also uses create_tied_parameter.
+# Import-time side effects: creates a module logger.
 from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
 
@@ -22,6 +30,14 @@ def create_tied_parameter(
     reduce_op: Optional[dist.ReduceOp],
     root_module: nn.Module,
 ) -> NanotronParameter:
+    # [FUNCTION DOC]
+    # Behavior: wraps parameter in a NanotronParameter if needed, then marks it as tied with the given
+    # name, global ranks, reduce op and root module.
+    # Inputs: parameter (nn.Parameter), name (fully qualified name relative to root_module), global_ranks
+    # (tuple of ints sharing the parameter), reduce_op (dist.ReduceOp or None meaning no gradient sync
+    # needed), root_module (nn.Module used to resolve names).
+    # Outputs: the tied NanotronParameter.
+    # Exceptions: whatever mark_as_tied raises (e.g. if already tied). Side effects: mutates parameter metadata.
     if not isinstance(parameter, NanotronParameter):
         parameter = NanotronParameter(tensor=parameter)
     parameter.mark_as_tied(name=name, global_ranks=global_ranks, reduce_op=reduce_op, root_module=root_module)
@@ -34,6 +50,17 @@ def tie_parameters(
     parallel_context: ParallelContext,
     reduce_op: Optional[dist.ReduceOp],
 ):
+    # [FUNCTION DOC]
+    # Behavior: rejects an empty tie list; checks via parallel_context that all ranks involved belong to
+    # the same data-parallel replica; uses the first tie's target as the canonical name and the union of
+    # all ranks as global_ranks; then for every tie target present on this world rank, resolves the
+    # parameter and its parent module, creates the tied parameter once (from the first local target) and
+    # assigns that same object to every local target, so local duplicates share storage.
+    # Inputs: root_module (nn.Module), ties (list of pairs: parameter target name, tuple of global ranks
+    # holding it), parallel_context (ParallelContext), reduce_op (optional ReduceOp for gradient sync).
+    # Outputs: None.
+    # Exceptions: ValueError if ties is empty; AssertionError if ranks span multiple DP replicas.
+    # Side effects: replaces attributes on submodules of root_module.
     """
     Tie parameters.
     Within a single device, tied parameters are replaced with a single Parameter
@@ -83,6 +110,14 @@ def tie_parameters(
 
 
 def create_pg_for_tied_weights(root_module: nn.Module, parallel_context: ParallelContext):
+    # [FUNCTION DOC]
+    # Behavior: collects the set of global-rank tuples of all local tied parameters, all-gathers these sets
+    # across the world group, takes the sorted union and creates a new process group for each tuple not
+    # already in parallel_context.world_ranks_to_pg.
+    # Inputs: root_module (nn.Module), parallel_context (ParallelContext).
+    # Outputs: None. Exceptions: None explicitly raised.
+    # Side effects: collective all_gather_object on world group; new_group creation (collective on all
+    # ranks); mutates parallel_context.world_ranks_to_pg.
     """Tied weights are tied across specific set of global ranks, we use this method to create process groups for each difference set of global ranks"""
     group_ranks = {
         param.get_tied_info().global_ranks
@@ -104,6 +139,13 @@ def create_pg_for_tied_weights(root_module: nn.Module, parallel_context: Paralle
 def get_tied_id_to_param(
     parameters: List[NanotronParameter], root_module: nn.Module
 ) -> Dict[Tuple[str, Tuple[int, ...]], NanotronParameter]:
+    # [FUNCTION DOC]
+    # Behavior: builds a mapping from module id to its dotted name prefix (empty for the root), then for
+    # every tied parameter in parameters computes its full name from that mapping and returns a dictionary
+    # keyed by (full name, global ranks).
+    # Inputs: parameters (iterable of NanotronParameter), root_module (nn.Module).
+    # Outputs: dictionary mapping (name, global ranks tuple) to the parameter.
+    # Exceptions: None explicitly raised. Side effects: None.
     module_id_to_prefix = {id(module): f"{module_name}." for module_name, module in root_module.named_modules()}
     # Fix the root_model
     module_id_to_prefix[id(root_module)] = ""
@@ -123,6 +165,16 @@ def sync_tied_weights_gradients(
     parallel_context: ParallelContext,
     grad_accumulator: Optional[GradientAccumulator],
 ):
+    # [FUNCTION DOC]
+    # Behavior: gathers tied parameters requiring grad; logs (debug) on world ranks 0 and last; iterates
+    # tied entries in sorted key order (identical across ranks), skipping those with reduce op None; takes
+    # the gradient from grad_accumulator's buffer (by name) if provided else the param's grad; groups
+    # gradients by (group ranks, reduce op); finally performs a coalesced all-reduce per group on the
+    # process group for those ranks.
+    # Inputs: module (root model), parallel_context, grad_accumulator (optional GradientAccumulator).
+    # Outputs: None. Exceptions: None explicitly raised (KeyError if a needed process group was never created).
+    # Side effects: in-place all-reduce of gradient tensors; logging; profiler record_function range.
+    # KNOWN ISSUE: a None gradient (unused tied param) would break the coalesced all-reduce.
     tied_id_to_param = get_tied_id_to_param(
         parameters=[param for param in module.parameters() if param.requires_grad], root_module=module
     )

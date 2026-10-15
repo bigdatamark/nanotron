@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Purpose: token samplers for distributed generation where the final logits are sharded along the
+# vocabulary across a tensor-parallel process group (each rank holds a contiguous vocab slice, rank 0
+# first, and the full batch).
+# Shared scheme used by every sampler: the batch is split across the pg ranks (the first
+# batch_size mod pg_size ranks get one extra row); an all_to_all exchanges data so that each rank
+# holds its batch slice with information from every vocab shard; the rank samples for its rows; finally
+# all_gather_batches reassembles the full batch of sampled token ids on every rank.
+# Contents: all_gather_batches, SamplerType enum, Sampler base, TopPSampler, GreedySampler,
+# TopKSampler, BasicSampler. Import-time side effects: None.
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import Sequence
@@ -8,6 +18,14 @@ from nanotron import distributed as dist
 
 
 def all_gather_batches(in_tensor: torch.Tensor, in_split: Sequence[int], group: dist.ProcessGroup) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: all-gather along the first dimension allowing unequal per-rank sizes.
+    # Behavior: allocates an output with the sum of in_split rows, splits it into per-rank views and runs
+    # all_gather into them.
+    # Inputs: in_tensor - local tensor whose first dimension equals this rank's entry in in_split;
+    # in_split - sequence of row counts per rank; group - ProcessGroup.
+    # Outputs: tensor with all ranks' rows concatenated in rank order.
+    # Exceptions: None explicitly raised. Side effects: collective communication over group.
     # All gather along first dimension, allow un-equal splits
     out_tensor = torch.empty((sum(in_split),) + in_tensor.shape[1:], dtype=in_tensor.dtype, device=in_tensor.device)
     out_split_list = list(torch.split(out_tensor, in_split, dim=0))
@@ -16,6 +34,8 @@ def all_gather_batches(in_tensor: torch.Tensor, in_split: Sequence[int], group: 
 
 
 class SamplerType(Enum):
+    # [CLASS DOC]
+    # Purpose: enum selecting a sampling strategy: TOP_P, TOP_K, GREEDY, BASIC.
     TOP_P = auto()
     TOP_K = auto()
     GREEDY = auto()
@@ -23,12 +43,21 @@ class SamplerType(Enum):
 
 
 class Sampler:
+    # [CLASS DOC]
+    # Purpose: abstract base for samplers; subclasses are callables mapping vocab-sharded logits of shape
+    # (batch, vocab_per_shard) to sampled token ids of shape (batch, 1), identical on all ranks of pg.
     def __call__(self, sharded_logits: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: abstract. Inputs: sharded_logits. Outputs: none.
+        # Exceptions: NotImplementedError always. Side effects: None.
         raise NotImplementedError
 
 
 @dataclass
 class TopPSampler(Sampler):
+    # [CLASS DOC]
+    # Purpose: nucleus sampling. Fields: pg (vocab-sharding group), p (default 0.9), temperature (default
+    # 1.0), filter_value (probability given to removed tokens, default 0.0), min_tokens_to_keep (default 1).
     pg: dist.ProcessGroup
     p: float = 0.9
     temperature: float = 1.0
@@ -36,6 +65,15 @@ class TopPSampler(Sampler):
     min_tokens_to_keep: int = 1
 
     def __call__(self, sharded_logits: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: all_to_all so each rank holds full-vocab logits for its batch slice (shards concatenated
+        # along vocab); softmax of logits divided by temperature in float32; sorts probabilities ascending,
+        # computes the cumulative sum, marks tokens whose cumulative mass is at most 1 minus p for removal
+        # (keeping the top min_tokens_to_keep if above 1), scatters the mask back to vocab order, sets removed
+        # probabilities to filter_value, draws one token per row with multinomial, then all_gather_batches.
+        # Inputs: sharded_logits - (batch, vocab_per_shard). Outputs: int64 tensor (batch, 1) of token ids.
+        # Exceptions: None explicitly raised. Side effects: collective communication; consumes RNG.
+        # KNOWN ISSUE: the comment says the sort is descending, but it is ascending (the masking logic is written for ascending order, so the behavior is consistent).
         batch_size, vocab_per_shard = sharded_logits.shape
 
         # Split max_values/max_indices into a list of tensors along batch
@@ -90,9 +128,18 @@ class TopPSampler(Sampler):
 
 @dataclass
 class GreedySampler(Sampler):
+    # [CLASS DOC]
+    # Purpose: argmax decoding over the sharded vocabulary. Field: pg.
     pg: dist.ProcessGroup
 
     def __call__(self, sharded_logits: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: computes the local max logit and index per row, offsets the index by rank times
+        # vocab_per_shard to make it global, all_to_alls the values and indices so each rank holds every
+        # shard's candidate for its batch slice, takes the shard with the largest value (first on ties),
+        # selects the matching global index and all_gather_batches the result.
+        # Inputs: sharded_logits - (batch, vocab_per_shard). Outputs: (batch, 1) token ids.
+        # Exceptions: None explicitly raised. Side effects: collective communication (two all_to_alls and an all_gather).
         batch_size, vocab_per_shard = sharded_logits.shape
 
         # Find local max logit and its index
@@ -158,11 +205,21 @@ class GreedySampler(Sampler):
 
 @dataclass
 class TopKSampler(Sampler):
+    # [CLASS DOC]
+    # Purpose: top-k sampling over the sharded vocabulary. Fields: pg, k (default 50), temperature (default 1.0).
     pg: dist.ProcessGroup
     k: int = 50
     temperature: float = 1.0
 
     def __call__(self, sharded_logits: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: takes the local top k logits per row with global indices (offset by rank times
+        # vocab_per_shard), all_to_alls values and indices to batch-sharded layout (k times pg_size candidates
+        # per row), takes the global top k among candidates, applies temperature and float32 softmax, samples
+        # one candidate with multinomial, maps it to its global token id and all_gather_batches.
+        # Inputs: sharded_logits - (batch, vocab_per_shard); k must not exceed vocab_per_shard.
+        # Outputs: (batch, 1) token ids. Exceptions: torch error if k exceeds vocab_per_shard.
+        # Side effects: collective communication; consumes RNG.
         batch_size, vocab_per_shard = sharded_logits.shape
 
         # Find local top-k logits and their indices
@@ -238,11 +295,18 @@ class TopKSampler(Sampler):
 
 @dataclass
 class BasicSampler(Sampler):
+    # [CLASS DOC]
+    # Purpose: plain ancestral sampling from the full softmax distribution (no temperature). Field: pg.
     """Basic sampler that samples from the full vocab according to the logits."""
 
     pg: dist.ProcessGroup
 
     def __call__(self, sharded_logits: torch.Tensor) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: all_to_all to obtain full-vocab logits for the local batch slice, float32 softmax,
+        # multinomial sample of one token per row, all_gather_batches.
+        # Inputs: sharded_logits - (batch, vocab_per_shard). Outputs: (batch, 1) token ids.
+        # Exceptions: None explicitly raised. Side effects: collective communication; consumes RNG.
         # We will cross batch and vocab shards to sample from the full vocab and a part of the batch
         # (right now logits are sharded on vocab and batch, so we need to do all-to-all)
         batch_size, vocab_per_shard = sharded_logits.shape

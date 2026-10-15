@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Purpose: launches LightEval evaluation of a single saved nanotron checkpoint as a SLURM job.
+# Generates a bash SLURM script (checkpoint download from S3 with s5cmd or local copy with rsync,
+# torchrun of run_evals.py, optional result upload to S3 and W&B, cleanup), writes it to disk and
+# submits it with sbatch.
+# Contents: LightEvalRunner (called by the trainer after checkpoint upload), normalize_s3_path,
+# run_slurm_one_job. When run as a script, loads a hard-coded config and checkpoint path and tests
+# the runner.
+# Import-time side effects: creates a module logger.
 """ Mostly complete a SLURM template with a link to a single checkpoint on s3 and launch it
 """
 import datetime
@@ -18,13 +27,34 @@ logger = logging.get_logger(__name__)
 
 
 class LightEvalRunner:
+    # [CLASS DOC]
+    # Purpose: holds the training Config and its LightEval section, and decides when to launch an eval job.
+    # Key attributes: config, lighteval_config (config.lighteval), parallel_context (optional, used only
+    # to pick the logging group).
     def __init__(self, config: Config, parallel_context: Optional[ParallelContext] = None):
+        # [FUNCTION DOC]
+        # Behavior: stores config, asserts it has a lighteval section, stores it and parallel_context.
+        # Inputs: config - Config; parallel_context - optional ParallelContext (default None).
+        # Outputs: None. Exceptions: AssertionError if config.lighteval is None. Side effects: None.
         self.config = config
         assert config.lighteval is not None, "LightEval config is required"
         self.lighteval_config = config.lighteval
         self.parallel_context = parallel_context
 
     def eval_single_checkpoint(self, uploaded_files: List[dict]) -> Tuple[str, str]:
+        # [FUNCTION DOC]
+        # Behavior: skips (returns None) if an eval_interval is set and the current step is not a multiple.
+        # Selects uploaded files whose destination contains "config.py" or "config.yaml"; logs an error on DP
+        # rank 0 and returns None if there are zero or more than one. Derives the checkpoint path by removing
+        # "config.yaml" from the destination, logs a warning, and if the step is a multiple of eval_interval,
+        # calls run_slurm_one_job; otherwise warns and returns (None, None).
+        # Inputs: uploaded_files - list of dicts with at least a "destination" key.
+        # Outputs: tuple (slurm job id string or None, log file path or None), or None when skipped early.
+        # Exceptions: TypeError if eval_interval is None (the second modulo check runs unconditionally).
+        # Side effects: logging; via run_slurm_one_job, file writes and job submission.
+        # KNOWN ISSUE: early returns give None instead of the annotated tuple, while the later skip returns a tuple of Nones.
+        # KNOWN ISSUE: when eval_interval is None the first check passes but the second modulo raises TypeError.
+        # KNOWN ISSUE: a matched config.py destination is not stripped (only config.yaml is removed), giving a wrong checkpoint path.
         """Run light evaluation on uploaded files."""
         if (
             self.config.lighteval.eval_interval is not None
@@ -77,6 +107,11 @@ class LightEvalRunner:
 
 
 def normalize_s3_path(path: str) -> str:
+    # [FUNCTION DOC]
+    # HELPER: canonicalizes an S3 URL.
+    # Behavior: wraps the path as an xPath, splits into bucket and prefix with _get_s3_path_components and
+    # rebuilds "s3://bucket/prefix" without a trailing slash.
+    # Inputs: path - str. Outputs: str. Exceptions: as _get_s3_path_components. Side effects: None.
     """Normalize S3 path using existing s3_utils"""
     # Use existing utility to normalize path components
     path = xPath(path)
@@ -91,6 +126,25 @@ def run_slurm_one_job(
     model_checkpoint_path: str,
     current_step: int,
 ):
+    # [FUNCTION DOC]
+    # Behavior: normalizes S3 checkpoint paths; computes nodes as ceiling of dp times pp times tp of the
+    # eval parallelism divided by gpus_per_node; builds a timestamped run name; creates script and log
+    # directories under slurm_script_dir and logs_path keyed by run and step; builds the SLURM header
+    # (partition, nodes, cpus, gpus, qos, time, output log, requeue, optional reservation) and body
+    # (environment setup, HF token check, HF cache variables, checkpoint download excluding optimizer,
+    # random and lr_scheduler states, config.yaml check, torchrun of run_evals.py with the eval override
+    # file and cache dir). Appends an s5cmd upload of results if output_dir and s3_save_path are set, a
+    # W&B upload call (consumed tokens is step times the global batch tokens) if upload_to_wandb, and a
+    # cleanup step. Writes the script, then submits it with sbatch using a minimal environment (PATH,
+    # LD_LIBRARY_PATH, HOME) and parses the job id from the last word of stdout.
+    # Inputs: config - training Config; lighteval_config - LightEvalConfig; model_checkpoint_path - local
+    # or S3 path; current_step - int training step.
+    # Outputs: tuple (job id string, expected log path) or (None, None) on sbatch failure.
+    # Exceptions: CalledProcessError is caught and logged; KeyError if PATH is unset; OS errors propagate.
+    # Side effects: creates directories and writes the launch script; runs sbatch; logging.
+    # KNOWN ISSUE: the line passing --lighteval-override lacks a trailing line continuation, so --cache-dir is executed as a separate shell command instead of an argument.
+    # KNOWN ISSUE: --gpus requests gpus_per_node GPUs in total even when several nodes are used.
+    # KNOWN ISSUE: the returned log path name does not match the SBATCH output pattern (job id then timestamp), so it points to a nonexistent file.
     """Launch a single job on Slurm with the given mapping"""
     # Normalize S3 path if needed
     if model_checkpoint_path.startswith(("s3:/", "s3://")):

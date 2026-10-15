@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Purpose: The main training orchestrator of nanotron.
+# Main contents: get_size, DistributedTrainer (config parsing, process groups, model/optimizer/scheduler
+# construction and checkpoint resume, the training loop, logging, checkpoint saving with optional S3
+# upload and LightEval), and the module-level tying helpers mark_tied_parameters,
+# mark_unsharded_params_as_tied_across_tp and mark_unsharded_params_as_tied_across_expert.
+# Fits in nanotron: run_train.py builds a DistributedTrainer and calls train with dataloaders; it ties
+# together parallel context, models, pipeline engine, optimizers, serialization and sanity checks.
+# Import-time side effects: creates loggers and lowers torch.distributed logger verbosity to WARNING;
+# defines the mutable CONFIG_TO_MODEL_CLASS registry (Llama, Starcoder2, Qwen2); imports wandb if
+# available (else wandb is None).
 import datetime
 import gc
 import json
@@ -121,6 +132,13 @@ except ImportError:
 
 
 def get_size(bytes):
+    # [FUNCTION DOC]
+    # HELPER: human-readable byte formatting.
+    # Behavior: divides by 1024 through units "", K, M, B, T, P and returns the first value below 1024
+    # formatted with two decimals followed by the unit and "B".
+    # Inputs: bytes (number). Outputs: str.
+    # Exceptions: None explicitly raised. Side effects: None.
+    # KNOWN ISSUE: uses "B" instead of "G" for gigabytes, and returns None for values of 1024 peta or more.
     """Convert bytes to human readable format"""
     for unit in ["", "K", "M", "B", "T", "P"]:
         if bytes < 1024:
@@ -129,6 +147,16 @@ def get_size(bytes):
 
 
 class DistributedTrainer:
+    # [CLASS DOC]
+    # Purpose: End-to-end distributed trainer supporting data, tensor, pipeline, context and expert parallelism.
+    # Key attributes: config, model_config, parallel_context, random_states, model (possibly DDP-wrapped),
+    # unwrapped_model, optimizer, grad_accumulator, lr_scheduler, metadata (TrainingMetadata),
+    # init_checkpoint_path, param_shard_metadata (set when weights are loaded), logger_ranks, loggerwriter,
+    # micro_batch_size, n_micro_batches_per_batch, global_batch_size (samples), sequence_length,
+    # iteration_step, limit_val_batches, current_dataloader / current_base_dl, iteration_timer, s3_mover,
+    # lighteval_runner (world rank 0), metrics_logging, pipeline_engine, num_params, grad_norm_unclipped.
+    # Extension points: pre_init, post_init, pre_training, post_train_step, post_training,
+    # pre_save_checkpoint, post_save_checkpoint hooks, and _init_model_instance / _mark_tied_parameters.
     def __init__(
         self,
         config_or_config_file: Union[Config, str],
@@ -136,6 +164,26 @@ class DistributedTrainer:
         model_config_class: Optional[Type] = None,
         model_class: Type[NanotronModel] = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: loads the config (from YAML path or object), optionally registers model_class for the
+        # config class name, creates the ParallelContext (tp, pp, dp, expert, context sizes), runs pre_init
+        # (resolves resume checkpoint), sets per-rank log levels, seeds RNG with seed plus TP rank, builds
+        # named random states, builds the model (init_model), chooses STANDARD or SPECTRAL_MUP parametrization,
+        # builds optimizer and grad accumulator and loads optimizer state (to CPU) if resuming and enabled,
+        # builds the lr scheduler and loads it if enabled, loads TrainingMetadata from the checkpoint (asserting
+        # train_steps exceeds the last step) or creates fresh metadata with one DataStageMetadata per config
+        # stage, computes logger ranks (output pp rank with other ranks 0), sets batch-size fields and
+        # iteration step, logs library versions and configs, optionally logs benchmark throughput, runs
+        # post_init and creates the MetricsLogger.
+        # Inputs: config_or_config_file (Config or YAML path str), config_class (default Config),
+        # model_config_class (optional), model_class (optional NanotronModel subclass).
+        # Outputs: None.
+        # Exceptions: AssertionError for metadata problems; errors from model/optimizer building and loading.
+        # Side effects: initializes distributed process groups; seeds global RNG; allocates the model on GPU;
+        # file reads; extensive logging; mutates the CONFIG_TO_MODEL_CLASS registry.
+        # KNOWN ISSUE: logging the absolute path of config_or_config_file raises TypeError when a Config object is passed.
+        # KNOWN ISSUE: checkpoint metadata is only loaded when load_lr_scheduler is true, otherwise a resumed run restarts its step counters at 0.
+        # KNOWN ISSUE: when the resume path is remote, weights are not loaded and param_shard_metadata is never set, so load_optimizer raises AttributeError.
         """
         Nanotron's distributed trainer.
 
@@ -296,9 +344,19 @@ class DistributedTrainer:
         self.metrics_logging = MetricsLogger(self.config)
 
     def pre_init(self):
+        # [FUNCTION DOC]
+        # Behavior: hook run before setup; sets init_checkpoint_path via parse_ckpt_path (which may download from S3).
+        # Inputs: None. Outputs: None. Exceptions: see parse_ckpt_path. Side effects: sets attribute; possible download and collectives.
         self.init_checkpoint_path = parse_ckpt_path(config=self.config, parallel_context=self.parallel_context)
 
     def post_init(self):
+        # [FUNCTION DOC]
+        # Behavior: creates an S3Mover if s3_upload is configured (real only on LOCAL_RANK 0) else None; on world
+        # rank 0 with a lighteval config creates a LightEvalRunner and, if S3 is enabled, sets its
+        # eval_single_checkpoint as the post-upload callback.
+        # Inputs: None. Outputs: None.
+        # Exceptions: TypeError if LOCAL_RANK is unset while S3 upload is configured.
+        # Side effects: sets s3_mover and lighteval_runner.
         # S3 Mover and save initial state
         if self.config.s3_upload is not None:
             # NOTE: Only local rank 0 should upload
@@ -324,6 +382,15 @@ class DistributedTrainer:
                     self.s3_mover.post_upload_callback = self.lighteval_runner.eval_single_checkpoint
 
     def pre_training(self, *args, **kwargs):
+        # [FUNCTION DOC]
+        # Behavior: warns that sanity checks are on (and asserts not in benchmark mode); logs the run summary;
+        # if wandb is available, initializes runs: with TP above 1 and detailed metrics, one run per TP rank on
+        # dp_cp rank 0; otherwise one run on the first logger rank, with optional system-metrics sampling
+        # settings from STATS_SAMPLING_INTERVAL_IN_SEC, and uploads a temporary YAML copy of the config.
+        # Inputs: args, kwargs (unused).
+        # Outputs: None.
+        # Exceptions: AssertionError if sanity checks are enabled under NANOTRON_BENCHMARK.
+        # Side effects: logging; wandb network initialization; temp file write; reads environment variables.
         if not self.config.general.ignore_sanity_checks:
             log_rank(
                 "Sanity checks are enabled, this will slow down the training. To disable them, set `config.general.ignore_sanity_checks` to `True`",
@@ -412,16 +479,35 @@ class DistributedTrainer:
                 )
 
     def post_train_step(self):
+        # [FUNCTION DOC]
+        # Behavior: clears the model's per-step tbi logs and polls the S3 mover.
+        # Inputs: None. Outputs: None. Exceptions: None explicitly raised. Side effects: mutates model logs; may spawn subprocesses.
         self.unwrapped_model.clear_all_tbi_logs()
         # Update our background upload/removal of checkpoints
         if self.s3_mover is not None:
             self.s3_mover.update()
 
     def post_training(self):
+        # [FUNCTION DOC]
+        # Behavior: waits on all world ranks until pending S3 uploads finish.
+        # Inputs: None. Outputs: None. Exceptions: None explicitly raised. Side effects: world collectives, sleeps.
         if self.s3_mover is not None:
             self.s3_mover.distributed_wait_for_completion(group=self.parallel_context.world_pg)
 
     def _update_dataloader_based_on_training_stages(self, dataloaders: Union[List[DataLoader], DataLoader]):
+        # [FUNCTION DOC]
+        # HELPER: selects the dataloader for the current data stage, called every iteration.
+        # Behavior: without data stages, on first call wraps the given (or first of a tuple) dataloader with
+        # sanity_check_dataloader and returns. A generator input (DoReMi) is used as-is. Otherwise finds the
+        # stage to resume (latest stage whose start step is not after iteration_step); iterates stages from
+        # metadata.last_stage_idx; when a stage starts at the current step, or it is the resume stage on first
+        # call, clears the previous stage's dataloader from memory (if a real DataLoader), updates
+        # last_stage_idx, logs resume progress, takes (and lazily instantiates) that stage's dataloader and stops.
+        # If one was chosen, wraps it with sanity_check_dataloader and stores it.
+        # Inputs: dataloaders (dictionary of stage name to dataloader or zero-argument factory, a single dataloader, tuple, or generator).
+        # Outputs: None.
+        # Exceptions: AssertionError if empty; KeyError for missing stage names.
+        # Side effects: mutates current_dataloader, current_base_dl and metadata; frees memory; logging.
         from collections.abc import Generator
 
         if not hasattr(self.config, "data_stages") or self.config.data_stages is None:
@@ -444,6 +530,11 @@ class DistributedTrainer:
         assert len(dataloaders) > 0, "No dataloaders provided"
 
         def clear_dataloader_from_memory(dataloader: DataLoader, stage_name: str):
+            # [FUNCTION DOC]
+            # HELPER: frees a finished stage's dataloader.
+            # Behavior: logs, clears current_base_dl, deletes the dataloader's dataset, sampler and batch_sampler attributes and runs garbage collection.
+            # Inputs: dataloader (DataLoader), stage_name (str). Outputs: None.
+            # Exceptions: AttributeError if attributes are missing. Side effects: mutates dataloader and self; gc.
             import gc
 
             log_rank(
@@ -463,6 +554,12 @@ class DistributedTrainer:
         dataloader = None
 
         def find_stage_idx_to_resume():
+            # [FUNCTION DOC]
+            # HELPER: returns the index of the stage active at iteration_step.
+            # Behavior: sorts stages by start step descending and returns the original-order index of the first
+            # stage whose start step is not after iteration_step, or None.
+            # Inputs: None (closure). Outputs: int or None. Exceptions: None. Side effects: None.
+            # KNOWN ISSUE: the index conversion assumes config.data_stages is already sorted by start step ascending.
             reversed_data_stages = sorted(self.config.data_stages, key=lambda x: x.start_training_step, reverse=True)
             for idx, stage in enumerate(reversed_data_stages):
                 if self.iteration_step >= stage.start_training_step:
@@ -523,6 +620,19 @@ class DistributedTrainer:
         ],
         **kwargs,
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: optionally saves an initial checkpoint (fresh runs only); takes the pipeline engine from the
+        # config and sets its micro-batch count; builds module_id_to_prefix on the unwrapped model; sets the
+        # step range from last_train_step plus 1 to train_steps; runs pre_training; frees memory; under the
+        # profiler, for each step: starts a CUDA iteration timer, selects the stage dataloader, runs
+        # training_step, updates dataset consumption metrics and per-folder token counts when available,
+        # updates metadata counters (samples, tokens, last step, stage samples; asserts stage sequence length
+        # matches), logs at the configured interval, and saves a checkpoint at the checkpoint interval. Then
+        # barriers, optionally saves a final checkpoint and runs post_training.
+        # Inputs: dataloader_or_dls (dictionary of stage name to iterator(s), or a single dataloader), kwargs passed to pre_training.
+        # Outputs: None.
+        # Exceptions: AssertionError on sequence-length mismatch; propagates training errors.
+        # Side effects: the entire training run: GPU compute, collectives, file writes, logging, profiling.
         if self.config.checkpoints.save_initial_state and self.init_checkpoint_path is None:
             self.save_checkpoint()
 
@@ -604,6 +714,21 @@ class DistributedTrainer:
     def training_step(
         self, dataloader: Iterator[Dict[str, Union[torch.Tensor, TensorPointer]]]
     ) -> Tuple[Iterable[Dict], Optional[torch.Tensor]]:
+        # [FUNCTION DOC]
+        # Behavior: before-step sanity checks; runs the pipeline engine train_batch_iter over
+        # n_micro_batches_per_batch micro-batches drawn from dataloader (logging memory on the first 5 steps);
+        # after-step sanity checks; waits on fp32 grad all-reduce handles when DDP with a grad accumulator;
+        # without DDP manually all-reduces gradients across DP (context parallel unsupported); syncs tied
+        # gradients; clips gradients if configured (storing grad_norm_unclipped); on ranks with real losses
+        # sums micro-batch losses (and z_loss) and starts an async DP-CP average all-reduce of the loss; on the
+        # first resumed step moves optimizer states to CUDA; before-optimizer sanity checks; fetches tbi logs;
+        # optimizer step and zero_grad; scheduler step; after-optimizer sanity checks; waits on the loss
+        # all-reduce; runs post_train_step. Each phase is timed.
+        # Inputs: dataloader (iterator of micro-batch dictionaries).
+        # Outputs: tuple (outputs list from the engine, loss_avg tensor or None, z_loss_avg tensor or None, tbi_logs).
+        # Exceptions: NotImplementedError for context parallel without DDP; AssertionError from sanity checks or missing handles.
+        # Side effects: forward/backward, collectives across dp/cp/tp/pp/tied groups, parameter updates, timers.
+        # KNOWN ISSUE: return annotation lists two elements but four are returned.
         before_tbi_sanity_checks(
             self.config, self.parallel_context, self.unwrapped_model, self.grad_accumulator, self.lr_scheduler
         )
@@ -731,6 +856,11 @@ class DistributedTrainer:
         return outputs, loss_avg, z_loss_avg, tbi_logs
 
     def validation_step(self, dataloader: Iterator[Dict[str, Union[torch.Tensor, TensorPointer]]]) -> Iterable[Dict]:
+        # [FUNCTION DOC]
+        # Behavior: runs the pipeline engine's validate_batch_iter over limit_val_batches micro-batches.
+        # Inputs: dataloader (iterator). Outputs: iterable of output dictionaries.
+        # Exceptions: None explicitly raised. Side effects: forward passes, pipeline communication.
+        # KNOWN ISSUE: validate_batch_iter is called without the pg argument passed in training, and pipeline_engine is only set in train.
         outputs = self.pipeline_engine.validate_batch_iter(
             model=self.model,
             batch=(next(dataloader) for _ in range(self.limit_val_batches)),
@@ -745,6 +875,21 @@ class DistributedTrainer:
         z_loss_avg: Optional[torch.Tensor],
         tbi_logs: Optional[Dict[str, torch.Tensor]],
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: world barrier; stops the iteration timer; computes tokens per second and model/hardware
+        # TFLOPs; builds basic log items (tokens, time, throughput, global batch size in tokens, loss, lr,
+        # TFLOPs, ETA; plus z_loss and grad_norm when present); logger ranks write them to the console; then
+        # adds tbi_logs statistics (overall and per head), CPU/process memory (DEBUG_CPU), timers
+        # (ENABLE_TIMERS) and per-dataset consumed tokens (DEBUG_DL, default on); decides which ranks log to
+        # wandb and logs either detailed metrics (collected from the MetricsLogger, plus CUDA and disk usage
+        # and TP group info) at the detail interval or the basic items; in benchmark mode at step 4 logs
+        # throughput and exits the process unless profiling.
+        # Inputs: outputs (engine outputs), loss_avg, z_loss_avg (optional tensors), tbi_logs (optional dictionary of name to tensor shaped heads by tokens).
+        # Outputs: None.
+        # Exceptions: AssertionError for missing loggerwriter/dataloader/wandb run.
+        # Side effects: barrier; logging; wandb network calls; reads environment variables; may terminate the process.
+        # KNOWN ISSUE: calls item on loss_avg unconditionally, which fails on pipeline ranks that do not compute the loss (loss_avg None).
+        # KNOWN ISSUE: the final "Successfully logged ... to WandB" debug message is emitted even when nothing was logged to wandb.
         # TODO @nouamanetazi: Megatron-LM seems to be using a barrier to report their interval time. Check if this is necessary. https://github.com/NouamaneTazi/Megatron-LM/blob/e241a96c3085b18e36c6cee1d68a8155de77b5a6/megatron/training.py#L607
         dist.barrier()
         # End the iteration timer and get elapsed time in milliseconds
@@ -786,6 +931,11 @@ class DistributedTrainer:
         ]
 
         def get_cpu_logitems():
+            # [FUNCTION DOC]
+            # HELPER: collects host memory statistics.
+            # Behavior: returns log items for virtual memory, swap, and the main process and every child process
+            # memory info (rss, shared, vms, text, data, lib, dirty), skipping vanished or inaccessible children.
+            # Inputs: None. Outputs: list of LogItem. Exceptions: None explicitly raised (Linux-specific fields). Side effects: reads process info.
             # Add CPU memory usage metrics
             memory = psutil.virtual_memory()
             cpu_memory_log_entries = [
@@ -983,6 +1133,12 @@ class DistributedTrainer:
                 exit(0)
 
     def init_model(self) -> Union[NanotronModel, DistributedDataParallel]:
+        # [FUNCTION DOC]
+        # Behavior: pads vocab size to be divisible by TP size times make_vocab_size_divisible_by; warns if
+        # max_position_embeddings differs from the training sequence length (fine-tuning vs ignored); builds
+        # the model instance and loads or initializes weights.
+        # Inputs: None. Outputs: model (NanotronModel or DDP wrapper).
+        # Exceptions: see helpers. Side effects: mutates model_config.vocab_size; allocates model; logging.
         """Initialize the model and load weights from checkpoint if needed."""
         # TODO: add max_position_embeddings
         self.model_config.vocab_size = _vocab_size_with_padding(
@@ -1014,6 +1170,11 @@ class DistributedTrainer:
         return model
 
     def _init_model_instance(self) -> NanotronModel:
+        # [FUNCTION DOC]
+        # HELPER: builds the model class registered for the model config.
+        # Behavior: asserts the config class name is registered, then calls _init_model with a builder that
+        # constructs the class with model config, parallel context, parallelism config and random states.
+        # Inputs: None. Outputs: model. Exceptions: AssertionError for unsupported configs. Side effects: see _init_model.
         model_config_cls = self.model_config.__class__.__name__
         assert (
             model_config_cls in CONFIG_TO_MODEL_CLASS
@@ -1030,6 +1191,15 @@ class DistributedTrainer:
         return model
 
     def _load_model_checkpoint(self, model: NanotronModel) -> NanotronModel:
+        # [FUNCTION DOC]
+        # HELPER: weight loading or random initialization.
+        # Behavior: if resuming from a local checkpoint, loads weights and stores param_shard_metadata (marks
+        # reloaded also for remote paths). Otherwise rejects context parallel; for ExistingCheckpointInit loads
+        # weights from that path; for random or spectral-muP init calls init_model_randomly then averages all
+        # params across DP and tied params across their tied groups.
+        # Inputs: model (NanotronModel or DDP). Outputs: the same model.
+        # Exceptions: NotImplementedError for context parallel init; ValueError for unsupported init methods.
+        # Side effects: file reads; in-place weight changes; collectives; sets param_shard_metadata.
         unwrapped_model = model.module if isinstance(model, DistributedDataParallel) else model
 
         # Load or initialize model weights
@@ -1086,6 +1256,18 @@ class DistributedTrainer:
         model_builder: Callable[[], NanotronModel],
         target_pp_ranks: Optional[List[int]] = None,
     ) -> NanotronModel:
+        # [FUNCTION DOC]
+        # HELPER: constructs, ties, counts and optionally DDP-wraps the model.
+        # Behavior: decides on DDP; builds the model on its pipeline ranks with the configured dtype;
+        # initializes rotary embeddings; marks tied parameters; counts parameters and bytes, summing across TP
+        # and PP (all-reduce), stores num_params, logs counts and memory; wraps in DistributedDataParallel over
+        # the dp_cp group (no buffer broadcast, configured bucket size) after checking the model has grads;
+        # runs the NanotronParameter sanity check.
+        # Inputs: model_builder (zero-argument callable returning a NanotronModel), target_pp_ranks (optional list of ints).
+        # Outputs: model (NanotronModel or DDP).
+        # Exceptions: errors from build_model, check_model_has_grad or sanity_check.
+        # Side effects: GPU allocation; collectives; process group creation for tied weights; logging.
+        # KNOWN ISSUE: operator precedence in the DDP decision makes the ZeRO/fp32-accumulation exclusion apply only to the context-parallel clause, so DP above 1 always uses DDP.
         config = self.config
         parallel_context = self.parallel_context
 
@@ -1168,6 +1350,10 @@ class DistributedTrainer:
     def setup_log_writers(
         self,
     ) -> Optional[LoggerWriter]:
+        # [FUNCTION DOC]
+        # Behavior: returns a LoggerWriter (global step equal to train_steps) on logger ranks, else None.
+        # Inputs: None. Outputs: LoggerWriter or None. Exceptions: None. Side effects: None.
+        # KNOWN ISSUE: the docstring documents arguments the method does not take.
         """Setup all log writers on the appropriate ranks
 
         Args:
@@ -1183,6 +1369,14 @@ class DistributedTrainer:
         return loggerwriter
 
     def pre_save_checkpoint(self) -> Path:
+        # [FUNCTION DOC]
+        # Behavior: if a lighteval eval_interval_file exists, reads a new interval and applies it when it is a
+        # multiple of checkpoint_interval (warning otherwise or on read errors); if S3 is enabled, waits for the
+        # previous upload across the world group and logs launched eval job info from the callback output.
+        # Inputs: None. Outputs: None.
+        # Exceptions: None explicitly raised (read errors are caught).
+        # Side effects: file read; mutates config.lighteval; collectives; logging.
+        # KNOWN ISSUE: annotated to return a Path but returns None.
         # Check if eval_interval should be updated from file
         eval_interval_file = self.config.lighteval.eval_interval_file if self.config.lighteval is not None else None
         if eval_interval_file is not None and Path(eval_interval_file).exists():
@@ -1228,6 +1422,12 @@ class DistributedTrainer:
                 )
 
     def post_save_checkpoint(self):
+        # [FUNCTION DOC]
+        # Behavior: starts the S3 upload if enabled; on world rank 0 without S3 but with lighteval, runs an
+        # evaluation of the just-saved checkpoint when the step matches eval_interval (or no interval is set).
+        # Inputs: None. Outputs: None. Exceptions: None explicitly raised.
+        # Side effects: subprocess launch; evaluation job launch.
+        # KNOWN ISSUE: start_uploading is called without the step sub folder, so the whole checkpoints directory is uploaded each time.
         # Upload to S3
         if self.s3_mover is not None:
             self.s3_mover.start_uploading()
@@ -1242,6 +1442,15 @@ class DistributedTrainer:
                     self.lighteval_runner.eval_single_checkpoint(checkpoint_path)
 
     def save_checkpoint(self) -> Path:
+        # [FUNCTION DOC]
+        # Behavior: pre-save hook; creates the step folder (world rank 0 on shared filesystems, else each node's
+        # LOCAL_RANK 0) and barriers; updates config step and consumed samples; calls save (weights only from
+        # dp_cp rank 0, config only from world rank 0, sanity checks unless disabled); saves random states;
+        # writes latest.txt with the step; writes the model config JSON; post-save hook.
+        # Inputs: None. Outputs: Path of the checkpoint folder.
+        # Exceptions: TypeError if LOCAL_RANK is unset on non-shared filesystems; errors from save.
+        # Side effects: file writes; world barriers and collectives; S3 upload; mutates config.
+        # KNOWN ISSUE: every rank writes latest.txt concurrently, and the path join fails if checkpoints_path is a str.
         self.pre_save_checkpoint()
 
         checkpoints_path = self.config.checkpoints.checkpoints_path
@@ -1300,12 +1509,23 @@ class DistributedTrainer:
         parallel_context: ParallelContext,
         parallel_config: Optional[ParallelismArgs] = None,
     ):
+        # [FUNCTION DOC]
+        # HELPER: overridable hook delegating to mark_tied_parameters.
+        # Inputs: model, parallel_context, parallel_config (optional). Outputs: None. Exceptions: see mark_tied_parameters. Side effects: ties params.
         mark_tied_parameters(model=model, parallel_context=parallel_context, parallel_config=parallel_config)
 
 
 def mark_tied_parameters(
     model: NanotronModel, parallel_context: ParallelContext, parallel_config: Optional[ParallelismArgs] = None
 ):
+    # [FUNCTION DOC]
+    # Behavior: ties embedding and LM-head parameters across the pipeline ranks that own them (same ep, dp,
+    # cp, tp coordinates) with SUM gradient reduction; calls the model's tie_custom_params; asserts the model
+    # is not DDP; ties unsharded params across TP and across expert groups; creates process groups for all tied rank sets.
+    # Inputs: model (NanotronModel), parallel_context, parallel_config (optional ParallelismArgs).
+    # Outputs: None.
+    # Exceptions: AssertionError if model is DDP.
+    # Side effects: replaces parameters with tied NanotronParameters; collective process group creation.
     # Tie embeddings
     embeddings_lm_head_tied_names = model.get_embeddings_lm_head_tied_names()
     if len(embeddings_lm_head_tied_names) > 0:
@@ -1342,6 +1562,12 @@ def mark_tied_parameters(
 def mark_unsharded_params_as_tied_across_tp(
     model: NanotronModel, parallel_context: ParallelContext, parallel_config: "ParallelismArgs"
 ):
+    # [FUNCTION DOC]
+    # Behavior: for every direct parameter of every module, skipping already tied params, TP-sharded params
+    # and the TensorParallelRowLinear bias (only on TP rank 0), ties it across all TP group ranks with reduce
+    # op None in ALL_REDUCE mode (or when no config is given) and SUM otherwise (sequence-parallel inputs differ).
+    # Inputs: model, parallel_context, parallel_config (ParallelismArgs or None).
+    # Outputs: None. Exceptions: see tie_parameters. Side effects: replaces parameters on modules.
     for module_name, module in model.named_modules():
         for param_name, param in module.named_parameters(recurse=False):
             name = f"{module_name}.{param_name}"
@@ -1383,6 +1609,12 @@ def mark_unsharded_params_as_tied_across_tp(
 def mark_unsharded_params_as_tied_across_expert(
     model: NanotronModel, parallel_context: ParallelContext, parallel_config: "ParallelismArgs"
 ):
+    # [FUNCTION DOC]
+    # Behavior: for every direct parameter not already tied and not expert-sharded, ties it across the
+    # expert-parallel group ranks with reduce op None (non-expert parts see the full tokens).
+    # Inputs: model, parallel_context, parallel_config (unused).
+    # Outputs: None. Exceptions: see tie_parameters. Side effects: replaces parameters on modules.
+    # KNOWN ISSUE: since the TP pass runs first, every parameter tied across TP is skipped here, so non-expert params are never marked tied across the expert group when TP is used.
     for module_name, module in model.named_modules():
         for param_name, param in module.named_parameters(recurse=False):
             name = f"{module_name}.{param_name}"

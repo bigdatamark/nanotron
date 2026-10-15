@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Purpose: nanotron's wrapper over torch.distributed. It re-exports everything from torch.distributed
+# (star import) and overrides a few collectives/helpers with versions that add input checks, PyTorch
+# 1.12 compatibility, caching of rank lookups, and coalesced (flattened-buffer) collectives.
+# Contents: new_group, reduce_scatter_tensor, all_gather_into_tensor, reduce_scatter_coalesced,
+# all_reduce_coalesced, all_gather_coalesced, get_global_rank (cached), get_global_ranks, get_rank
+# (cached), initialize_torch_distributed; module values torch_version_above_1_13, Work (the async work
+# handle type for the installed torch), default_pg_timeout (20 minutes).
+# Usage: other nanotron modules import this as "dist" in place of torch.distributed.
+# Import-time side effects: parses torch version; no communication.
 import datetime
 import os
 from functools import cache, lru_cache
@@ -21,6 +31,13 @@ default_pg_timeout = datetime.timedelta(minutes=20)
 def new_group(  # pylint: disable=function-redefined
     ranks=None, timeout=default_pg_timeout, backend=None, pg_options=None
 ) -> ProcessGroup:
+    # [FUNCTION DOC]
+    # Behavior: rejects an empty rank list, then delegates to torch.distributed.new_group.
+    # Inputs: ranks - list of global ranks; timeout - default default_pg_timeout (20 min); backend,
+    # pg_options - forwarded (default None).
+    # Outputs: the new ProcessGroup.
+    # Exceptions: ValueError if ranks is empty; TypeError if ranks is None (len of None).
+    # Side effects: collective group creation (must be called by all ranks of the world).
     if len(ranks) == 0:
         raise ValueError("Cannot create a group with not ranks inside it")
 
@@ -34,6 +51,15 @@ def reduce_scatter_tensor(  # pylint: disable=function-redefined
     group: Optional[ProcessGroup] = None,
     async_op: bool = False,
 ) -> Optional[Work]:
+    # [FUNCTION DOC]
+    # Behavior: defaults group to the world group, asserts group has more than one rank, then calls
+    # reduce_scatter_tensor (torch 1.13 or newer) or the private _reduce_scatter_base (1.12). Every rank
+    # receives the reduced shard of input corresponding to its group rank in output.
+    # Inputs: output - tensor of size input size divided by group size; input - full tensor; op - reduce
+    # op (default SUM); group - process group (default world); async_op - default False.
+    # Outputs: Work handle if async_op, else None.
+    # Exceptions: AssertionError for single-rank groups.
+    # Side effects: collective communication; writes output.
     if group is None:
         group = dist.torch_dist.distributed_c10d._get_default_group()
 
@@ -51,6 +77,13 @@ def reduce_scatter_tensor(  # pylint: disable=function-redefined
 def all_gather_into_tensor(  # pylint: disable=function-redefined
     output_tensor, input_tensor, group: Optional[ProcessGroup] = None, async_op: bool = False
 ) -> Optional[Work]:
+    # [FUNCTION DOC]
+    # Behavior: defaults group to world, asserts group size above one, calls all_gather_into_tensor (1.13+)
+    # or _all_gather_base (1.12); every rank receives the concatenation of all ranks' input_tensor.
+    # Inputs: output_tensor - buffer of group size times input size; input_tensor; group (default world);
+    # async_op (default False).
+    # Outputs: Work handle if async_op else None. Exceptions: AssertionError for single-rank groups.
+    # Side effects: collective communication; writes output_tensor.
     if group is None:
         group = dist.torch_dist.distributed_c10d._get_default_group()
 
@@ -76,6 +109,18 @@ def reduce_scatter_coalesced(
     group: Optional[ProcessGroup] = None,
     async_op: bool = False,
 ) -> Optional[torch._C.Future]:
+    # [FUNCTION DOC]
+    # Behavior: validates that all tensors share device and dtype and that each inner input list has
+    # group_size entries (group_size is inferred from the first inner list). Flattens all output tensors
+    # into one buffer and, for each group rank r, flattens the r-th input of every list into one buffer;
+    # runs a single reduce_scatter, then unflattens the result and copies it back into the original
+    # output tensors. In async mode that copy is chained on the work future.
+    # Inputs: output_tensor_list - list of tensors (one per parameter); input_tensor_lists - list (one per
+    # parameter) of lists indexed by group rank; op (default SUM); group (default None meaning world);
+    # async_op (default False).
+    # Outputs: a future completing after the copy-back if async_op, else None.
+    # Exceptions: AssertionError on empty lists, length mismatches, group_size of 1, or device/dtype mismatch.
+    # Side effects: collective communication; temporary flattened buffers; in-place copies into outputs.
     """
     Reduces, then scatters a list of tensors to all processes in a group.
 
@@ -125,6 +170,9 @@ def reduce_scatter_coalesced(
     work = dist.reduce_scatter(output_tensor_buffer, input_tensor_buffer_list, op=op, group=group, async_op=async_op)
 
     def update_output():
+        # [FUNCTION DOC]
+        # HELPER: copies the reduced flat buffer back into the caller's output tensors.
+        # Inputs/Outputs: None (closure). Exceptions: None. Side effects: in-place copy into output_tensor_list.
         for original_buffer, reduced_buffer in zip(
             output_tensor_list, torch._utils._unflatten_dense_tensors(output_tensor_buffer, output_tensor_list)
         ):
@@ -143,6 +191,12 @@ def all_reduce_coalesced(  # pylint: disable=function-redefined
     group: Optional[ProcessGroup] = None,
     async_op: bool = False,
 ) -> Optional[torch._C.Future]:
+    # [FUNCTION DOC]
+    # Behavior: defaults group to world; returns immediately (no-op) for a single-rank group; otherwise
+    # calls torch's all_reduce_coalesced.
+    # Inputs: tensors - list of tensors reduced in place; op (default SUM); group; async_op (default False).
+    # Outputs: None for single-rank or sync; work handle when async.
+    # Exceptions: None explicitly raised. Side effects: collective communication; in-place reduction.
     if group is None:
         group = dist.torch_dist.distributed_c10d._get_default_group()
 
@@ -158,6 +212,18 @@ def all_gather_coalesced(  # pylint: disable=function-redefined
     group: Optional[ProcessGroup] = None,
     async_op: bool = False,
 ) -> Optional[torch._C.Future]:
+    # [FUNCTION DOC]
+    # Behavior: NCCL-compatible replacement for torch's deprecated coalesced all-gather. Validates
+    # devices/dtypes and that each output list has group_size entries (inferred from the first). Inverts
+    # the output lists from parameter-major to rank-major, flattens the local inputs into one buffer and
+    # each rank's outputs into one buffer per rank, runs one all_gather, then unflattens each gathered
+    # buffer and copies into the original output tensors (chained on the future when async).
+    # Inputs: output_tensor_lists - per parameter, a list of group_size output tensors; input_tensor_list
+    # - local tensors, one per parameter; group (default None meaning world); async_op (default False).
+    # Outputs: future if async_op, else None.
+    # Exceptions: AssertionError on empty/mismatched lists, group_size of 1, or device/dtype mismatch.
+    # Side effects: collective communication; in-place copies into outputs.
+    # KNOWN ISSUE: the comment in the synchronous branch mentions reduce_scatter although the call is all_gather.
     """
     `torch` has a deprecated version of this method that doesn't work over NCCL.
     All gathers a list of tensors to all processes in a group.
@@ -208,6 +274,9 @@ def all_gather_coalesced(  # pylint: disable=function-redefined
     work = dist.all_gather(output_tensor_buffer_list, input_tensor_buffer, group=group, async_op=async_op)
 
     def update_output():
+        # [FUNCTION DOC]
+        # HELPER: copies each gathered flat buffer back into the per-rank original output tensors.
+        # Inputs/Outputs: None (closure). Exceptions: None. Side effects: in-place copies.
         for original_buffer_list, gathered_buffer_tensor in zip(output_tensor_lists, output_tensor_buffer_list):
             for original_buffer, gathered_buffer in zip(
                 original_buffer_list,
@@ -225,6 +294,11 @@ def all_gather_coalesced(  # pylint: disable=function-redefined
 # This cache has a speedup of 4 tflops on a 7b model
 @cache
 def get_global_rank(group: ProcessGroup, group_rank: int) -> int:  # pylint: disable=function-redefined
+    # [FUNCTION DOC]
+    # Behavior: maps a rank within group to its global rank using get_global_rank (1.13+) or the private
+    # _get_global_rank (1.12). Memoized forever with functools.cache (keyed on group object and rank).
+    # Inputs: group - ProcessGroup; group_rank - int. Outputs: int global rank.
+    # Exceptions: propagates torch errors for invalid ranks. Side effects: populates the cache.
     if torch_version_above_1_13:
         return dist.get_global_rank(group, group_rank=group_rank)
     else:
@@ -233,12 +307,20 @@ def get_global_rank(group: ProcessGroup, group_rank: int) -> int:  # pylint: dis
 
 
 def get_global_ranks(group: ProcessGroup) -> Tuple[int]:
+    # [FUNCTION DOC]
+    # Behavior: returns the sorted tuple of global ranks of every member of group.
+    # Inputs: group - ProcessGroup. Outputs: tuple of ints. Exceptions: None explicitly raised. Side effects: None.
     return tuple(sorted((get_global_rank(group, i) for i in range(group.size()))))
 
 
 # We cache for dp, pp, tp process groups, world group, and tied process group for tied params
 @lru_cache
 def get_rank(group: Optional[ProcessGroup] = None) -> int:  # pylint: disable=function-redefined
+    # [FUNCTION DOC]
+    # Behavior: returns the current process's rank in group (world if None), memoized with lru_cache.
+    # Inputs: group - optional ProcessGroup. Outputs: int.
+    # Exceptions: RuntimeError if the current process is not a member of group (torch returns -1).
+    # Side effects: populates the cache.
     """Similar to `get_rank` except we raise an exception instead of return -1 when current rank is not part of the group"""
     result = dist.get_rank(group)
     if result == -1:
@@ -247,6 +329,17 @@ def get_rank(group: Optional[ProcessGroup] = None) -> int:  # pylint: disable=fu
 
 
 def initialize_torch_distributed():
+    # [FUNCTION DOC]
+    # Behavior: reads RANK, WORLD_SIZE, LOCAL_RANK from the environment (defaults 0, 1, 0). Requires CUDA:
+    # sets the current CUDA device to LOCAL_RANK and uses the nccl backend. Takes MASTER_PORT from the
+    # environment or picks a free port, builds an env:// init method with localhost and that port, and
+    # calls init_process_group with torch's default process-group timeout.
+    # Inputs: None. Outputs: True.
+    # Exceptions: NotImplementedError when CUDA is unavailable; torch errors if initialization fails.
+    # Side effects: sets CUDA device; initializes the global default process group (collective rendezvous).
+    # KNOWN ISSUE: the assignment of the gloo backend after the raise is unreachable dead code.
+    # KNOWN ISSUE: env:// init ignores the host and port in the URL (it reads MASTER_ADDR/MASTER_PORT from the environment), so the free port picked when MASTER_PORT is unset is not actually used; also each rank would pick a different port.
+    # KNOWN ISSUE: uses torch's default_pg_timeout instead of this module's 20-minute default_pg_timeout.
     """Initializes torch distributed with the environment variables"""
     rank = int(os.getenv("RANK", "0"))
     world_size = int(os.getenv("WORLD_SIZE", "1"))

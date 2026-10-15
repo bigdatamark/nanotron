@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Purpose: Distributed unit tests for DistributedSamplerForDoReMi and its use with CombinedDataset in a DataLoader: tp synchronization, no dp overlap, determinism across epochs, per-domain proportions of the global batch, no repeated samples, and per-domain counters while yielding.
+# Structure: public parametrized tests set up dummy datasets and a DoReMiContext (uniform weights), then run a private worker via tests.helpers.utils.init_distributed.
+# Import-time side effects: appends the repo root to sys.path; requires CUDA at run time.
 import pytest
 import torch
 from nanotron import distributed as dist
@@ -18,22 +22,34 @@ from tests.helpers.utils import init_distributed
 
 @pytest.fixture
 def dataset1():
+    # [FUNCTION DOC]
+    # HELPER: pytest fixture returning a dummy dataset with 7000 items.
+    # Inputs: None. Outputs: datasets.Dataset. Exceptions: None. Side effects: None.
     return create_dummy_dataset(7000)
 
 
 @pytest.fixture
 def dataset2():
+    # [FUNCTION DOC]
+    # HELPER: pytest fixture returning a dummy dataset with 3000 items.
+    # Inputs: None. Outputs: datasets.Dataset. Exceptions: None. Side effects: None.
     return create_dummy_dataset(3000)
 
 
 @pytest.fixture
 def datasets(dataset1, dataset2):
+    # [FUNCTION DOC]
+    # HELPER: pytest fixture returning the list of dataset1 and dataset2.
+    # Inputs: dataset1, dataset2. Outputs: list of datasets. Exceptions: None. Side effects: None.
     return [dataset1, dataset2]
 
 
 @pytest.mark.parametrize("num_microbatches", [1, 32])
 @pytest.mark.parametrize("is_proxy", [True, False])
 def test_dist_doremi_sampler_sync_across_tp(num_microbatches, dataset1, is_proxy):
+    # [FUNCTION DOC]
+    # Behavior: Two domains (both dataset1), micro batch 16; runs the worker with tp=2.
+    # Inputs: num_microbatches (1 or 32); dataset1; is_proxy (bool). Outputs: None. Exceptions: AssertionError in workers. Side effects: spawns processes.
     NUM_DOMAINS = 2
     BATCH_SIZE = 16
 
@@ -52,6 +68,11 @@ def test_dist_doremi_sampler_sync_across_tp(num_microbatches, dataset1, is_proxy
 def _test_dist_doremi_sampler_sync_across_tp(
     parallel_context: ParallelContext, batch_size: int, num_microbatches: int, datasets, doremi_context: DoReMiContext
 ):
+    # [FUNCTION DOC]
+    # HELPER: worker checking that tp ranks get identical indices.
+    # Behavior: builds a DistributedSamplerForDoReMi for this rank's dp rank and size, iterates to exhaustion and asserts each micro-batch of indices is synced across the tp group.
+    # Inputs: parallel_context; batch_size; num_microbatches; datasets; doremi_context. Outputs: None.
+    # Exceptions: AssertionError if unsynced. Side effects: tp collectives.
     dp_size = dist.get_world_size(parallel_context.dp_pg)
     dp_rank = dist.get_rank(parallel_context.dp_pg)
 
@@ -74,6 +95,10 @@ def _test_dist_doremi_sampler_sync_across_tp(
 @pytest.mark.parametrize("num_microbatches", [1, 32])
 @pytest.mark.parametrize("is_proxy", [True, False])
 def test_dist_doremi_sampler_not_overlapse_across_dp_for_proxy_training(dp_size, num_microbatches, dataset1, is_proxy):
+    # [FUNCTION DOC]
+    # Behavior: Two domains, global batch 512 divided by micro-batches and dp_size; runs the worker.
+    # Inputs: dp_size (2 or 4); num_microbatches; dataset1; is_proxy. Outputs: None. Exceptions: AssertionError in workers. Side effects: spawns processes.
+    # KNOWN ISSUE: dp_size is used to compute batch_size but the distributed launch is hard-coded to dp=2.
     NUM_DOMAINS = 2
     GLOBAL_BATCH_SIZE = 512
     batch_size = GLOBAL_BATCH_SIZE // (num_microbatches * dp_size)
@@ -97,6 +122,12 @@ def _test_dist_doremi_sampler_not_overlapse_across_dp_for_proxy_training(
     datasets,
     doremi_context: DoReMiContext,
 ):
+    # [FUNCTION DOC]
+    # HELPER: worker checking dp ranks receive disjoint indices.
+    # Behavior: builds a DistributedSamplerForDoReMi for this rank's dp rank and size; for each micro-batch all-gathers indices over the world group and asserts the gathered tensors have no common elements.
+    # Inputs: parallel_context; batch_size; num_microbatches; datasets; doremi_context. Outputs: None.
+    # Exceptions: AssertionError on overlap. Side effects: all_gather collectives.
+    # KNOWN ISSUE: unpacks the gathered list into torch.isin, which only works for exactly two ranks.
     dp_size = dist.get_world_size(parallel_context.dp_pg)
     dp_rank = dist.get_rank(parallel_context.dp_pg)
 
@@ -126,6 +157,9 @@ def _test_dist_doremi_sampler_not_overlapse_across_dp_for_proxy_training(
 @pytest.mark.parametrize("num_microbatches", [1, 32])
 @pytest.mark.parametrize("is_proxy", [True, False])
 def test_determistic_doremi_sampler(num_microbatches, dataset1, is_proxy):
+    # [FUNCTION DOC]
+    # Behavior: Two domains, micro batch 100, three epochs, single process.
+    # Inputs: num_microbatches; dataset1; is_proxy. Outputs: None. Exceptions: AssertionError in worker. Side effects: spawns a process.
     BATCH_SIZE = 100
     NUM_DOMAINS = 2
 
@@ -151,6 +185,11 @@ def _test_determistic_doremi_sampler(
     datasets,
     doremi_context: DoReMiContext,
 ):
+    # [FUNCTION DOC]
+    # HELPER: worker checking sampler determinism across epochs.
+    # Behavior: builds a DistributedSamplerForDoReMi for this rank's dp rank and size, collects all micro-batches per epoch calling reset between epochs, and asserts consecutive epochs produced the same sequences.
+    # Inputs: parallel_context; batch_size; num_microbatches; n_epochs; datasets; doremi_context. Outputs: None.
+    # Exceptions: AssertionError on mismatch. Side effects: None beyond sampler state.
     dp_size = dist.get_world_size(parallel_context.dp_pg)
     dp_rank = dist.get_rank(parallel_context.dp_pg)
 
@@ -189,6 +228,9 @@ def test_sampling_from_dist_doremi_sampler_with_global_batch_size(
     dataset1,
     is_proxy,
 ):
+    # [FUNCTION DOC]
+    # Behavior: Eight domains, global batch 512 split across micro-batches and dp; runs the worker with dp_size.
+    # Inputs: dp_size (1, 2, 4); num_microbatches; dataset1; is_proxy. Outputs: None. Exceptions: AssertionError in workers. Side effects: spawns processes.
     NUM_DOMAINS = 8
     GLOBAL_BATCH_SIZE = 512
     batch_size = GLOBAL_BATCH_SIZE // (num_microbatches * dp_size)
@@ -214,6 +256,11 @@ def _test_sampling_from_dist_doremi_sampler_with_global_batch_size(
     datasets,
     doremi_context: DoReMiContext,
 ):
+    # [FUNCTION DOC]
+    # HELPER: worker checking per-domain counts of each global batch match the domain weights.
+    # Behavior: builds a DistributedSamplerForDoReMi for this rank's dp rank and size; computes expected per-domain counts by rounding global batch times weight; for each micro-batch asserts its length and counts indices per domain by offset range; after the last micro-batch of a global batch, all-reduces counts (sum) and asserts every domain is non-empty and within dp_size of expected, then resets the counts.
+    # Inputs: parallel_context; batch_size; num_microbatches; global_batch_size; datasets; doremi_context. Outputs: None.
+    # Exceptions: AssertionError on failure. Side effects: all_reduce collectives.
     dp_size = dist.get_world_size(parallel_context.dp_pg)
     dp_rank = dist.get_rank(parallel_context.dp_pg)
 
@@ -270,6 +317,9 @@ def _test_sampling_from_dist_doremi_sampler_with_global_batch_size(
 @pytest.mark.parametrize("num_microbatches", [1, 32])
 @pytest.mark.parametrize("is_proxy", [True, False])
 def test_dist_doremi_sampler_not_repeating_samples(dp_size, num_microbatches, dataset1, is_proxy):
+    # [FUNCTION DOC]
+    # Behavior: Two domains, global batch 512; runs the worker with dp_size.
+    # Inputs: dp_size (1, 2, 4); num_microbatches; dataset1; is_proxy. Outputs: None. Exceptions: AssertionError in workers. Side effects: spawns processes.
     NUM_DOMAINS = 2
     GLOBAL_BATCH_SIZE = 512
     batch_size = GLOBAL_BATCH_SIZE // (num_microbatches * dp_size)
@@ -293,6 +343,12 @@ def _test_dist_doremi_sampler_not_repeating_samples(
     datasets,
     doremi_context: DoReMiContext,
 ):
+    # [FUNCTION DOC]
+    # HELPER: worker checking no index is ever yielded twice, locally or globally.
+    # Behavior: builds a DistributedSamplerForDoReMi for this rank's dp rank and size; for each micro-batch asserts no intersection with previously yielded local and global indices, then all-gathers indices over dp and records them; finally asserts the global record has no duplicates.
+    # Inputs: parallel_context; batch_size; num_microbatches; datasets; doremi_context. Outputs: None.
+    # Exceptions: AssertionError on repeats. Side effects: all_gather collectives.
+    # KNOWN ISSUE: the variable named epoch actually counts micro-batches.
     dp_size = dist.get_world_size(parallel_context.dp_pg)
     dp_rank = dist.get_rank(parallel_context.dp_pg)
 
@@ -336,6 +392,9 @@ def _test_dist_doremi_sampler_not_repeating_samples(
 @pytest.mark.parametrize("num_microbatches", [1, 5])
 @pytest.mark.parametrize("is_proxy", [True, False])
 def test_yielding(dp_size, num_microbatches, dataset1, is_proxy):
+    # [FUNCTION DOC]
+    # Behavior: Two domains, micro batch 100, global batch 100*micro-batches*dp; runs the worker.
+    # Inputs: dp_size (2, 4, 8); num_microbatches (1 or 5); dataset1; is_proxy. Outputs: None. Exceptions: AssertionError in workers. Side effects: spawns processes.
     NUM_DOMAINS = 2
     BATCH_SIZE = 100
     global_batch_size = BATCH_SIZE * num_microbatches * dp_size
@@ -361,6 +420,11 @@ def _test_yielding(
     datasets,
     doremi_context: DoReMiContext,
 ):
+    # [FUNCTION DOC]
+    # HELPER: worker checking sampler domain counters while yielding.
+    # Behavior: builds a DistributedSamplerForDoReMi for this rank's dp rank and size; for each micro-batch all-gathers indices over dp and asserts the total size; after each full global batch asserts each domain counter equals the number of global batches times global batch size times 0.5.
+    # Inputs: parallel_context; batch_size; global_batch_size; num_microbatches; datasets; doremi_context. Outputs: None.
+    # Exceptions: AssertionError on failure. Side effects: all_gather collectives.
     dp_size = dist.get_world_size(parallel_context.dp_pg)
     dp_rank = dist.get_rank(parallel_context.dp_pg)
 
@@ -400,6 +464,9 @@ def _test_yielding(
 @pytest.mark.parametrize("num_microbatches", [1, 5])
 @pytest.mark.parametrize("is_proxy", [True, False])
 def test_yielding_with_dataloader(dp_size, num_microbatches, dataset1, is_proxy):
+    # [FUNCTION DOC]
+    # Behavior: Same setup as test_yielding but through a DataLoader.
+    # Inputs: dp_size; num_microbatches; dataset1; is_proxy. Outputs: None. Exceptions: AssertionError in workers. Side effects: spawns processes.
     NUM_DOMAINS = 2
     BATCH_SIZE = 100
     global_batch_size = BATCH_SIZE * num_microbatches * dp_size
@@ -425,6 +492,11 @@ def _test_yielding_with_dataloader(
     datasets,
     doremi_context: DoReMiContext,
 ):
+    # [FUNCTION DOC]
+    # HELPER: worker checking DataLoader batches with the DoReMi batch sampler.
+    # Behavior: builds a DistributedSamplerForDoReMi for this rank's dp rank and size, wraps CombinedDataset in a DataLoader using it as batch_sampler; for each batch asserts the "text" column has micro batch size entries and that their dp sum equals batch size times dp; after each full global batch checks domain counters as in _test_yielding; finally asserts at least one batch was produced.
+    # Inputs: parallel_context; batch_size; global_batch_size; num_microbatches; datasets; doremi_context. Outputs: None.
+    # Exceptions: AssertionError on failure. Side effects: all_reduce collectives over dp.
     dp_size = dist.get_world_size(parallel_context.dp_pg)
     dp_rank = dist.get_rank(parallel_context.dp_pg)
 

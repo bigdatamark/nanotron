@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Purpose: Example script producing a YAML config for a tiny Llama model (hidden 16, 2 layers, 4 heads, vocab 256) used for quick smoke tests of nanotron training.
+# Behavior at import time: builds LlamaConfig, computes and prints an approximate parameter count, builds LR scheduler (cosine, 2 warmup steps), AdamW optimizer (ZeRO 0), parallelism (dp=2, pp=2, tp=2, 1f1b, REDUCE_SCATTER), tokens (seq 256, 15 steps, mbs 2), two data stages on stas/openwebtext-10k (stable from step 1, annealing from step 10) and a Config with the dummy word-level tokenizer.
+# Main entry (run as script): saves config_tiny_llama.yaml next to this file.
+# Exports: model_config, num_params, seed, learning_rate, optimizer, parallelism, tokens, data_stages, checkpoints_path, config.
+# Side effects at import: prints; creates ./checkpoints in the current working directory.
+# KNOWN ISSUE: inline comment claims 1.62M parameters, which does not match this tiny config (about 14K by the formula used).
 """ Example python script to generate a YAML config file which can be used to run a training with nanotron. Refer to "examples" section in the `/README.md` for more information."""
 import os
 

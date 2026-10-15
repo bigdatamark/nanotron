@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Purpose: Example nanotron training entry point showing how to plug a custom dataloader into DistributedTrainer: when a data stage has no dataset configured, random token ids are generated; otherwise a HuggingFace pretraining dataset is tokenized and loaded.
+# Main contents: get_dataloader_from_data_stage, get_dataloader, get_args, and a main block that builds DistributedTrainer from --config-file and calls train with the per-stage dataloaders.
+# Usage: launched with torchrun (one process per GPU); CUDA_DEVICE_MAX_CONNECTIONS=1 recommended.
+# Import-time side effects: tries to import transformers/huggingface_hub (versions set to None if missing); creates a module logger.
 """
 Nanotron training script example using a custom dataloader.
 
@@ -54,6 +59,14 @@ def get_dataloader_from_data_stage(
     consumed_train_samples: int,
     num_remaining_train_steps: int,
 ):
+    # [FUNCTION DOC]
+    # Behavior: Determines the pipeline ranks holding input and output (get_input_output_pp_ranks). Case 1, data.dataset is None: builds an in-memory datasets.Dataset of uniformly random token ids in [0, vocab_size) with global_batch_size*num_remaining_train_steps rows of sequence_length+1 tokens, wraps it in a DataCollatorForCLM, and returns a torch DataLoader (micro batch size, drop_last, no workers, pinned memory, worker init seeded by dp rank). Case 2, PretrainDatasetsArgs: inside main_rank_first over the world group (rank 0 processes and caches first), loads the train split with get_datasets, loads the tokenizer (pad = eos, left padding), applies clm_process to pack into sequence_length chunks, builds the distributed train dataloader with get_train_dataloader (skipping consumed samples), and asserts the dataset has enough tokens for the remaining steps. Other dataset types raise.
+    # Inputs: trainer: DistributedTrainer (provides config, model, parallel_context, batch sizes, sequence_length, iteration_step); data: DataArgs for the stage; consumed_train_samples: int samples already consumed in this stage; num_remaining_train_steps: int.
+    # Outputs: a torch DataLoader yielding collated CLM micro-batches.
+    # Exceptions: AssertionError if counts are negative or dataset is too small; ValueError for unsupported dataset types; errors from tokenizer/dataset loading.
+    # Side effects: logs on rank 0; consumes numpy global RNG (case 1); dataset download/cache writes; barrier synchronization through main_rank_first.
+    # KNOWN ISSUE: assert messages say "greater than 0" while the check allows 0.
+    # KNOWN ISSUE: requires transformers installed for case 2 but the import failure is only silenced at module level, so AutoTokenizer would be undefined (NameError).
     """
     Returns a dataloader for a given data stage.
 
@@ -166,6 +179,13 @@ def get_dataloader_from_data_stage(
 
 
 def get_dataloader(trainer: DistributedTrainer) -> Dict[str, DataLoader]:
+    # [FUNCTION DOC]
+    # Behavior: Iterates over trainer.config.data_stages; for each stage reads consumed samples from the checkpoint metadata (asserting it exists) and computes remaining train steps, logs the plan on rank 0, then builds the dataloader immediately for the first stage and stores a zero-argument callable that builds it lazily for later stages.
+    # Inputs: trainer: DistributedTrainer.
+    # Outputs: dictionary mapping stage name to a DataLoader (first stage) or a callable returning one (later stages).
+    # Exceptions: AssertionError if consumed samples cannot be found.
+    # Side effects: logging; builds the first dataloader (see get_dataloader_from_data_stage).
+    # KNOWN ISSUE: the lazy lambda binds only stage as a default argument; consumed_train_samples and num_remaining_train_steps are captured late, so every lazy stage uses the values computed for the last stage.
     dataloaders = {}
 
     for stage_idx, stage in enumerate(trainer.config.data_stages):
@@ -207,6 +227,10 @@ def get_dataloader(trainer: DistributedTrainer) -> Dict[str, DataLoader]:
 
 
 def get_args():
+    # [FUNCTION DOC]
+    # Behavior: Parses a required --config-file argument from the command line.
+    # Inputs: None. Outputs: argparse Namespace with config_file.
+    # Exceptions: SystemExit on missing argument. Side effects: reads sys.argv.
     parser = argparse.ArgumentParser()
     parser.add_argument("--config-file", type=str, required=True, help="Path to the YAML or python config file")
     return parser.parse_args()

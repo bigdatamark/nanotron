@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Purpose: Dataclasses and JSON (de)serialization for checkpoint-level and tensor-level metadata.
+# Main contents: DataStageMetadata, TrainingMetadata, CheckpointMetadata, TensorMetadata, the
+# recursive conversion helpers process_type / to_dict / to_list, and save_meta / load_meta.
+# Fits in nanotron: the trainer keeps a TrainingMetadata of consumed samples/tokens per data stage;
+# save_meta writes it with topology info into the checkpoint metadata JSON file; TensorMetadata is
+# stored in each safetensors file header to describe how a shard maps into the unsharded tensor.
+# Import-time side effects: None.
 import dataclasses
 import json
 import re
@@ -17,6 +25,11 @@ from collections import defaultdict
 
 @dataclasses.dataclass
 class DataStageMetadata:
+    # [CLASS DOC]
+    # Purpose: Progress counters for one data stage (reset at each stage).
+    # Key attributes: name, start_training_step, consumed_train_samples (used by the sampler),
+    # sequence_length (defaults to 4096 when None), consumed_tokens_per_dataset_folder (dictionary of
+    # folder name to token count).
     """
     consumed_train_samples: The number of samples consumed by the model in the this stage (resets at each stage).
     consumed_tokens_per_dataset_folder: The number of tokens consumed by the model in the this stage for each dataset folder. (resets at each stage)
@@ -29,18 +42,32 @@ class DataStageMetadata:
     consumed_tokens_per_dataset_folder: Dict[str, int] = dataclasses.field(default_factory=dict) # this gets reset at each stage
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: fills sequence_length with 4096 when it is None (temporary default).
+        # Inputs: None. Outputs: None. Exceptions: None. Side effects: mutates self.
         if self.sequence_length is None:
             self.sequence_length = 4096 # TODO: temp
 
     def sanity_consumed_train_samples(self):
+        # [FUNCTION DOC]
+        # Behavior: asserts consumed samples times sequence length equals the sum of per-folder tokens.
+        # Inputs: None. Outputs: None. Exceptions: AssertionError on mismatch. Side effects: None.
         assert self.consumed_train_samples*self.sequence_length == sum(self.consumed_tokens_per_dataset_folder.values()), f"Mismatch between the total consumed samples and the sum of consumed samples across dataset folders! consumed_train_samples={self.consumed_train_samples}, sequence_length={self.sequence_length}, consumed_tokens_per_dataset_folder={self.consumed_tokens_per_dataset_folder}"
 
     @property
     def consumed_tokens_all_datasets(self):
+        # [FUNCTION DOC]
+        # Behavior: property returning the sum of per-folder token counts.
+        # Inputs: None. Outputs: int. Exceptions: None. Side effects: None.
         return sum(self.consumed_tokens_per_dataset_folder.values())
 
 @dataclasses.dataclass
 class TrainingMetadata:
+    # [CLASS DOC]
+    # Purpose: Global training progress across stages.
+    # Key attributes: consumed_train_samples (legacy global count), last_train_step, consumed_tokens_total
+    # (derived if None), last_stage_idx (optional), data_stages (optional list of DataStageMetadata).
+    # Invariant: global sample and token counts equal the sums over stages.
     """
     consumed_train_samples: The number of samples consumed globally, across all stages.
     last_train_step: The last training step across all stages.
@@ -58,6 +85,14 @@ class TrainingMetadata:
     data_stages: Optional[List[DataStageMetadata]] = None
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: asserts consumed_train_samples equals the sum over stages; asserts or fills
+        # consumed_tokens_total from the per-stage token sums; asserts data_stages is present if
+        # last_stage_idx is set.
+        # Inputs: None. Outputs: None.
+        # Exceptions: AssertionError on mismatches.
+        # Side effects: may set consumed_tokens_total.
+        # KNOWN ISSUE: the sums iterate data_stages before the None check, so data_stages None (declared allowed) raises TypeError; the last assertion is therefore unreachable in that case.
         # NOTE: this is a sanity check after loading a trained checkpoint
         assert (
             self.consumed_train_samples == sum(stage.consumed_train_samples for stage in self.data_stages)
@@ -74,6 +109,9 @@ class TrainingMetadata:
 
     @property
     def consumed_tokens_per_dataset_folder_total(self):
+        # [FUNCTION DOC]
+        # Behavior: property summing tokens per dataset folder across all stages.
+        # Inputs: None. Outputs: defaultdict of folder name to int. Exceptions: TypeError if data_stages is None. Side effects: None.
         consumed = defaultdict(int)
         for stage in self.data_stages:
             for dataset_folder, tokens in stage.consumed_tokens_per_dataset_folder.items():
@@ -82,11 +120,17 @@ class TrainingMetadata:
     
     @property
     def current_stage(self) -> DataStageMetadata:
+        # [FUNCTION DOC]
+        # Behavior: property returning the stage at last_stage_idx.
+        # Inputs: None. Outputs: DataStageMetadata. Exceptions: TypeError/IndexError if unset or out of range. Side effects: None.
         return self.data_stages[self.last_stage_idx]
 
 
 @dataclasses.dataclass
 class CheckpointMetadata:
+    # [CLASS DOC]
+    # Purpose: Content of the checkpoint metadata file: checkpoint version, tp, dp, cp sizes (cp default 1),
+    # the TrainingMetadata, and optional custom_metas dictionary.
     version: Version
     tp: int
     dp: int
@@ -97,6 +141,11 @@ class CheckpointMetadata:
 
 @dataclasses.dataclass
 class TensorMetadata:
+    # [CLASS DOC]
+    # Purpose: Per-tensor metadata stored in safetensors headers as strings.
+    # Key attributes: version, local_global_slices_pairs (tuple of SlicesPair mapping local shard slices
+    # to global slices), unsharded_shape (tuple of ints); class-level dacite config with type hooks that
+    # parse slices pairs and shape strings (also tolerating numpy integer reprs), strict mode.
     # Mandatory for checkpoint version higher than 1.2
     version: Version
     # Anything users want to store
@@ -119,6 +168,9 @@ class TensorMetadata:
     )
 
     def to_str_dict(self) -> Dict[str, str]:
+        # [FUNCTION DOC]
+        # Behavior: serializes version, slices pairs and unsharded shape to strings.
+        # Inputs: None. Outputs: dictionary of str to str. Exceptions: None explicitly raised. Side effects: None.
         return {
             "version": str(self.version),
             "local_global_slices_pairs": SlicesPair.tuple_to_str(self.local_global_slices_pairs),
@@ -127,6 +179,10 @@ class TensorMetadata:
 
     @classmethod
     def from_str_dict(cls, dictionary: Dict[str, str]) -> "TensorMetadata":
+        # [FUNCTION DOC]
+        # Behavior: class method that parses the string dictionary back via dacite with the class config.
+        # Inputs: dictionary (str to str). Outputs: TensorMetadata.
+        # Exceptions: dacite errors on missing/extra keys or bad values. Side effects: None.
         tensor_metadata: TensorMetadata = dacite.from_dict(
             data_class=TensorMetadata,
             data=dictionary,
@@ -136,6 +192,12 @@ class TensorMetadata:
 
 
 def process_type(elt: Any, type_hooks: Dict[Type, Callable[[Any], Any]]):
+    # [FUNCTION DOC]
+    # HELPER: recursive converter used before JSON dumping.
+    # Behavior: dictionaries go through to_dict, objects whose exact class has a hook are converted by the
+    # hook, lists/tuples go through to_list, other values are returned unchanged.
+    # Inputs: elt (any), type_hooks (dictionary from type to converter). Outputs: converted value.
+    # Exceptions: None explicitly raised. Side effects: None.
     if isinstance(elt, dict):
         return to_dict(elt, type_hooks=type_hooks)
     elif elt.__class__ in type_hooks:
@@ -147,6 +209,9 @@ def process_type(elt: Any, type_hooks: Dict[Type, Callable[[Any], Any]]):
 
 
 def to_dict(dict_: Dict, type_hooks: Dict[Type, Callable[[Any], Any]]):
+    # [FUNCTION DOC]
+    # HELPER: applies process_type to every value of a dictionary.
+    # Inputs: dict_, type_hooks. Outputs: new dictionary. Exceptions: None. Side effects: None.
     result = {}
     for key, value in dict_.items():
         result[key] = process_type(value, type_hooks=type_hooks)
@@ -154,10 +219,20 @@ def to_dict(dict_: Dict, type_hooks: Dict[Type, Callable[[Any], Any]]):
 
 
 def to_list(list_: Union[List, Tuple], type_hooks: Dict[Type, Callable[[Any], Any]]):
+    # [FUNCTION DOC]
+    # HELPER: applies process_type to every element, preserving the container class (list or tuple).
+    # Inputs: list_, type_hooks. Outputs: new list or tuple. Exceptions: None. Side effects: None.
     return list_.__class__((process_type(elt, type_hooks=type_hooks) for elt in list_))
 
 
 def save_meta(parallel_context: ParallelContext, root_folder: Path, training_metadata: TrainingMetadata):
+    # [FUNCTION DOC]
+    # Behavior: asserts the metadata type; only world rank 0 continues: creates root_folder, builds
+    # CheckpointMetadata with current version and tp/dp/cp sizes, converts Version objects to strings,
+    # and writes sorted, indented JSON to the checkpoint metadata file.
+    # Inputs: parallel_context, root_folder (Path), training_metadata (TrainingMetadata).
+    # Outputs: None. Exceptions: AssertionError on wrong type.
+    # Side effects: directory creation and file write on world rank 0.
     assert isinstance(training_metadata, TrainingMetadata)
 
     if dist.get_rank(parallel_context.world_pg) != 0:
@@ -180,6 +255,12 @@ def save_meta(parallel_context: ParallelContext, root_folder: Path, training_met
 
 
 def load_meta(parallel_context: ParallelContext, root_folder: Path) -> CheckpointMetadata:
+    # [FUNCTION DOC]
+    # Behavior: reads the metadata JSON, builds CheckpointMetadata via dacite (casting Version), and asserts
+    # its version is not newer than the current checkpoint version.
+    # Inputs: parallel_context (unused), root_folder (Path). Outputs: CheckpointMetadata.
+    # Exceptions: AssertionError for a newer checkpoint; I/O or dacite errors.
+    # Side effects: file read.
     with open(root_folder / CHECKPOINT_FILE_NAME, mode="r") as fi:
         checkpoint_metadata = json.load(fi)
         checkpoint_metadata = from_dict(

@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Purpose: Script converting a nanotron Llama (or Qwen2) checkpoint into HuggingFace LlamaForCausalLM format, optionally saving a tokenizer and running a test generation.
+# Main contents: TEST_PROMPT, _handle_attention_block, _handle_gate_up_proj, convert_nt_to_hf, get_hf_config, convert_checkpoint_and_save, check_converted_model_generation, and a CLI main (--checkpoint_path, --save_path, --tokenizer_name default Llama-2-7b-chat, --config_cls LlamaConfig or Qwen2Config).
+# Usage: torchrun with one process.
+# Import-time side effects: None.
+# KNOWN ISSUE: uses a relative import of convert_weights, so running the file directly as in the docstring fails.
 """
 Converts a nanotron model to HF format
 Command:
@@ -38,7 +44,17 @@ def _handle_attention_block(
     # This function selects the proper chunk of the bundled qkv tensor and permutation
     # to ensure correct transformation to huggingface.
 
+    # [FUNCTION DOC]
+    # HELPER: extracts q, k or v from nanotron's fused qkv_proj weight.
+    # Behavior: Asserts part is q, k or v; slices rows [0, n_q*d_qk) for q, the next n_kv*d_qk for k and the rest for v; for q and k optionally undoes the interleaved rotary layout back to HF half-split layout.
+    # Inputs: qkv: fused weight tensor; part: "q", "k" or "v"; n_q_heads, n_kv_heads: int; d_qk: head dimension; interleave: bool.
+    # Outputs: tensor slice for the requested projection.
+    # Exceptions: AssertionError on invalid part. Side effects: None.
     def interleave_weight(w: torch.Tensor):
+        # [FUNCTION DOC]
+        # HELPER: inverse per-head rotary permutation.
+        # Behavior: Splits rows into heads of d_qk and reorders each head's interleaved pairs into first-half/second-half order, then concatenates.
+        # Inputs: w: tensor [heads*d_qk, hidden]. Outputs: tensor of same shape. Exceptions: reshape errors. Side effects: None.
         w_new = []
         for head_w in w.split(d_qk):
             head_w = head_w.view(d_qk // 2, 2, -1).transpose(0, 1).reshape(d_qk, -1)
@@ -61,6 +77,11 @@ def _handle_gate_up_proj(gate_up_proj: torch.Tensor, gate: bool) -> torch.Tensor
     # The gate and up projection are bundled in nanotron.
     # This function selects the proper chunk in the bundled weights to return
     # either the gate or the up projection only.
+    # [FUNCTION DOC]
+    # HELPER: splits nanotron's fused gate_up_proj weight.
+    # Behavior: Returns the first half of rows for the gate projection, the second half for up.
+    # Inputs: gate_up_proj: tensor [2*intermediate, hidden]; gate: bool. Outputs: tensor [intermediate, hidden].
+    # Exceptions: None explicitly raised. Side effects: None.
     weight_size = gate_up_proj.shape[0] // 2
     if gate:
         return gate_up_proj[:weight_size]
@@ -74,6 +95,12 @@ def convert_nt_to_hf(
     model_config: NanotronLlamaConfig,
     interleave_qkv: bool = False,
 ):
+    # [FUNCTION DOC]
+    # Behavior: Gets the nanotron state dict and the HF-to-nanotron name mapping; for every direct parameter of every HF module looks up the nanotron tensor; for qkv takes the projection letter from the fifth name component (q_proj, k_proj or v_proj) and slices it; for gate_up chooses half by whether the module name contains "gate"; copies into the HF parameter under no_grad.
+    # Inputs: nanotron_model: LlamaForTraining; hf_model: LlamaForCausalLM; model_config: nanotron config; interleave_qkv: bool, default False.
+    # Outputs: None.
+    # Exceptions: KeyError for unmapped HF parameters; shape errors from copy.
+    # Side effects: mutates hf_model parameters in place.
     """Converts the weights from the nanotron_model to hf_model, making modifications
     in-place."""
 
@@ -107,6 +134,10 @@ def convert_nt_to_hf(
 
 
 def get_hf_config(config: NanotronLlamaConfig) -> HFLlamaConfig:
+    # [FUNCTION DOC]
+    # Behavior: Copies each mapped field from the nanotron config into an HF LlamaConfig.
+    # Inputs: config: nanotron Llama or Qwen2 config. Outputs: HF LlamaConfig.
+    # Exceptions: AttributeError if a field is missing. Side effects: None.
     """Converts a nanotron configuration to huggingface configuration."""
     attrs = {key: getattr(config, value) for key, value in get_config_mapping(nt_to_hf=False).items()}
     return HFLlamaConfig(**attrs)
@@ -118,6 +149,13 @@ def convert_checkpoint_and_save(
     tokenizer_name: Optional[str] = None,
     config_cls: Type[NanotronConfigs] = NanotronLlamaConfig,
 ):
+    # [FUNCTION DOC]
+    # Behavior: Reads model_config.json from checkpoint_path into config_cls, loads the nanotron model with weights, creates an empty HF LlamaForCausalLM on CUDA in bfloat16 from the converted config, optionally saves the tokenizer to save_path, copies weights and saves the HF model, then prints.
+    # Inputs: checkpoint_path: Path; save_path: Path; tokenizer_name: optional HF tokenizer id; config_cls: nanotron config class (default LlamaConfig).
+    # Outputs: None.
+    # Exceptions: file/loading errors; KeyError from conversion.
+    # Side effects: distributed initialization; GPU memory; network download for tokenizer; file writes; stdout.
+    # KNOWN ISSUE: config_cls is not forwarded to load_nanotron_model, so a Qwen2Config checkpoint is loaded into LlamaForTraining.
     """Loads the nanotron checkpoint in `checkpoint_path`, creates
     a new huggingface instance, copies the weights from the nanotron checkpoint
     and saves the transformed huggingface to `save_path`."""
@@ -145,6 +183,11 @@ def convert_checkpoint_and_save(
 
 
 def check_converted_model_generation(save_path: Path):
+    # [FUNCTION DOC]
+    # Behavior: Loads tokenizer and HF model from save_path, tokenizes TEST_PROMPT on CUDA, prints the decoded input, generates up to 100 new tokens in bfloat16 and prints the decoded result.
+    # Inputs: save_path: Path. Outputs: None.
+    # Exceptions: loading/generation errors.
+    # Side effects: GPU memory; stdout.
     """Loads a huggingface model and tokenizer from `save_path` and
     performs a dummy text generation."""
 

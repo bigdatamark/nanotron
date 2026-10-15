@@ -1,3 +1,20 @@
+# [MODULE DOC]
+# Triton-based ring flash attention adapted from lucidrains/ring-attention-pytorch, with its ring.py,
+# distributed.py and triton_flash_attn.py sources concatenated into one file.
+# Algorithm: each rank holds a sequence chunk; keys/values (and in backward their gradients) can be passed around
+# the ring with blocking point-to-point exchanges while a modified Triton FlashAttention accumulates unnormalized
+# output, row maxima and log-sum-exp across passes. Supports causal masking (block-diagonal or striped layout),
+# key padding masks (as additive bias), grouped-query attention by repeating KV heads, limited lookback and
+# softclamping of attention logits.
+# Main contents: RingFlashAttentionCUDAFunction and the ring_flash_attn_cuda entry point (registered lazily as
+# "ring_flash_triton" in ALL_ATTENTION_FUNCTIONS), ring index/pass utilities, distributed all-gather helpers, and
+# the Triton forward/backward kernels with their Python launchers.
+# Import-time side effects: queries the installed version of the "triton-nightly" distribution; when missing it
+# prints a message and calls exit(), terminating the process; asserts triton-nightly is 3.0.0 or newer; compiles
+# nothing until kernels are launched. Several helper names are redefined by later sections.
+# Exports: no __all__; ring_flash_attn_cuda is the intended public entry.
+# KNOWN ISSUE: exiting the interpreter at import time when triton-nightly is absent is far more drastic than raising
+# ImportError, and regular triton installations are rejected even when new enough.
 """Ring attention implementation adapted from https://github.com/lucidrains/ring-attention-pytorch/blob/main/ring_attention_pytorch/ring_flash_attention_cuda.py"""
 from __future__ import annotations
 
@@ -14,14 +31,26 @@ from torch.autograd.function import Function
 
 
 def exists(v):
+    # [FUNCTION DOC]
+    # HELPER: null check used throughout the module (redefined identically in each concatenated section).
+    # Inputs: a value. Outputs: True when it is not None.
+    # Exceptions: None explicitly raised. Side effects: None.
     return v is not None
 
 
 def default(val, d):
+    # [FUNCTION DOC]
+    # HELPER: returns the first argument unless it is None, in which case returns the fallback (redefined per section).
+    # Inputs: value, fallback. Outputs: the chosen value.
+    # Exceptions: None explicitly raised. Side effects: None.
     return val if exists(val) else d
 
 
 def divisible_by(num, den):
+    # [FUNCTION DOC]
+    # HELPER: divisibility test (redefined per section).
+    # Inputs: num, den (ints). Outputs: True when num modulo den is zero.
+    # Exceptions: ZeroDivisionError when den is zero. Side effects: None.
     return (num % den) == 0
 
 
@@ -33,6 +62,11 @@ def divisible_by(num, den):
 
 
 class RingFlashAttentionCUDAFunction(Function):
+    # [CLASS DOC]
+    # Autograd function implementing ring attention with the Triton flash kernels. Stores on ctx a tuple of settings
+    # (causal, softmax_scale, original mask, bucket_size, ring_reduce_col, max_ring_passes, num_lookback_buckets,
+    # striped_ring_attn, q_head_groups, softclamp settings, original dtype, ring_pg) and saves q, k, v, o and lse.
+    # Inputs layout: q [batch, seq, q_heads, head_dim], k and v [batch, seq, kv_heads, head_dim] on CUDA.
     @staticmethod
     @torch.no_grad()
     def forward(
@@ -51,6 +85,29 @@ class RingFlashAttentionCUDAFunction(Function):
         ring_pg: dist.ProcessGroup | None,
     ):
 
+        # [FUNCTION DOC]
+        # Forward pass without gradient tracking.
+        # Steps: checks shapes, GQA divisibility and CUDA placement; softmax_scale is one over sqrt(head_dim); float32
+        # inputs are cast to half. Ring size comes from ring_pg or the world size. Cross attention (different q and k
+        # lengths) disables ring passing and striping. With max_lookback_seq_len (causal only) the number of ring passes is
+        # limited to ceil of lookback over chunk length. Causal attention drops the padding mask. bucket_size is clamped to
+        # the chunk length. Iterates over ring passes (all_ring_pass when ring_reduce_col, otherwise only the local chunk):
+        # repeats KV heads for GQA, converts the boolean mask to a 0 / minus infinity bias, decides block causality (striped:
+        # always causal, diagonal masked when this rank is below the source rank; non-striped: causal on the diagonal block
+        # and skips blocks from later ranks), then accumulates with flash_attn_forward. When not fused, normalizes the
+        # output by exp of m minus lse at the end. Casts output back to the original dtype.
+        # Inputs: ctx; q, k, v; mask (optional boolean key padding mask [batch, seq_k]); causal; bucket_size;
+        # ring_reduce_col (pass KV around the ring); striped_ring_attn; max_lookback_seq_len (optional); softclamp_qk_sim;
+        # softclamp_value; ring_pg (optional process group).
+        # Outputs: attention output with q's shape and original dtype.
+        # Exceptions: AssertionError on shape/device/lookback violations.
+        # Side effects: blocking send/recv plus barriers on the ring group when ring_reduce_col; stores state on ctx.
+        # KNOWN ISSUE: the conditional expressions computing causal_mask_diagonal and block_causal are parsed as "get_rank()
+        # if ring_pg is None else (comparison)", so without a ring_pg they receive the raw rank integer instead of a boolean.
+        # KNOWN ISSUE: with the default ring_reduce_col False only the local chunk is attended (no ring communication).
+        # KNOWN ISSUE: flash_attn_forward no longer launches its kernel (see that function), so the output is not computed.
+        # KNOWN ISSUE: q_seq_len is taken from dimension 1 of q, which is the sequence dimension only for the documented
+        # [b, s, h, d] layout although the parameter comment says [b, num_heads, seq_length, head_dim].
         assert k.shape[-2:] == v.shape[-2:]
         q_heads, kv_heads = q.shape[-2], k.shape[-2]
 
@@ -216,6 +273,20 @@ class RingFlashAttentionCUDAFunction(Function):
     @torch.no_grad()
     def backward(ctx, do):
 
+        # [FUNCTION DOC]
+        # Backward pass without gradient tracking. Restores settings; allocates float32 dq and zero dk, dv; stacks k, v, dk,
+        # dv so they travel the ring together. For each pass determines whether to accumulate (striped causal: always;
+        # plain causal: only blocks from this rank or earlier; non-causal: always) and the block causality, runs
+        # flash_attn_backward under inference mode (reusing delta across passes), sums dk/dv over GQA head groups and adds to
+        # the accumulators. When ring_reduce_col is set, passes the gradients along the ring. Finally casts gradients to the
+        # original dtype.
+        # Inputs: ctx; do (output gradient).
+        # Outputs: dq, dk, dv followed by nine None values.
+        # Exceptions: AssertionError when k and v dtypes differ, or from flash_attn_backward.
+        # Side effects: blocking ring communication and barriers; Triton kernel launches.
+        # KNOWN ISSUE: the per-pass ring_dk/ring_dv are accumulated into the local dk/dv, but the stacked kv_and_dkv
+        # being passed still carries the stale gradients, so accumulated gradients are not what gets rotated.
+        # KNOWN ISSUE: the bias passed to flash_attn_backward is 2-D, while flash_attn_backward asserts a 4-D bias.
         (
             causal,
             softmax_scale,
@@ -380,6 +451,14 @@ def ring_flash_attn_cuda(
     ring_pg: dist.ProcessGroup | None = None,
     **kwargs,
 ):
+    # [FUNCTION DOC]
+    # Attention-registry entry point (autocast disabled) applying RingFlashAttentionCUDAFunction.
+    # Inputs: module (unused); q, k, v; attention_mask (optional key padding mask); is_causal (False); bucket_size
+    # (1024); ring_reduce_col (False); striped_ring_attn (False); max_lookback_seq_len (None); softclamp_qk_sim (False);
+    # softclamp_value (50.0); ring_pg (None); other keyword arguments ignored.
+    # Outputs: a one-element tuple containing the attention output.
+    # Exceptions: see RingFlashAttentionCUDAFunction.forward. Side effects: ring communication.
+    # KNOWN ISSUE: returns a 1-tuple rather than the output and weights pair other backends return.
     return (
         ring_flash_attn_cuda_(
             q,
@@ -412,14 +491,26 @@ from torch.nn import Module
 
 
 def exists(v):
+    # [FUNCTION DOC]
+    # HELPER: null check used throughout the module (redefined identically in each concatenated section).
+    # Inputs: a value. Outputs: True when it is not None.
+    # Exceptions: None explicitly raised. Side effects: None.
     return v is not None
 
 
 def default(v, d):
+    # [FUNCTION DOC]
+    # HELPER: returns the first argument unless it is None, in which case returns the fallback (redefined per section).
+    # Inputs: value, fallback. Outputs: the chosen value.
+    # Exceptions: None explicitly raised. Side effects: None.
     return v if exists(v) else d
 
 
 def cast_tuple(t, length=1):
+    # [FUNCTION DOC]
+    # HELPER: wraps a non-tuple value into a tuple repeated length times; tuples pass through.
+    # Inputs: t; length (default 1). Outputs: tuple.
+    # Exceptions: None explicitly raised. Side effects: None.
     return t if isinstance(t, tuple) else ((t,) * length)
 
 
@@ -427,10 +518,18 @@ def cast_tuple(t, length=1):
 
 
 def circular_index_left(pos, ring_size, num=1):
+    # [FUNCTION DOC]
+    # HELPER: position num steps to the left on a ring of ring_size.
+    # Inputs: pos, ring_size, num (default 1). Outputs: int in the range 0 to ring_size minus one.
+    # Exceptions: None explicitly raised. Side effects: None.
     return ((pos - num) + ring_size) % ring_size
 
 
 def circular_index_right(pos, ring_size, num=1):
+    # [FUNCTION DOC]
+    # HELPER: position num steps to the right on a ring of ring_size.
+    # Inputs: pos, ring_size, num (default 1). Outputs: int.
+    # Exceptions: None explicitly raised. Side effects: None.
     return (pos + num) % ring_size
 
 
@@ -438,6 +537,15 @@ def circular_index_right(pos, ring_size, num=1):
 
 
 def circular_rank_left(rank=None, ring_size=None, num=1, pg=None):
+    # [FUNCTION DOC]
+    # HELPER: rank of the left neighbor within this rank's ring (ranks are grouped into consecutive rings of ring_size;
+    # the ring offset is preserved).
+    # Inputs: rank (default current rank in pg or globally); ring_size (default world size of pg or global); num (1);
+    # pg (optional group).
+    # Outputs: int rank.
+    # Exceptions: None explicitly raised. Side effects: None.
+    # KNOWN ISSUE: the result is a rank within pg but is used as a peer for P2P ops that expect global ranks when
+    # pg is a subgroup.
     rank = default(rank, get_rank() if pg is None else dist.get_rank(pg))
     ring_size = default(ring_size, get_world_size() if pg is None else dist.get_world_size(pg))
     ring_set_num = rank // ring_size
@@ -446,6 +554,10 @@ def circular_rank_left(rank=None, ring_size=None, num=1, pg=None):
 
 
 def circular_rank_right(rank=None, ring_size=None, num=1, pg=None):
+    # [FUNCTION DOC]
+    # HELPER: rank of the right neighbor within this rank's ring; same conventions as circular_rank_left.
+    # Inputs: rank, ring_size, num, pg. Outputs: int rank.
+    # Exceptions: None explicitly raised. Side effects: None.
     rank = default(rank, get_rank() if pg is None else dist.get_rank(pg))
     ring_size = default(ring_size, get_world_size() if pg is None else dist.get_world_size(pg))
     ring_set_num = rank // ring_size
@@ -457,6 +569,13 @@ def circular_rank_right(rank=None, ring_size=None, num=1, pg=None):
 
 
 def send_and_receive_(x, receive_buffer, send_to_rank, receive_from_rank, ring_pg=None):
+    # [FUNCTION DOC]
+    # HELPER: blocking exchange used by ring_pass: isend x to send_to_rank and irecv into receive_buffer from
+    # receive_from_rank as one batch, waits for both, then barriers on ring_pg (or the world).
+    # Inputs: x; receive_buffer; send_to_rank; receive_from_rank; ring_pg (optional).
+    # Outputs: None.
+    # Exceptions: errors from torch.distributed.
+    # Side effects: P2P communication, barrier, fills receive_buffer.
     send_op = dist.P2POp(dist.isend, x, send_to_rank, ring_pg)
     recv_op = dist.P2POp(dist.irecv, receive_buffer, receive_from_rank, ring_pg)
 
@@ -478,6 +597,13 @@ def ring_pass(
     ring_size: int | None = None,
     ring_pg: dist.ProcessGroup | None = None,
 ):
+    # [FUNCTION DOC]
+    # Sends x one step to the right neighbor and receives from the left neighbor.
+    # Inputs: num_ring_passes (int); x (tensor, made contiguous); receive_buffer (optional, zeros like x when absent);
+    # ring_size (default world size); ring_pg (optional).
+    # Outputs: tuple of the received tensor and the sent tensor (so they can be swapped as buffers next time).
+    # Exceptions: errors from torch.distributed. Side effects: blocking communication and a barrier.
+    # KNOWN ISSUE: num_ring_passes is ignored; exactly one pass is always performed.
     ring_size = default(ring_size, get_world_size())
     x = x.contiguous()
 
@@ -504,10 +630,27 @@ RingInfo = namedtuple("RingInfo", ["ring_rank", "iter_info"])
 
 
 def null_ring_pass(*tensors, max_iters=None, receive_buffers=None, ring_size=None, ring_pg=None):
+    # [FUNCTION DOC]
+    # Generator yielding a single iteration with ring rank 0, flags first and last both true, and the given tensors and
+    # receive buffers unchanged (no communication).
+    # Inputs: tensors; max_iters, receive_buffers, ring_size, ring_pg (unused except receive_buffers echoed).
+    # Outputs: yields one pair of RingInfo and (tensors, receive_buffers).
+    # Exceptions: None explicitly raised. Side effects: None.
+    # KNOWN ISSUE: the reported ring rank is always 0 instead of the local rank, so causal callers on ranks above 0 treat
+    # their own chunk as off-diagonal.
     yield RingInfo(0, (True, True)), (tensors, receive_buffers)
 
 
 def all_ring_pass(*tensors, max_iters=None, receive_buffers=None, ring_size=None, ring_pg=None):
+    # [FUNCTION DOC]
+    # Generator over ring passes. Runs between 1 and ring_size iterations (capped by max_iters). Each iteration yields
+    # RingInfo with the rank whose chunk is currently held (starting at the local rank, moving left each step) and
+    # first/last flags, plus the tensors and receive buffers; between iterations (not after the last) every non-None
+    # tensor is passed one step along the ring with ring_pass, swapping send and receive buffers.
+    # Inputs: tensors (any may be None); max_iters (default ring_size); receive_buffers (single value or tuple);
+    # ring_size (default world size); ring_pg (optional).
+    # Outputs: yields pairs of RingInfo and (tensors, receive_buffers).
+    # Exceptions: None explicitly raised. Side effects: blocking ring communication.
     ring_size = default(ring_size, get_world_size())
     max_iters = default(max_iters, ring_size)
 
@@ -559,18 +702,35 @@ from torch.nn import Module
 
 
 def exists(val):
+    # [FUNCTION DOC]
+    # HELPER: null check used throughout the module (redefined identically in each concatenated section).
+    # Inputs: a value. Outputs: True when it is not None.
+    # Exceptions: None explicitly raised. Side effects: None.
     return val is not None
 
 
 def default(val, d):
+    # [FUNCTION DOC]
+    # HELPER: returns the first argument unless it is None, in which case returns the fallback (redefined per section).
+    # Inputs: value, fallback. Outputs: the chosen value.
+    # Exceptions: None explicitly raised. Side effects: None.
     return val if exists(val) else d
 
 
 def divisible_by(num, den):
+    # [FUNCTION DOC]
+    # HELPER: divisibility test (redefined per section).
+    # Inputs: num, den (ints). Outputs: True when num modulo den is zero.
+    # Exceptions: ZeroDivisionError when den is zero. Side effects: None.
     return (num % den) == 0
 
 
 def pad_dim_to(t, length, dim=0):
+    # [FUNCTION DOC]
+    # HELPER: right-pads tensor t with zeros along dim up to length.
+    # Inputs: t; length (int, at least the current size); dim (default 0, negative allowed).
+    # Outputs: padded tensor.
+    # Exceptions: None explicitly raised. Side effects: None.
     pad_length = length - t.shape[dim]
     zero_pairs = (-dim - 1) if dim < 0 else (t.ndim - dim - 1)
     return F.pad(t, (*((0, 0) * zero_pairs), 0, pad_length))
@@ -583,20 +743,33 @@ cache = partial(lru_cache, maxsize=None)
 
 @cache()
 def get_rank():
+    # [FUNCTION DOC]
+    # Global rank, or 0 when torch.distributed is not initialized. Cached for the process lifetime.
+    # Inputs: none. Outputs: int. Exceptions: None explicitly raised. Side effects: caches the first result.
     return dist.get_rank() if dist.is_initialized() else 0
 
 
 @cache()
 def get_world_size():
+    # [FUNCTION DOC]
+    # Global world size, or 1 when torch.distributed is not initialized. Cached.
+    # Inputs: none. Outputs: int. Exceptions: None explicitly raised. Side effects: caches the first result.
     return dist.get_world_size() if dist.is_initialized() else 1
 
 
 @cache()
 def is_distributed():
+    # [FUNCTION DOC]
+    # True when torch.distributed is initialized with more than one process. Cached.
+    # Inputs: none. Outputs: bool. Exceptions: None explicitly raised. Side effects: caches the first result.
     return dist.is_initialized() and dist.get_world_size() > 1
 
 
 def all_gather_same_dim(t):
+    # [FUNCTION DOC]
+    # HELPER: all-gathers a same-shaped tensor from every rank of the default group.
+    # Inputs: t (made contiguous). Outputs: list of world_size tensors.
+    # Exceptions: errors from torch.distributed. Side effects: all_gather collective.
     t = t.contiguous()
     world_size = dist.get_world_size()
     gathered_tensors = [torch.empty_like(t, device=t.device, dtype=t.dtype) for i in range(world_size)]
@@ -605,16 +778,31 @@ def all_gather_same_dim(t):
 
 
 def gather_sizes(t, *, dim):
+    # [FUNCTION DOC]
+    # HELPER: all-gathers the size of dimension dim of t from every rank.
+    # Inputs: t; dim (keyword). Outputs: long tensor [world_size].
+    # Exceptions: None explicitly raised. Side effects: all_gather collective.
     size = torch.tensor(t.shape[dim], device=t.device, dtype=torch.long)
     sizes = all_gather_same_dim(size)
     return torch.stack(sizes)
 
 
 def has_only_one_value(t):
+    # [FUNCTION DOC]
+    # HELPER: True (as a boolean tensor) when all elements equal the first element.
+    # Inputs: t (1-D tensor). Outputs: boolean scalar tensor.
+    # Exceptions: None explicitly raised. Side effects: None.
     return (t == t[0]).all()
 
 
 def all_gather_variable_dim(t, dim=0, sizes=None):
+    # [FUNCTION DOC]
+    # All-gathers tensors whose size along dim may differ per rank. Gathers sizes unless given; if all equal, gathers and
+    # concatenates directly; otherwise pads every tensor to the maximum size, gathers, concatenates and removes padding
+    # via a validity mask and index_select.
+    # Inputs: t; dim (default 0); sizes (optional long tensor of per-rank sizes).
+    # Outputs: tuple of concatenated tensor and sizes.
+    # Exceptions: None explicitly raised. Side effects: collectives on the default group; host sync via item.
     device, rank, world_size = t.device, dist.get_rank(), dist.get_world_size()
 
     if not exists(sizes):
@@ -644,8 +832,17 @@ def all_gather_variable_dim(t, dim=0, sizes=None):
 
 
 class AllGatherFunction(Function):
+    # [CLASS DOC]
+    # Autograd function for variable-size all-gather; backward returns the slice of the gradient belonging to this rank.
+    # ctx stores batch_sizes (list of ints) and dim.
     @staticmethod
     def forward(ctx, x, dim, sizes):
+        # [FUNCTION DOC]
+        # Casts boolean input to int for communication, gathers with all_gather_variable_dim, records sizes and dim, and
+        # casts back to boolean if needed.
+        # Inputs: ctx; x; dim; sizes (optional).
+        # Outputs: tuple of gathered tensor and sizes tensor.
+        # Exceptions: None explicitly raised. Side effects: collectives; host sync for tolist.
         is_bool = x.dtype == torch.bool
 
         if is_bool:
@@ -662,21 +859,40 @@ class AllGatherFunction(Function):
 
     @staticmethod
     def backward(ctx, grads, _):
+        # [FUNCTION DOC]
+        # Splits the incoming gradient by recorded sizes along dim and returns this rank's piece.
+        # Inputs: ctx; grads; second gradient ignored.
+        # Outputs: the gradient slice, None, None.
+        # Exceptions: None explicitly raised. Side effects: None.
         batch_sizes, rank = ctx.batch_sizes, dist.get_rank()
         grads_by_rank = grads.split(batch_sizes, dim=ctx.dim)
         return grads_by_rank[rank], None, None
 
 
 class AllGather(Module):
+    # [CLASS DOC]
+    # torch.nn.Module wrapper over AllGatherFunction with a fixed gather dimension (attribute dim).
     def __init__(self, *, dim=0):
+        # [FUNCTION DOC]
+        # Stores dim (keyword-only, default 0).
+        # Inputs: dim. Outputs: None. Exceptions: None explicitly raised. Side effects: None.
         super().__init__()
         self.dim = dim
 
     def forward(self, x, sizes=None):
+        # [FUNCTION DOC]
+        # Applies AllGatherFunction along self.dim.
+        # Inputs: x; sizes (optional). Outputs: tuple of gathered tensor and sizes.
+        # Exceptions: None explicitly raised. Side effects: collectives.
         return AllGatherFunction.apply(x, self.dim, sizes)
 
 
 def split_by_rank(x):
+    # [FUNCTION DOC]
+    # Picks this rank's element from x (a tuple of tensors or a stacked tensor) and builds a sizes tensor: lengths of
+    # dimension 0 of each tuple element, or dimension 1 repeated for a stacked tensor.
+    # Inputs: x. Outputs: tuple of the local piece and a long sizes tensor on its device.
+    # Exceptions: IndexError if fewer entries than ranks. Side effects: None.
     rank = dist.get_rank()
     out = x[rank]
 
@@ -705,14 +921,25 @@ from torch import Tensor
 
 
 def exists(v):
+    # [FUNCTION DOC]
+    # HELPER: null check used throughout the module (redefined identically in each concatenated section).
+    # Inputs: a value. Outputs: True when it is not None.
+    # Exceptions: None explicitly raised. Side effects: None.
     return v is not None
 
 
 def default(val, d):
+    # [FUNCTION DOC]
+    # HELPER: returns the first argument unless it is None, in which case returns the fallback (redefined per section).
+    # Inputs: value, fallback. Outputs: the chosen value.
+    # Exceptions: None explicitly raised. Side effects: None.
     return val if exists(val) else d
 
 
 def is_contiguous(x: Tensor):
+    # [FUNCTION DOC]
+    # HELPER: True when the last dimension has stride 1 (what the Triton kernels require).
+    # Inputs: x tensor. Outputs: bool. Exceptions: None explicitly raised. Side effects: None.
     return x.stride(-1) == 1
 
 
@@ -794,6 +1021,19 @@ def _fwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
+    # [FUNCTION DOC]
+    # Triton forward FlashAttention kernel, one program per (query block, batch-head). Loads previously accumulated
+    # output, row max m and lse when LOAD_ACCUMULATED, otherwise starts from zero and minus infinity. Iterates over key
+    # blocks (up to the diagonal when causal), computes scaled scores, optionally softclamps with tanh, masks
+    # out-of-range keys and causal positions (strictly-below-diagonal when CAUSAL_MASK_DIAGONAL), adds bias, and
+    # updates the unnormalized accumulator, running max and log-sum-exp online. Optionally normalizes the output; stores
+    # lse, m (when not normalized) and output with boundary masks.
+    # Inputs: tensor pointers Q, K, V, Bias, Out, M, Lse; softmax_scale; strides; sizes; cache keys; compile-time flags
+    # and block sizes (EVEN_M, EVEN_N and EVEN_HEADDIM set by heuristics).
+    # Outputs: None. Exceptions: None explicitly raised. Side effects: writes Out, M, Lse.
+    # KNOWN ISSUE: the running maximum is initialized from and compared against lse_i rather than m_i, mixing the two
+    # statistics (as in the upstream adaptation); it is also never launched, since flash_attn_forward has the launch
+    # commented out.
     start_m = tl.program_id(0)
     off_hb = tl.program_id(1)
     off_b = off_hb // nheads
@@ -1000,6 +1240,20 @@ def flash_attn_forward(
     head_first_dim=False,
     remove_padding=False,
 ):
+    # [FUNCTION DOC]
+    # Python launcher for the forward kernel. Makes inputs contiguous, optionally converts head-first layout, validates
+    # shapes ([batch, seq, heads, head_dim]), head_dim at most 128, fp16/bf16 CUDA tensors, and an optional bias (2-D
+    # key bias expanded to [batch, heads, seq_q, seq_k]). Allocates m and lse [batch, heads, seq_q rounded up to 128]
+    # (filled with the most negative float when load_accumulated, else uninitialized) and o (zeros or uninitialized)
+    # when not provided; converts back to head-first and trims padding if requested.
+    # Inputs: q, k, v; bias (optional); causal; o, m, lse (optional accumulators); softmax_scale (default one over
+    # sqrt(d)); causal_mask_diagonal; return_normalized_output; load_accumulated (default True); softclamp_qk_sim;
+    # softclamp_value (50.0); head_first_dim (False); remove_padding (False).
+    # Outputs: tuple of o, m, lse.
+    # Exceptions: AssertionError on invalid shapes, dtypes or devices.
+    # Side effects: allocates CUDA tensors.
+    # KNOWN ISSUE: the kernel launch is commented out (TODO), so the returned tensors are just the initialized or
+    # passed-in buffers and no attention is computed; BLOCK_HEADDIM and bias strides are computed and discarded.
     q, k, v = [x if is_contiguous(x) else x.contiguous() for x in (q, k, v)]
 
     if head_first_dim:
@@ -1056,6 +1310,9 @@ def flash_attn_forward(
     max(triton.next_power_of_2(d), 16)
 
     def grid(META):
+        # [FUNCTION DOC]
+        # HELPER: launch grid for the (disabled) forward kernel: ceil of seqlen_q over BLOCK_M by batch times heads.
+        # Inputs: META. Outputs: tuple of two ints. Exceptions: None explicitly raised. Side effects: None.
         return triton.cdiv(seqlen_q, META["BLOCK_M"]), batch * nheads
 
     # TODO @nouamane: what's up with triton?
@@ -1130,6 +1387,11 @@ def _bwd_preprocess_do_o_dot(
     BLOCK_M: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
 ):
+    # [FUNCTION DOC]
+    # Triton kernel computing delta, the per-row dot product of output and output gradient, for each (query block,
+    # batch-head) program, storing into Delta at the rounded-length layout.
+    # Inputs: Out, DO, Delta pointers; strides; nheads; seqlen_q; seqlen_q_rounded; headdim; BLOCK_M; BLOCK_HEADDIM.
+    # Outputs: None. Exceptions: None explicitly raised. Side effects: writes Delta.
     start_m = tl.program_id(0)
     off_hb = tl.program_id(1)
     off_b = off_hb // nheads
@@ -1169,6 +1431,10 @@ def _bwd_store_dk_dv(
 ):
     # [2022-11-01] TD: Same bug. In the case of EVEN_N=True and EVEN_M=False,
     # if we just call tl.store(dv_ptrs), there's a race condition
+    # [FUNCTION DOC]
+    # HELPER: Triton device function storing dk and dv blocks with the boundary masks implied by the EVEN flags.
+    # Inputs: dk_ptrs, dv_ptrs, dk, dv, offs_n, offs_d, seqlen_k, headdim, EVEN_M, EVEN_N, EVEN_HEADDIM.
+    # Outputs: None. Exceptions: None explicitly raised. Side effects: writes DK, DV.
     if EVEN_N & EVEN_M:
         if EVEN_HEADDIM:
             tl.store(dv_ptrs, dv)
@@ -1224,6 +1490,15 @@ def _bwd_kernel_one_col_block(
     BLOCK_N: tl.constexpr,
 ):
     # We need to make sure begin_m is a multiple of BLOCK_M (not BLOCK_N)
+    # [FUNCTION DOC]
+    # HELPER: Triton device function computing gradients for one key block (column) in _bwd_kernel.
+    # Loads the key/value block, loops over query blocks (from the diagonal when causal), recomputes scores with the same
+    # softclamp/mask/bias logic as forward, probabilities from the saved lse, accumulates dv and dk, and updates dq
+    # either by load-add-store or atomic add (sequence-parallel mode); the softclamp derivative scales ds. Early-exits
+    # storing zeros when the block starts past the query length.
+    # Inputs: start_n; tensor pointers; strides; sizes; compile-time flags (ATOMIC_ADD, BIAS_TYPE "none", "vector" or
+    # "matrix", IS_CAUSAL, CAUSAL_MASK_DIAGONAL, SOFTCLAMP settings, EVEN flags, block sizes).
+    # Outputs: None. Exceptions: None explicitly raised. Side effects: writes DQ, DK, DV.
     begin_m = 0 if not IS_CAUSAL else ((start_n * BLOCK_N) // BLOCK_M) * BLOCK_M
     # initialize row/col offsets
     offs_qm = begin_m + tl.arange(0, BLOCK_M)
@@ -1472,6 +1747,10 @@ def _bwd_kernel_one_col_block(
 
 
 def init_to_zero(name):
+    # [FUNCTION DOC]
+    # HELPER: builds a Triton autotune pre-hook that zeroes the named kernel argument (used to clear DQ).
+    # Inputs: name (argument name). Outputs: a callable taking the kernel argument dictionary.
+    # Exceptions: None explicitly raised. Side effects: the returned hook mutates the tensor.
     return lambda nargs: nargs[name].zero_()
 
 
@@ -1562,6 +1841,12 @@ def _bwd_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
+    # [FUNCTION DOC]
+    # Triton backward kernel (autotuned over sequence-parallel or not, 128 by 128 blocks). Offsets pointers for the
+    # batch-head program, then either loops over all key blocks serially or handles the single key block given by
+    # program id 0 with atomic dq accumulation.
+    # Inputs: tensor pointers, strides, sizes, cache keys and compile-time flags.
+    # Outputs: None. Exceptions: None explicitly raised. Side effects: writes DQ, DK, DV.
     off_hb = tl.program_id(1)
     off_b = off_hb // nheads
     off_h = off_hb % nheads
@@ -1678,6 +1963,17 @@ def flash_attn_backward(
     softclamp_value=50.0,
 ):
     # Make sure that the last dimension is contiguous
+    # [FUNCTION DOC]
+    # Python launcher for the backward kernels. Makes do contiguous, checks shapes/strides, defaults softmax_scale to
+    # one over sqrt(d); computes delta with _bwd_preprocess_do_o_dot unless provided; classifies the bias as vector
+    # ([..., 1, seq_k]) or matrix; launches _bwd_kernel accumulating dq in float32, writes dk and dv directly, and copies
+    # the float32 dq into dq.
+    # Inputs: do, q, k, v, o ([batch, seq, heads, d]); lse [batch, heads, seq_q rounded to 128]; dq, dk, dv output
+    # buffers; delta (optional cached); bias (optional 4-D); causal; causal_mask_diagonal; softmax_scale;
+    # softclamp_qk_sim; softclamp_value.
+    # Outputs: delta (to reuse in later ring passes).
+    # Exceptions: AssertionError on shape/stride/dtype violations; RuntimeError for an unsupported bias shape.
+    # Side effects: Triton kernel launches; writes dq, dk, dv.
     if do.stride(-1) != 1:
         do = do.contiguous()
     batch, seqlen_q, nheads, d = q.shape
@@ -1701,6 +1997,9 @@ def flash_attn_backward(
         delta = torch.empty_like(lse)
 
         def grid(META):
+            # [FUNCTION DOC]
+            # HELPER: launch grid for _bwd_preprocess_do_o_dot: ceil of seqlen_q over BLOCK_M by batch times heads.
+            # Inputs: META. Outputs: tuple. Exceptions: None explicitly raised. Side effects: None.
             return triton.cdiv(seqlen_q, META["BLOCK_M"]), batch * nheads
 
         _bwd_preprocess_do_o_dot[grid](
@@ -1741,6 +2040,9 @@ def flash_attn_backward(
     # BLOCK_N = 64
     # num_warps = 4
     def grid(META):
+        # [FUNCTION DOC]
+        # HELPER: launch grid for _bwd_kernel: number of key blocks when SEQUENCE_PARALLEL else 1, by batch times heads.
+        # Inputs: META. Outputs: tuple. Exceptions: None explicitly raised. Side effects: None.
         return triton.cdiv(seqlen_k, META["BLOCK_N"]) if META["SEQUENCE_PARALLEL"] else 1, batch * nheads
 
     _bwd_kernel[grid](

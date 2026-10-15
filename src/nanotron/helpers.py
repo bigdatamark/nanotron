@@ -1,3 +1,16 @@
+# [MODULE DOC]
+# Purpose: grab-bag of training-setup helpers used by nanotron's trainer: vocab padding, TP random
+# state setup, learning-rate scheduler construction, optimizer/parameter-group construction (custom
+# per-parameter LR for muP/SP, weight-decay exclusion, ZeRO, FP32 grad accumulation, DDP hooks),
+# profiler creation, communication benchmarks, throughput table/CSV logging, and data-stage resume
+# bookkeeping.
+# Main contents: _vocab_size_with_padding, init_random_states, lr_scheduler_builder,
+# get_custom_weight_decay_for_named_parameters, get_custom_lr_for_named_parameters,
+# merge_named_param_groups, init_optimizer_and_grad_accumulator, test_equal_dict, get_profiler,
+# get_all_comps, test_all_pair_to_pair, create_table_log, get_formatted_value, create_table_output,
+# write_to_csv, log_throughput, compute_remain_train_steps_of_a_data_stage_from_ckp,
+# get_consumed_train_samples_of_a_data_stage_from_ckp.
+# Import-time side effects: creates a module logger.
 import contextlib
 import csv
 import gc
@@ -50,6 +63,12 @@ logger = logging.get_logger(__name__)
 
 
 def _vocab_size_with_padding(orig_vocab_size: int, pg_size: int, make_vocab_size_divisible_by: int):
+    # [FUNCTION DOC]
+    # HELPER: pads the vocabulary for tensor-parallel embedding sharding.
+    # Behavior: rounds orig_vocab_size up to a multiple of make_vocab_size_divisible_by times pg_size and
+    # logs a warning on rank 0 when padding was added.
+    # Inputs: orig_vocab_size, pg_size, make_vocab_size_divisible_by - ints.
+    # Outputs: padded vocab size (int). Exceptions: None explicitly raised. Side effects: logging.
     """Pad vocab size so it is divisible by pg_size * make_vocab_size_divisible_by."""
 
     multiple = make_vocab_size_divisible_by * pg_size
@@ -65,6 +84,13 @@ def _vocab_size_with_padding(orig_vocab_size: int, pg_size: int, make_vocab_size
 
 
 def init_random_states(parallel_config: ParallelismArgs, tp_pg: ProcessGroup):
+    # [FUNCTION DOC]
+    # Behavior: when parallel_config is None or TP mode is ALL_REDUCE, returns RandomStates holding a
+    # "tp_synced" state equal to the current RNG state synchronized across tp_pg (so TP ranks apply
+    # identical dropout etc.); for REDUCE_SCATTER (sequence parallel) returns empty RandomStates.
+    # Inputs: parallel_config - ParallelismArgs or None; tp_pg - ProcessGroup.
+    # Outputs: RandomStates. Exceptions: None explicitly raised.
+    # Side effects: collective communication across tp_pg for the sync.
     # Get synchronized random states
     if parallel_config is None or parallel_config.tp_mode is TensorParallelLinearMode.ALL_REDUCE:
         random_states = RandomStates(
@@ -77,6 +103,15 @@ def init_random_states(parallel_config: ParallelismArgs, tp_pg: ProcessGroup):
 
 
 def lr_scheduler_builder(optimizer: Optimizer, lr_scheduler_args: LRSchedulerArgs, total_training_steps: int):
+    # [FUNCTION DOC]
+    # Behavior: derives lr_decay_steps (given, or total steps minus warmup steps and minus decay start step
+    # when those are set) and lr_decay_starting_step (given, else warmup steps, else 0). Builds one lambda
+    # per base-optimizer param group bound to that group's initial lr and returns a LambdaLR over the base
+    # optimizer.
+    # Inputs: optimizer - nanotron Optimizer wrapper; lr_scheduler_args - LRSchedulerArgs;
+    # total_training_steps - int.
+    # Outputs: torch LambdaLR. Exceptions: AssertionError on lambda/group count mismatch (cannot happen).
+    # Side effects: debug logging.
     if lr_scheduler_args.lr_decay_steps is None:
         lr_decay_steps = total_training_steps
         if lr_scheduler_args.lr_warmup_steps is not None:
@@ -95,6 +130,20 @@ def lr_scheduler_builder(optimizer: Optimizer, lr_scheduler_args: LRSchedulerArg
         lr_decay_starting_step = lr_scheduler_args.lr_decay_starting_step
 
     def lr_lambda(current_step: int, initial_lr: float):
+        # [FUNCTION DOC]
+        # HELPER: per-step multiplier for LambdaLR.
+        # Behavior: if warmup and decay steps are both 0, returns initial_lr unchanged. Otherwise, in order:
+        # warmup (step at most warmup steps and a style set): linear ramp from 0 to initial_lr, or
+        # "constant" at the global learning_rate; constant phase at initial_lr before the decay start;
+        # decay phase (style set and step before start plus decay steps): cosine, linear or "1-sqrt" from
+        # initial_lr to min_decay_lr; else min_decay_lr. The result is divided by initial_lr (LambdaLR multiplies).
+        # Inputs: current_step - int; initial_lr - the group's base lr.
+        # Outputs: float multiplier.
+        # Exceptions: ValueError for unknown warmup or decay styles; TypeError if warmup style is set but
+        # lr_warmup_steps is None; ZeroDivisionError if initial_lr is 0.
+        # Side effects: None.
+        # KNOWN ISSUE: the early return when there is no warmup or decay returns initial_lr itself rather than a multiplier of 1.0, so LambdaLR would scale lr by lr.
+        # KNOWN ISSUE: constant warmup uses the global learning_rate instead of the group's initial_lr, which is wrong for groups with custom (muP) learning rates.
         """
         current_step: current training step
         initial_lr: the learning rate of a parameter group
@@ -162,6 +211,9 @@ def lr_scheduler_builder(optimizer: Optimizer, lr_scheduler_args: LRSchedulerArg
         return lmbda
 
     def get_lr_lambda_for_param_group(lr: float):
+        # [FUNCTION DOC]
+        # HELPER: binds lr_lambda to a param group's initial lr.
+        # Inputs: lr - float. Outputs: partial function of current_step. Exceptions/Side effects: None.
         return partial(lr_lambda, initial_lr=lr)
 
     # NOTE: get learning rate scheduler for each param group
@@ -190,6 +242,16 @@ def get_custom_weight_decay_for_named_parameters(
     weight_decay: float,
     exclude_named_params: List[str],
 ) -> List[Dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Behavior: creates one parameter group per named parameter with weight_decay set to 0 when its name,
+    # or for tied parameters its full tied name, matches (from the start) any regex in
+    # exclude_named_params, else the given weight_decay. Logs each exclusion (debug) and the total
+    # (warning) on rank 0.
+    # Inputs: named_parameters - iterable of (name, NanotronParameter); model - unused; module_id_to_prefix
+    # - dict for resolving tied names; weight_decay - float; exclude_named_params - list of regex strings or None.
+    # Outputs: list of dicts with "named_params" (single-element list) and "weight_decay".
+    # Exceptions: NameError/UnboundLocalError (see known issue). Side effects: logging.
+    # KNOWN ISSUE: tied_name is only assigned for tied parameters but used for every parameter when exclusions are given, so it is undefined for an untied first parameter, or stale (from a previous tied parameter) for later untied ones.
     """
     Apply weight decay to all parameters except those whose names match regex patterns in exclude_named_params.
 
@@ -244,6 +306,14 @@ def get_custom_lr_for_named_parameters(
     named_parameters: Iterable[Tuple[str, torch.Tensor]],
     model: NanotronModel,
 ) -> List[Dict[str, Any]]:
+    # [FUNCTION DOC]
+    # Behavior: picks LearningRateForSpectralMup or LearningRateForSP according to the parametrization,
+    # builds it from the modules on this pipeline rank and the base lr, and creates one group per
+    # parameter with its computed lr.
+    # Inputs: parametrization_method - SPECTRAL_MUP or STANDARD; lr - float; named_parameters; model -
+    # NanotronModel.
+    # Outputs: list of dicts with "named_params" and "lr".
+    # Exceptions: AssertionError for other methods or non-float lrs. Side effects: logging.
     """
     Get custom learning rates for parameters based on the parametrization method.
 
@@ -292,7 +362,11 @@ def merge_named_param_groups(
     named_param_groups_with_lr: List[Dict[str, Any]],
     named_param_groups_with_weight_decay: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
-
+    # [FUNCTION DOC]
+    # Behavior: zips the lr groups and weight-decay groups (same order), asserts they reference the same
+    # named params and merges each pair into a dict with named_params, lr and weight_decay.
+    # Inputs: named_param_groups_with_lr, named_param_groups_with_weight_decay - lists of dicts.
+    # Outputs: merged list. Exceptions: AssertionError on length or content mismatch. Side effects: None.
     assert len(named_param_groups_with_lr) == len(
         named_param_groups_with_weight_decay
     ), "Named param groups don't match in length"
@@ -318,6 +392,23 @@ def init_optimizer_and_grad_accumulator(
     optimizer_args: OptimizerArgs,
     parallel_context: ParallelContext,
 ) -> Tuple[BaseOptimizer, GradientAccumulator]:
+    # [FUNCTION DOC]
+    # Behavior: unwraps DDP; maps module ids to name prefixes; collects named params with correct tied
+    # names; builds per-parameter groups with custom lr and weight decay. Defines a base builder producing a
+    # NamedOptimizer around AdamW (lr, weight decay, eps, betas, fused from config) or SGD. If
+    # accumulate_grad_in_fp32, wraps with OptimizerFromGradientAccumulator using an FP32GradientAccumulator
+    # (captured into grad_accumulator). If zero_stage is above 0, wraps everything in
+    # ZeroDistributedOptimizer over the DP group and sanity-checks that the first optimizer param shares
+    # storage with the model param; otherwise builds directly. With ZeRO and fp32 accumulation, tells the
+    # accumulator which parameter slices this DP rank owns. If the model is DDP and fp32 accumulation is on,
+    # registers a comm hook (FP32GradBucketManager over the DP x CP group, averaging reduce, reduce-scatter
+    # when ZeRO is used).
+    # Inputs: parametrization_method; model - nn.Module or DDP; optimizer_args - OptimizerArgs;
+    # parallel_context.
+    # Outputs: tuple (optimizer, gradient accumulator or None).
+    # Exceptions: ValueError for unsupported optimizer names; AssertionError on sanity checks or wrong
+    # accumulator/optimizer types.
+    # Side effects: logging; allocates fp32 gradient buffers and optimizer state; registers a DDP comm hook.
     log_rank(
         "Building Optimizer and Gradient Accumulator and Learning Rate Scheduler",
         logger=logger,
@@ -352,11 +443,18 @@ def init_optimizer_and_grad_accumulator(
 
     # Basic optimizer builder
     def basic_optimizer_builder(named_param_groups):
+        # [FUNCTION DOC]
+        # HELPER: builds a NamedOptimizer with AdamW or SGD from optimizer_args.
+        # Inputs: named_param_groups - list of group dicts. Outputs: NamedOptimizer.
+        # Exceptions: ValueError for unsupported optimizer names. Side effects: allocates optimizer state.
         optimizer = None
 
         if optimizer_args.optimizer_factory.name == "adamW":
 
             def optimizer(param_groups):
+                # [FUNCTION DOC]
+                # HELPER: AdamW factory closure. Inputs: param_groups. Outputs: torch AdamW with config lr, weight decay, eps, betas, fused.
+                # Exceptions/Side effects: None beyond torch.
                 return torch.optim.AdamW(
                     param_groups,
                     lr=optimizer_args.learning_rate_scheduler.learning_rate,
@@ -369,6 +467,9 @@ def init_optimizer_and_grad_accumulator(
         elif optimizer_args.optimizer_factory.name == "sgd":
 
             def optimizer(param_groups):
+                # [FUNCTION DOC]
+                # HELPER: SGD factory closure. Inputs: param_groups. Outputs: torch SGD with config lr and weight decay.
+                # Exceptions/Side effects: None beyond torch.
                 return torch.optim.SGD(
                     param_groups,
                     lr=optimizer_args.learning_rate_scheduler.learning_rate,
@@ -390,6 +491,11 @@ def init_optimizer_and_grad_accumulator(
     if optimizer_args.accumulate_grad_in_fp32:
 
         def grad_optimizer_builder(named_param_groups):
+            # [FUNCTION DOC]
+            # HELPER: builds an OptimizerFromGradientAccumulator (FP32 accumulation, grad buckets over all named
+            # parameters) on top of basic_optimizer_builder and stores its accumulator in the enclosing grad_accumulator.
+            # Inputs: named_param_groups. Outputs: OptimizerFromGradientAccumulator.
+            # Exceptions: as basic_optimizer_builder. Side effects: sets the enclosing variable; allocates fp32 buffers.
             result = OptimizerFromGradientAccumulator(
                 gradient_accumulator_builder=lambda named_params: FP32GradientAccumulator(
                     named_parameters=named_params,
@@ -465,6 +571,12 @@ def init_optimizer_and_grad_accumulator(
 
 
 def test_equal_dict(first: Dict, second: Dict, sub_paths: Optional[List[str]] = None) -> None:
+    # [FUNCTION DOC]
+    # HELPER: test utility for comparing nested state dicts.
+    # Behavior: asserts identical key sets, then recursively compares sub-dicts, compares tensors exactly
+    # (zero tolerance) and other values by equality, reporting the dotted path on failure.
+    # Inputs: first, second - dicts; sub_paths - path prefix list (default None meaning empty).
+    # Outputs: None. Exceptions: AssertionError on any mismatch. Side effects: None.
     """Raise if doesn't match."""
 
     if sub_paths is None:
@@ -496,6 +608,12 @@ def test_equal_dict(first: Dict, second: Dict, sub_paths: Optional[List[str]] = 
 
 
 def get_profiler(config: Config):
+    # [FUNCTION DOC]
+    # Behavior: on global rank 0 with a profiler config, returns a torch profiler (CPU and CUDA, schedule
+    # wait/warmup/active/repeat/skip_first, shapes, memory, stack options) exporting TensorBoard traces to
+    # export path / timestamp-run if an export path is set; otherwise returns a null context manager.
+    # Inputs: config - Config. Outputs: profiler or nullcontext. Exceptions: None explicitly raised.
+    # Side effects: None until entered (then writes traces).
     if config.profiler is not None and dist.get_rank() == 0:
         if config.profiler.profiler_export_path is not None:
             on_trace_ready = tensorboard_trace_handler(
@@ -524,6 +642,13 @@ def get_profiler(config: Config):
 
 
 def get_all_comps(n: int) -> List[List[List[int]]]:
+    # [FUNCTION DOC]
+    # HELPER: builds the pairing schedule for test_all_pair_to_pair.
+    # Behavior: for n a power of two, generates rounds of disjoint rank pairs covering all pairs by
+    # reshaping the rank range into rows of width d (doubling d from 1), rolling odd rows by r for each
+    # r below d, and transposing.
+    # Inputs: n - int power of two. Outputs: nested list (rounds, pairs, 2) of ranks.
+    # Exceptions: ValueError if n is not a power of two. Side effects: None.
     """Return a 3D numpy array with a series of pairs to test latency/bandwidth between:
         This basically make a square matrix from the triangle of pair-to-pair comparisons
 
@@ -545,6 +670,9 @@ def get_all_comps(n: int) -> List[List[List[int]]]:
         raise ValueError("n must be a power of two")
 
     def op(lst, d=4, r=1):
+        # [FUNCTION DOC]
+        # HELPER: one reshape-roll-transpose step. Inputs: lst - numpy array; d - row width (default 4); r -
+        # roll amount (default 1). Outputs: flattened numpy array. Exceptions/Side effects: None (operates on a reshaped view).
         lst = lst.reshape(-1, d)
         lst[1::2] = np.roll(lst[1::2], r, axis=1)
         return lst.T.reshape(-1)
@@ -563,6 +691,16 @@ def get_all_comps(n: int) -> List[List[List[int]]]:
 def test_all_pair_to_pair(
     parallel_context: ParallelContext, throughput_size: int, throughput_iters: int, only_node_to_node: bool = True
 ):
+    # [FUNCTION DOC]
+    # Behavior: for each round of rank pairs from get_all_comps(world size) and each pair, all ranks hit a
+    # world barrier; the two ranks of the pair (only pairs whose ranks are both multiples of 8 when
+    # only_node_to_node) exchange a uint8 CUDA tensor of throughput_size bytes throughput_iters times
+    # with send/recv, timing each iteration with CUDA syncs, then log the last iteration's throughput in Gbps.
+    # Inputs: parallel_context; throughput_size - bytes; throughput_iters - iterations; only_node_to_node -
+    # default True.
+    # Outputs: None. Exceptions: None explicitly raised (NameError if throughput_iters is 0).
+    # Side effects: barriers and P2P communication; CUDA allocation and cache emptying; logging.
+    # KNOWN ISSUE: only the last iteration's duration is used, and the multiple-of-8 rule hard-codes 8 GPUs per node.
     """Test all pair-to-pair GPUs throughput
 
     Args:
@@ -629,6 +767,14 @@ def create_table_log(
     num_params,
     slurm_job_id,
 ):
+    # [FUNCTION DOC]
+    # HELPER: builds the list of LogItem rows for the benchmark table (job id, run name, nodes, batch
+    # sizes, TFLOPs, tokens/s/GPU, peak memory, parallelism settings, model shape, dtype, ZeRO stage,
+    # parameter counts).
+    # Inputs: config; parallel_context; model_tflops; hardware_tflops; tokens_per_sec; bandwidth;
+    # num_params - dict with "total" and "local"; slurm_job_id.
+    # Outputs: list of LogItem. Exceptions: AttributeError if config lacks the fields. Side effects: reads CUDA memory stats.
+    # KNOWN ISSUE: bandwidth is accepted but never included in the table.
     return [
         LogItem("job_id", slurm_job_id, "s"),
         LogItem("name", config.general.run, "s"),
@@ -671,12 +817,18 @@ def create_table_log(
 
 
 def get_formatted_value(item):
+    # [FUNCTION DOC]
+    # HELPER: formats a LogItem value with human_format or its format spec.
+    # Inputs: item - LogItem. Outputs: str. Exceptions: ValueError for incompatible format specs. Side effects: None.
     if item.log_format == "human_format":
         return human_format(item.scalar_value)
     return f"{item.scalar_value:{item.log_format}}"
 
 
 def create_table_output(table_log, column_widths):
+    # [FUNCTION DOC]
+    # HELPER: renders LogItems as a three-line markdown-style table (header, dashes, values) with given column widths.
+    # Inputs: table_log - list of LogItem; column_widths - list of ints. Outputs: str. Exceptions/Side effects: None.
     header_row = "| " + " | ".join([item.tag.ljust(width) for item, width in zip(table_log, column_widths)]) + " |"
     separator_row = "| " + " | ".join(["-" * width for width in column_widths]) + " |"
     data_row = (
@@ -688,6 +840,15 @@ def create_table_output(table_log, column_widths):
 
 
 def write_to_csv(csv_filename, table_log, model_tflops, slurm_job_id):
+    # [FUNCTION DOC]
+    # Behavior: if csv_filename is empty, warns and returns. Creates the parent directory, formats header
+    # and row, and tries up to 10 times (100 ms apart) to open the file in append mode with a non-blocking
+    # exclusive flock; writes the header if the file is empty, appends the row, flushes and fsyncs, then
+    # unlocks. Logs an error if the lock could not be acquired; any other exception is logged and swallowed.
+    # Inputs: csv_filename - path; table_log - list of LogItem; model_tflops, slurm_job_id - unused.
+    # Outputs: None. Exceptions: none propagate (all caught).
+    # Side effects: file I/O with locking; logging; sleeps.
+    # KNOWN ISSUE: model_tflops and slurm_job_id are unused, and the "Successfully wrote" message is logged in the finally block even when writing failed.
     """Write benchmark results to a CSV file with file locking using fcntl."""
     import fcntl
 
@@ -774,6 +935,13 @@ def log_throughput(
     bandwidth=0,
     num_params={"total": 0, "local": 0},
 ):
+    # [FUNCTION DOC]
+    # Behavior: builds the benchmark table (SLURM_JOB_ID or "N/A"), logs it on rank 0, writes it to
+    # config.general.benchmark_csv_path on world rank 0, then barriers on the world group.
+    # Inputs: config; parallel_context; model_tflops, hardware_tflops, tokens_per_sec, bandwidth - numbers
+    # (default 0); num_params - dict (default totals of 0).
+    # Outputs: None. Exceptions: as create_table_log. Side effects: logging; CSV write; world barrier.
+    # KNOWN ISSUE: num_params uses a mutable dictionary default (harmless here since it is not mutated).
     slurm_job_id = os.environ.get("SLURM_JOB_ID", "N/A")
 
     table_log = create_table_log(
@@ -797,11 +965,24 @@ def log_throughput(
 def compute_remain_train_steps_of_a_data_stage_from_ckp(
     stage: DatasetStageArgs, config: Config, metadata: TrainingMetadata
 ) -> int:
+    # [FUNCTION DOC]
+    # Behavior: the stage's end is the global train_steps if it is the last stage (by start step),
+    # otherwise the start step of a later stage. Returns 0 if the checkpoint's last step is beyond this
+    # stage's start; else returns end minus (last step if resuming, otherwise stage start) plus 1.
+    # Inputs: stage - DatasetStageArgs; config - Config; metadata - TrainingMetadata.
+    # Outputs: int number of remaining steps. Exceptions: None explicitly raised. Side effects: None.
+    # KNOWN ISSUE: resuming in the middle of a stage (last step beyond its start but before the next stage) returns 0 instead of the remaining steps.
+    # KNOWN ISSUE: the next stage is the first later stage in config order, not necessarily the nearest one if stages are unsorted.
     def is_last_stage():
+        # [FUNCTION DOC]
+        # HELPER: True if stage has the largest start step among config.data_stages.
+        # Inputs/Outputs: bool. Exceptions/Side effects: None.
         sorted_stages = sorted(config.data_stages, key=lambda x: x.start_training_step)
         return sorted_stages[-1].start_training_step == stage.start_training_step
 
     def is_resume_from_training():
+        # [FUNCTION DOC]
+        # HELPER: True if the metadata's last train step is positive. Outputs: bool. Exceptions/Side effects: None.
         return metadata.last_train_step > 0
 
     if is_last_stage() is True:
@@ -823,6 +1004,16 @@ def compute_remain_train_steps_of_a_data_stage_from_ckp(
 def get_consumed_train_samples_of_a_data_stage_from_ckp(
     stage: DatasetStageArgs, metadata: TrainingMetadata
 ) -> Optional[int]:
+    # [FUNCTION DOC]
+    # Behavior: finds the metadata stage with the same start step; if none, asserts training has not
+    # reached this stage yet and appends a new DataStageMetadata with 0 consumed samples to the metadata.
+    # Returns that stage's consumed samples and per-dataset-folder consumed tokens.
+    # Inputs: stage - DatasetStageArgs; metadata - TrainingMetadata.
+    # Outputs: tuple (consumed_train_samples int, consumed_tokens_per_dataset_folder dict).
+    # Exceptions: AssertionError if the stage is missing but already passed.
+    # Side effects: may mutate metadata.data_stages.
+    # KNOWN ISSUE: annotated as returning an optional int but returns a tuple.
+    # KNOWN ISSUE: metadata.data_stages is iterated before the None check, so a None list raises TypeError first.
     start_training_step = stage.start_training_step
 
     # find the stage in the metadata using the start_training_step

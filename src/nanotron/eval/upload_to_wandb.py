@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Purpose: script/library to upload LightEval result JSON files from S3 to a Weights & Biases run.
+# Contents: push_to_wandb; when run as a script, parses command-line arguments (wandb_project,
+# wandb_entity, model_name, results_path, train_step, consumed_tokens, all required) and calls it.
+# Import-time side effects: imports s3fs and wandb.
 import json
 import s3fs
 import wandb
@@ -7,6 +12,18 @@ from wandb.sdk.lib.runid import generate_id
 
 
 def push_to_wandb(wandb_project, wandb_entity, model_name, results_path, train_step, consumed_tokens):
+    # [FUNCTION DOC]
+    # Behavior: lists results_path on S3 (sorted), and for each .json file reads its "results" dictionary.
+    # For every benchmark key except "all", extracts dataset and optional subtask from the text between
+    # pipes (format "|dataset:subtask|"), and for each non-stderr metric records it under
+    # "dataset/subtask/metric" (or "dataset/metric"). Also records consumed_tokens and train_step. Then
+    # looks for an existing W&B run named model_name in entity/project to resume (otherwise uses a new id
+    # of model_name plus a random id), inits the run with resume allowed, logs all metrics in one step,
+    # and finishes the run.
+    # Inputs: wandb_project, wandb_entity, model_name - strings; results_path - S3 directory path;
+    # train_step - int; consumed_tokens - int.
+    # Outputs: None. Exceptions: None explicitly raised (S3, JSON KeyError, W&B errors propagate).
+    # Side effects: S3 reads; W&B network calls creating/resuming a run and logging metrics.
     s3 = s3fs.S3FileSystem(anon=False)
     all_metrics = {
         # basic X axis replacements for all metrics

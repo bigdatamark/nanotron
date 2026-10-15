@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Purpose: Top-level checkpoint save entry point and checkpoint path resolution for resuming.
+# Main contents: save, parse_ckpt_path.
+# Fits in nanotron: called by the trainer; delegates to serialize.weights, serialize.optimizer and
+# serialize.metadata, and to S3Mover for remote checkpoints. Layout: one safetensors file per tensor,
+# written per process; version 1 assumes the same topology on load.
+# Import-time side effects: creates a module logger.
+# KNOWN ISSUE: the design-notes string literal sits after the imports, so it is not actually the module docstring.
 import os
 from pathlib import Path
 from typing import Optional, cast
@@ -60,6 +68,21 @@ def save(
     should_save_lr_scheduler: bool = True,
     sanity_checks: bool = True,
 ) -> None:
+    # [FUNCTION DOC]
+    # Behavior: asserts training_metadata type; saves, each guarded by its flag and each logging an error on
+    # rank 0 then re-raising on failure: the config as config.yaml, model weights, optimizer state, and lr
+    # scheduler (after asserting one lambda per optimizer param group; passes the ZeRO stage). Then writes
+    # metadata. If sanity_checks: asserts all state_dict tensors synced across dp_cp, tied trainable params
+    # synced across their tied groups, optimizer states synced across dp_cp (unless ZeRO-distributed), and
+    # that optimizer states of tied params match exactly across tied groups (broadcast from group rank 0,
+    # moving tensors to CUDA). Finally barriers on the world group.
+    # Inputs: config (Config), model (nn.Module), optimizer (BaseOptimizer), lr_scheduler, parallel_context,
+    # training_metadata (TrainingMetadata), root_folder (Path of this checkpoint), should_save_config,
+    # should_save_model, should_save_optimizer, should_save_lr_scheduler (bools, default True),
+    # sanity_checks (bool, default True).
+    # Outputs: None.
+    # Exceptions: AssertionError for type/sanity mismatches; re-raises any save error.
+    # Side effects: file writes under root_folder; logging; broadcasts and a world barrier.
     assert isinstance(training_metadata, TrainingMetadata)
 
     try:
@@ -205,6 +228,19 @@ def save(
 
 
 def parse_ckpt_path(config: Config, parallel_context: ParallelContext) -> Optional[Path]:
+    # [FUNCTION DOC]
+    # Behavior: returns None if no resume_checkpoint_path is configured. Local path: if latest.txt exists,
+    # reads the iteration and returns path joined with it; else if model_config.json exists returns the
+    # path itself; else logs and returns None. Remote path: if latest.txt exists, source is remote path
+    # joined with the iteration and destination is checkpoints_path joined with it; else if the remote
+    # path exists, destination is checkpoints_path joined with its last name component; else warns and
+    # returns None. Then creates an S3Mover (real only on LOCAL_RANK 0, dummy elsewhere), waits for all
+    # ranks, starts downloading and waits again, and returns the local destination path.
+    # Inputs: config (Config with checkpoints and s3_upload sections), parallel_context.
+    # Outputs: Path of the checkpoint to load, or None.
+    # Exceptions: ValueError if latest.txt does not hold an integer; TypeError if LOCAL_RANK is unset in the remote case.
+    # Side effects: file reads; logging; s5cmd download to local disk; world-group collectives.
+    # KNOWN ISSUE: remote download requires config.s3_upload to be set even when only resuming; the docstring omits parallel_context.
     """Parse checkpoint path from config and download checkpoint from S3 if needed.
 
     Args:

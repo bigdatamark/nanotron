@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Purpose: Loss functions for the DoReMi example: per-domain loss aggregation, the DoReMi excess-loss / group-DRO objective with exponentiated-gradient domain-weight update, and cross-entropy with per-domain logging for reference training.
+# Main contents: compute_per_domain_loss (gathers across data parallel), compute_domain_loss_per_replicas (local only), DomainLossForProxyTraining, CrossEntropyWithPerDomainLoss, DoReMiLossForProxyTraining.
+# How it fits: the nn.Module losses are wrapped in PipelineBlocks by doremi/llama.py and run on the last pipeline stage.
+# Import-time side effects: None (imports TorchScript masked_mean).
 from typing import Dict, Tuple
 
 import torch
@@ -13,6 +18,13 @@ from .utils import masked_mean
 def compute_per_domain_loss(
     losses: torch.Tensor, domain_idxs: torch.Tensor, doremi_context: DoReMiContext, parallel_context: ParallelContext
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Behavior: All-gathers per-sample losses and domain ids over the data-parallel group (into contiguous CUDA buffers) and concatenates them along batch; sums each sample's token losses into its domain's bucket (Python loop over the global batch); counts samples per domain with bincount; divides each domain's total by samples times sequence length; replaces NaN (domains with no samples) with 0.
+    # Inputs: losses: CUDA tensor [batch, seq] per-token losses; domain_idxs: integer tensor [batch] or [batch,1]; doremi_context (for number of domains); parallel_context (dp group).
+    # Outputs: tuple of gathered losses [dp*batch, seq], normalized per-domain losses [num_domains], samples per domain [num_domains] (int64).
+    # Exceptions: AssertionError if gathered losses and domain ids differ in length.
+    # Side effects: two all_gather collectives on the dp group; CUDA allocations.
+    # KNOWN ISSUE: label_mask is not applied, so padded/ignored tokens are counted in domain losses and in the normalization by sequence length.
     dp_size = dist.get_world_size(parallel_context.dp_pg)
     dp_pg = parallel_context.dp_pg
 
@@ -54,6 +66,13 @@ def compute_per_domain_loss(
 def compute_domain_loss_per_replicas(
     losses: torch.Tensor, domain_idxs: torch.Tensor, doremi_context: DoReMiContext
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # [FUNCTION DOC]
+    # Behavior: Same per-domain aggregation as compute_per_domain_loss but only on the local replica's batch (no communication): sums each sample's token losses into its domain, divides by samples-per-domain times sequence length, zeros NaNs.
+    # Inputs: losses: CUDA tensor [batch, seq]; domain_idxs: integer tensor [batch] or [batch,1]; doremi_context.
+    # Outputs: tuple of normalized per-domain losses [num_domains] and samples per domain [num_domains].
+    # Exceptions: AssertionError on batch size mismatch.
+    # Side effects: CUDA allocations.
+    # KNOWN ISSUE: the return annotation declares three tensors but two are returned.
     domain_idxs = domain_idxs.view(-1)
 
     # NOTE: Calculate total loss per domain
@@ -79,11 +98,24 @@ def compute_domain_loss_per_replicas(
 
 
 class DomainLossForProxyTraining:
+    # [CLASS DOC]
+    # Purpose: Callable computing the DoReMi proxy objective from proxy and reference per-token losses.
+    # Attributes: doremi_context (provides current weights, step_size, smoothing_param), parallel_context.
     def __init__(self, doremi_context: DoReMiContext, parallel_context: ParallelContext):
+        # [FUNCTION DOC]
+        # Behavior: Stores the contexts.
+        # Inputs: doremi_context, parallel_context. Outputs: None. Exceptions: None. Side effects: None.
         self.doremi_context = doremi_context
         self.parallel_context = parallel_context
 
     def __call__(self, losses: torch.Tensor, ref_losses: torch.Tensor, domain_idxs: torch.Tensor):
+        # [FUNCTION DOC]
+        # Behavior: Asserts shapes match; computes excess losses as proxy minus reference clamped at 0; aggregates them per domain on the local replica; updates weights in log space (log of current weights plus step_size times normalized domain excess loss, normalized with logsumexp), mixes with uniform using smoothing_param; DRO loss is the dot product of these weights with the domain excess losses.
+        # Inputs: losses and ref_losses: tensors [batch, seq]; domain_idxs: tensor with batch as first dimension.
+        # Outputs: dictionary with dro_loss (scalar), domain_losses [num_domains], domain_weights [num_domains] (the updated train weights), samples_per_domain [num_domains].
+        # Exceptions: AssertionError on shape mismatch.
+        # Side effects: None (does not write the new weights back to doremi_context).
+        # KNOWN ISSUE: weights are computed per dp replica without synchronization (only averaged later for logging), and the gradient flows through the weights as well as the losses since they are not detached.
         assert losses.shape == ref_losses.shape, "losses and ref_losses must have the same shape"
         assert (
             domain_idxs.shape[0] == losses.shape[0]
@@ -117,7 +149,13 @@ class DomainLossForProxyTraining:
 
 
 class CrossEntropyWithPerDomainLoss(nn.Module):
+    # [CLASS DOC]
+    # Purpose: Loss module for reference-model training: standard masked cross-entropy plus per-domain loss statistics gathered across dp.
+    # Attributes: doremi_context, parallel_context.
     def __init__(self, doremi_context: DoReMiContext, parallel_context: ParallelContext):
+        # [FUNCTION DOC]
+        # Behavior: Initializes nn.Module and stores contexts.
+        # Inputs: doremi_context, parallel_context. Outputs: None. Exceptions: None. Side effects: None.
         super().__init__()
         self.doremi_context = doremi_context
         self.parallel_context = parallel_context
@@ -129,6 +167,14 @@ class CrossEntropyWithPerDomainLoss(nn.Module):
         label_mask: torch.Tensor,  # [batch_size, seq_length]
         domain_idxs: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Behavior: Computes TP-sharded per-token cross-entropy in float32, its masked mean as ce_loss, and per-domain losses/sample counts via compute_per_domain_loss.
+        # Inputs: sharded_logits (batch-first as passed by doremi/llama.py, vocab sharded over TP); label_ids [batch, seq]; label_mask [batch, seq]; domain_idxs.
+        # Outputs: dictionary with ce_loss, domain_losses, samples_per_domain.
+        # Exceptions: None explicitly raised.
+        # Side effects: TP collectives in sharded_cross_entropy; dp all_gathers.
+        # KNOWN ISSUE: returns the key "ce_loss" but the PipelineBlock in LlamaReferenceForTrainingWithPerDomainLoss expects and reads "loss", which would raise KeyError.
+        # KNOWN ISSUE: inline comment says sharded_logits is [seq, batch, vocab] but callers pass batch-first logits.
         per_token_loss = sharded_cross_entropy(
             sharded_logits, label_ids, group=self.parallel_context.tp_pg, dtype=torch.float
         )
@@ -140,7 +186,13 @@ class CrossEntropyWithPerDomainLoss(nn.Module):
 
 
 class DoReMiLossForProxyTraining(nn.Module):
+    # [CLASS DOC]
+    # Purpose: Loss module for DoReMi proxy training wrapping DomainLossForProxyTraining; the optimized loss is the DRO loss.
+    # Attributes: parallel_context, doremi_loss (DomainLossForProxyTraining).
     def __init__(self, doremi_context: DoReMiContext, parallel_context: ParallelContext):
+        # [FUNCTION DOC]
+        # Behavior: Initializes nn.Module, stores parallel_context and builds the DoReMi loss callable.
+        # Inputs: doremi_context, parallel_context. Outputs: None. Exceptions: None. Side effects: None.
         super().__init__()
         self.parallel_context = parallel_context
         self.doremi_loss = DomainLossForProxyTraining(doremi_context, parallel_context)
@@ -153,6 +205,13 @@ class DoReMiLossForProxyTraining(nn.Module):
         domain_idxs: torch.Tensor,
         ref_losses: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Behavior: Computes TP-sharded per-token cross-entropy, the masked mean ce_loss, and the DoReMi outputs from the per-token loss and reference losses.
+        # Inputs: sharded_logits (batch-first, TP-sharded vocab); label_ids, label_mask [batch, seq]; domain_idxs; ref_losses [batch, seq].
+        # Outputs: dictionary with ce_loss, loss (DRO loss, the optimized one), domain_losses, domain_weights, samples_per_domain.
+        # Exceptions: AssertionError from shape checks.
+        # Side effects: TP collectives.
+        # KNOWN ISSUE: inline comment says sharded_logits is [seq, batch, vocab] but callers pass batch-first logits.
         loss = sharded_cross_entropy(
             sharded_logits,
             label_ids,

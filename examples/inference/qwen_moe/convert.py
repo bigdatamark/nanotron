@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Purpose: Conversion script turning a HuggingFace Qwen1.5/Qwen2-MoE checkpoint into a nanotron Qwen2 checkpoint with MoE layers (weights, metadata, tokenizer, config.yaml, model_config.json).
+# Main contents: get_args (CLI), main (conversion). Module constants DEVICE (cuda; the model must be built on GPU for rotary buffers) and TORCH_DTYPE (bfloat16).
+# Usage: torchrun with a single process (dp=pp=tp=1).
+# Import-time side effects: logger creation; requires transformers, yaml and CUDA availability when used.
 """
 torchrun --nproc-per-node 1 convert.py --nanotron-checkpoint-path nanotron_checkpoints/Qwen1.5-MoE-A2.7B --pretrained-model-name-or-path Qwen/Qwen1.5-MoE-A2.7B
 """
@@ -31,6 +36,9 @@ TORCH_DTYPE = torch.bfloat16
 
 
 def get_args():
+    # [FUNCTION DOC]
+    # Behavior: Parses required --nanotron-checkpoint-path (output directory) and --pretrained-model-name-or-path (HF id or local path).
+    # Inputs: None. Outputs: argparse Namespace. Exceptions: SystemExit on missing arguments. Side effects: reads sys.argv.
     parser = argparse.ArgumentParser()
     group = parser.add_argument_group(title="Nanotron Model")
     group.add_argument(
@@ -55,6 +63,18 @@ def get_args():
 
 def main(args):
     # Init Nanotron Parallel Utilities
+    # [FUNCTION DOC]
+    # Behavior:
+    # 1. Builds a single-rank ParallelContext and sets rank logging levels.
+    # 2. Loads the HF causal LM in bfloat16 with flash attention 2 on CUDA and reads its Qwen2MoeConfig.
+    # 3. Builds a nanotron Qwen2Config mirroring the HF config (attention bias on, non-interleaved rope, no pad token) with a MoEConfig (top-k, number of experts, expert and shared-expert intermediate sizes, router aux loss coefficient, shared expert enabled).
+    # 4. Builds an empty Qwen2ForTraining on CUDA in bfloat16, marks tied parameters and runs the parameter sanity check.
+    # 5. Under no_grad copies weights with shape asserts: token embedding; per layer the input norm, concatenated q/k/v weights and biases into qkv_proj, o_proj, the router (HF gate), the shared expert gate and up weights concatenated into gate_up_proj, shared expert down_proj and shared_expert_gate, every expert's gate/up/down weights transposed and stacked into merged_gate_up_proj [experts, hidden, 2*moe_intermediate] (gate first, then up) and merged_down_proj [experts, moe_intermediate, hidden], and the post-attention norm; then final norm and lm_head.
+    # 6. Saves weights and training metadata (step 0, one empty data stage), the tokenizer, a config.yaml (Config with ExistingCheckpointInit pointing to the output folder) and model_config.json.
+    # Inputs: args: Namespace from get_args.
+    # Outputs: None.
+    # Exceptions: AssertionError on any shape mismatch; errors from model download/loading and file I/O.
+    # Side effects: initializes torch.distributed; GPU memory for both models; network download; writes many files under the output directory; logging.
     parallel_config = ParallelismArgs(dp=1, pp=1, tp=1)
 
     parallel_context = ParallelContext(

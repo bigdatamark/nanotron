@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Purpose: Save and load optimizer and lr scheduler state, including topology-agnostic optimizer loading
+# (resuming with a different TP size, and resharding ZeRO-1 states for a different DP size).
+# Main contents: optimizer_filename, lr_scheduler_filename, save_optimizer, save_lr_scheduler,
+# state_dict_to_device, load_optimizer, load_lr_scheduler.
+# Fits in nanotron: called from serialize.main.save and from the trainer when resuming; relies on the
+# ZeRO helpers in optim.zero and on per-parameter TensorMetadata from the weights checkpoint.
+# Files live in the "optimizer" and "lr_scheduler" subfolders and are written with torch.save.
+# Import-time side effects: None.
 import json
 import warnings
 from collections import defaultdict
@@ -25,6 +34,11 @@ from nanotron.serialize.utils import ObjectType, merge_and_shard_tp_tensors
 
 # TODO(xrsrke): take rank instead of parallel_context
 def optimizer_filename(parallel_context: ParallelContext, is_zero: bool):
+    # [FUNCTION DOC]
+    # HELPER: builds the per-rank optimizer state file name.
+    # Behavior: name contains pp rank/size, (only for ZeRO) dp rank/size, tp rank/size and expert rank/size, ending in .pt.
+    # Inputs: parallel_context, is_zero (bool, compared with identity to True).
+    # Outputs: str. Exceptions: None explicitly raised. Side effects: None.
     if is_zero is True:
         return f"{ObjectType.OPTIMIZER.value}_pp-{dist.get_rank(parallel_context.pp_pg)}-of-{parallel_context.pp_pg.size()}_dp-{dist.get_rank(parallel_context.dp_pg)}-of-{parallel_context.dp_pg.size()}_tp-{dist.get_rank(parallel_context.tp_pg)}-of-{parallel_context.tp_pg.size()}_exp-{dist.get_rank(parallel_context.ep_pg)}-of-{parallel_context.expert_parallel_size}.pt"
     else:
@@ -32,6 +46,10 @@ def optimizer_filename(parallel_context: ParallelContext, is_zero: bool):
 
 
 def lr_scheduler_filename(parallel_context: ParallelContext, is_zero: bool):
+    # [FUNCTION DOC]
+    # HELPER: same naming scheme as optimizer_filename with the lr_scheduler prefix.
+    # Inputs: parallel_context, is_zero. Outputs: str. Exceptions: None explicitly raised. Side effects: None.
+    # KNOWN ISSUE: callers pass the config ZeRO stage (an int); identity comparison with True means stage 1 is treated as non-ZeRO, so only dp_cp rank 0 saves and the filename omits dp.
     if is_zero is True:
         return f"{ObjectType.LR_SCHEDULER.value}_pp-{dist.get_rank(parallel_context.pp_pg)}-of-{parallel_context.pp_pg.size()}_dp-{dist.get_rank(parallel_context.dp_pg)}-of-{parallel_context.dp_pg.size()}_tp-{dist.get_rank(parallel_context.tp_pg)}-of-{parallel_context.tp_pg.size()}_exp-{dist.get_rank(parallel_context.ep_pg)}-of-{parallel_context.expert_parallel_size}.pt"
     else:
@@ -43,6 +61,15 @@ def save_optimizer(
     parallel_context: ParallelContext,
     root_folder: Path,
 ):
+    # [FUNCTION DOC]
+    # Behavior: for non-ZeRO optimizers only dp_cp rank 0 proceeds (states are replicated). Creates the
+    # optimizer folder; world rank 0 writes optimizer_config.json with optimizer type, parallel sizes and,
+    # for ZeRO optimizers, string-converted param_name_to_dp_rank_offsets and original param shapes.
+    # Every remaining rank torch-saves its optimizer state dict under its filename.
+    # Inputs: optimizer (BaseOptimizer), parallel_context, root_folder (checkpoint Path).
+    # Outputs: None.
+    # Exceptions: AssertionError if a ZeRO optimizer has no dp rank offsets.
+    # Side effects: directory creation and file writes.
     """Saves optimizer states
     - If Zero-0 is used, optimizer states are replicated across all DPs. Only DP-0 saves the states
     - If Zero-1 is used, optimizer states are sharded across all DPs. Each DP saves its own states
@@ -77,6 +104,11 @@ def save_optimizer(
             if isinstance(optimizer, ZeroDistributedOptimizer):
                 # NOTE: in order to serialize, we must save all keys and values as strings
                 def convert_to_string(input_item):
+                    # [FUNCTION DOC]
+                    # HELPER: makes nested structures JSON-serializable with string keys and values.
+                    # Behavior: recursively converts dictionary keys and values, list and tuple elements, and leaves to strings.
+                    # Inputs: input_item (any nested structure). Outputs: same structure with strings.
+                    # Exceptions: None. Side effects: None.
                     if isinstance(input_item, dict):
                         return {str(key): convert_to_string(value) for key, value in input_item.items()}
                     elif isinstance(input_item, list):
@@ -112,6 +144,11 @@ def save_lr_scheduler(
     parallel_context: ParallelContext,
     root_folder: Path,
 ):
+    # [FUNCTION DOC]
+    # Behavior: if not ZeRO, only dp_cp rank 0 proceeds; creates the lr_scheduler folder and torch-saves the
+    # scheduler state dict under the per-rank filename.
+    # Inputs: lr_scheduler, is_zero (truthy ZeRO flag/stage), parallel_context, root_folder.
+    # Outputs: None. Exceptions: None explicitly raised. Side effects: file writes.
     """Saves lr scheduler states"""
     if not is_zero and dist.get_rank(parallel_context.dp_cp_pg) > 0:
         # this is Zero-0, so only DP-0 saves the optimizer states
@@ -130,6 +167,15 @@ def save_lr_scheduler(
 # Helper functions to move optimizer states
 @torch.no_grad()
 def state_dict_to_device(state_dict: Dict, device: str) -> Dict:
+    # [FUNCTION DOC]
+    # HELPER: moves loaded optimizer states between devices.
+    # Behavior: asserts the first state's exp_avg is on CPU, empties CUDA cache, moves every state tensor to
+    # device in place, asserts the first exp_avg is now on CUDA, empties cache again. Runs without grad.
+    # Inputs: state_dict (optimizer state dict), device (str).
+    # Outputs: None.
+    # Exceptions: AssertionError on unexpected devices; KeyError if state 0 or exp_avg is missing.
+    # Side effects: mutates state_dict; CUDA memory/caching allocator.
+    # KNOWN ISSUE: annotated to return a dictionary but returns None; the final assertion fails for any device other than CUDA.
     assert (
         state_dict["state"][0]["exp_avg"].device.type == "cpu"
     ), "Optimizer states should be on CPU to avoid extra memory usage when loading from checkpoint"
@@ -154,6 +200,27 @@ def load_optimizer(
     param_shard_metadata: Tuple[Tuple[int, int], TensorMetadata] = None,  # (pp_rank, tp_rank) -> TensorMetadata
     model: Optional[nn.Module] = None,
 ):
+    # [FUNCTION DOC]
+    # Behavior: reads optimizer_config.json. If checkpoint TP or PP size differs from the current one
+    # (warning on PP change), requires param_shard_metadata and model, loads all old shards (for a ZeRO
+    # checkpoint merging DP shards first, else loading every pp/tp shard file), then for each local model
+    # parameter (skipping duplicate tied names) rebuilds each optimizer state: sharded params are merged
+    # from old TP shards and resliced to the current shard via merge_and_shard_tp_tensors (reshaping ZeRO
+    # flattened data to original shapes), non-sharded params are copied; ZeRO states are flattened; the
+    # step value is copied; names are recorded. Otherwise loads this rank's own file directly. Finally,
+    # for a ZeRO optimizer whose TP or DP size changed, slices each state to this DP rank's offset range,
+    # then loads the state dict into the optimizer. Runs without grad.
+    # Inputs: optimizer (BaseOptimizer), parallel_context, root_folder (checkpoint Path), map_location
+    # (optional device string), param_shard_metadata (dictionary from parameter name to a dictionary from
+    # (pp_rank, tp_rank) string pair to TensorMetadata; required on topology change), model (optional nn.Module; required on topology change).
+    # Outputs: None.
+    # Exceptions: AssertionError for missing metadata/model; NotImplementedError for non-NanotronParameter
+    # parameters; KeyError/FileNotFoundError on mismatched checkpoints.
+    # Side effects: file reads; mutates optimizer state; progress bar on world rank 0; warnings.
+    # KNOWN ISSUE: the ZeRO shard glob uses "-exp-" while files are named with "_exp-", so ZeRO checkpoints are never found on topology change.
+    # KNOWN ISSUE: ZeRO flattening only applies to the last state_key left over from the inner loop, other states stay unflattened.
+    # KNOWN ISSUE: the step copy uses ckp_optim_state and old_optim_state_index from the last loop iteration, which may be a shard without this param (index None), causing a KeyError.
+    # KNOWN ISSUE: for ZeRO resharding, the DP-change check runs even when the else branch loaded an already-sharded file, and ckp_dp_size is compared as int while names must exist in state_dict.
     root_folder = root_folder / "optimizer"
     ckp_optimizer_config_path = root_folder / "optimizer_config.json"
     with open(ckp_optimizer_config_path, "r") as file:
@@ -179,6 +246,11 @@ def load_optimizer(
         ), "You have to pass the model in order to adjust the optimizer states according to how the current parameters are sharded"
 
         def get_checkpoint_state_metadata(param_name: str, pp_rank: int, tp_rank: int) -> TensorMetadata:
+            # [FUNCTION DOC]
+            # HELPER: looks up old shard metadata for a parameter.
+            # Behavior: strips "module." from param_name and indexes param_shard_metadata with the stringified (pp_rank, tp_rank) pair.
+            # Inputs: param_name (str), pp_rank, tp_rank (ints). Outputs: TensorMetadata.
+            # Exceptions: KeyError if missing. Side effects: None.
             return param_shard_metadata[param_name.replace("module.", "")][(str(pp_rank), str(tp_rank))]
 
         ckp_optim_type = ckp_optimizer_config["type"]
@@ -363,6 +435,11 @@ def load_lr_scheduler(
     parallel_context: ParallelContext,
     root_folder: Path,
 ):
+    # [FUNCTION DOC]
+    # Behavior: torch-loads this rank's scheduler file, loads it into lr_scheduler and calls its
+    # _initial_step to reapply the initial learning rate.
+    # Inputs: lr_scheduler, is_zero, parallel_context, root_folder.
+    # Outputs: None. Exceptions: FileNotFoundError if absent. Side effects: file read; mutates scheduler and optimizer lr.
     root_folder = root_folder / "lr_scheduler"
 
     state_dict = torch.load(root_folder / lr_scheduler_filename(parallel_context, is_zero))
