@@ -30,10 +30,10 @@ logger = logging.get_logger(__name__)
 
 
 class BaseLLaMa(NanotronModel):
-    @torch.no_grad()
     # [CLASS DOC]
     # Purpose: Common NanotronModel base for DoReMi Llama variants. Subclasses must set self.model to a LlamaModel.
     # Key behavior: random parameter initialization handling tied and TP-sharded params; delegates block compute costs and FLOPs to the inner model.
+    @torch.no_grad()
     def init_model_randomly(self, config):
         # [FUNCTION DOC]
         # Behavior: Under no_grad, builds a map from module id to name prefix (root as empty string), then for each parameter (asserted to be a NanotronParameter) resolves its full name (tied params use the tied-info full name) and skips ones already initialized. Initialization by owning module type: column-parallel linear weight normal(0, std), bias zero; row-parallel linear weight normal(0, std/sqrt(2*num_layers)), bias zero; TritonRMSNorm weight one, bias zero; embedding weight normal(0, std). Finally asserts the set of initialized names equals the set of all parameter names.
