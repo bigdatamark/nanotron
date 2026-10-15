@@ -1,3 +1,16 @@
+# [MODULE DOC]
+# Purpose: example script that builds a complete MambaConfig for a small (2 layer, d_model 1024) Mamba
+# model trained on roneneldan/TinyStories with dp=pp=tp=2, and saves it as config_mamba.yaml next to this file.
+# Import-time behavior (all at module level): generates a random job id; defines ssm_cfg and the
+# MambaModelConfig; estimates the parameter count from per-layer components (embedding, in_proj, conv1d,
+# x_proj, dt_proj, out_proj, A_log, D, norms), formats it with human_format and prints it; builds optimizer
+# (AdamW, cosine LR with linear warmup), parallelism, tokens, data stage, model and top-level config objects;
+# creates the checkpoints directory examples/checkpoints. Only the YAML save runs under the main guard.
+# Side effects: stdout print, directory creation at import time, YAML file write when run as a script.
+# KNOWN ISSUE: parameter estimate counts the final norm (norm_f) once per layer instead of once, and assigns
+# in_proj twice; seed is assigned twice; job_id is unused.
+# KNOWN ISSUE: uses nanotron.config.ModelArgs rather than the Mamba ModelArgs from config.py, so dtype
+# defaulting/casting follows the core class.
 """ Example python script to generate a YAML config file which can be used to run a training with nanotron. Refer to "examples" section in the `/README.md` for more information."""
 import math
 import os

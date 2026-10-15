@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Purpose: example script defining the LlaMoE (Llama with mixture-of-experts MLP) model config dataclass and building
+# a full nanotron Config for a tiny 1-layer, 4-expert model trained on roneneldan/TinyStories with tp=2 and expert
+# parallel size 2; when run, saves it as config_llamoe.yaml next to the script.
+# Contents: LlaMoEConfig (also imported by llamoe.py), module-level config objects.
+# Import-time side effects: prints an estimated parameter count, asserts experts divisible by expert_parallel_size,
+# creates the examples/checkpoints directory. YAML write and a print happen only under the main guard.
+# KNOWN ISSUE: the parameter estimate counts one dense MLP per layer, ignoring moe_num_experts and the router;
+# resume_checkpoint_path points at the same checkpoints folder that is written, and both data stages share one DataArgs.
 """ Example python script to generate a YAML config file which can be used to run a training with nanotron. Refer to "examples" section in the `/README.md` for more information."""
 import os
 from dataclasses import dataclass
@@ -25,6 +34,14 @@ from nanotron.logging import human_format
 
 @dataclass
 class LlaMoEConfig:
+    # [CLASS DOC]
+    # Dataclass of LlaMoE architecture hyperparameters, round-tripped through YAML. Llama fields: bos/eos token ids (1, 2),
+    # hidden_act ("silu"), hidden_size (4096), initializer_range (0.02), intermediate_size (11008), is_llamoe_config marker
+    # (True), max_position_embeddings (2048), num_attention_heads (32), num_hidden_layers (32), num_key_value_heads
+    # (optional, defaults to num_attention_heads), pad_token_id (optional), pretraining_tp (1), rms_norm_eps (1e-6),
+    # rope_scaling (optional dict), tie_word_embeddings (False), use_cache (True), vocab_size (32000). MoE fields:
+    # moe_num_experts (1), num_experts_per_tok (top-k routing, 1), moe_capacity_factor (1).
+    # Invariant: num_experts_per_tok does not exceed moe_num_experts.
     """Configuration for a LLAMA model
 
     Be careful on having a coherent typing as we use it to reconstruct the model from yaml
@@ -57,6 +74,10 @@ class LlaMoEConfig:
     moe_capacity_factor: int = 1
 
     def __post_init__(self):
+        # [FUNCTION DOC]
+        # Behavior: fills num_key_value_heads with num_attention_heads when None, then asserts num_experts_per_tok is at most
+        # moe_num_experts. Inputs: self. Outputs: None. Exceptions: AssertionError when the top-k exceeds the expert count.
+        # Side effects: mutates self.num_key_value_heads.
         # for backward compatibility
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads

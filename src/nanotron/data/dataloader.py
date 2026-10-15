@@ -1,3 +1,11 @@
+# [MODULE DOC]
+# Purpose: builds and wraps training dataloaders for Hugging Face datasets and dummy data in nanotron.
+# Main contents: sanity_check_dataloader (moves batches to GPU and checks DP/TP consistency),
+# dummy_infinite_data_generator (random synthetic batches), set_tensor_pointers, get_dataloader_worker_init,
+# get_train_dataloader (DataLoader over a datasets.Dataset with CLM collators and the DP-aware sampler).
+# Fits in nanotron: used by the trainer and run_train scripts to feed the pipeline engine with micro-batches where
+# non-owning pipeline ranks hold TensorPointers.
+# Import-time side effects: creates a module logger.
 from typing import Dict, Iterator, List, Optional, Union
 
 import datasets
@@ -27,6 +35,19 @@ def sanity_check_dataloader(
     parallel_context: ParallelContext,
     config: Config,
 ) -> Iterator[Dict[str, Union[torch.Tensor, TensorPointer]]]:
+    # [FUNCTION DOC]
+    # Summary: generator wrapping a dataloader; converts each batch to CUDA tensors and optionally checks synchronisation.
+    # Behavior: iterate the dataloader, timing each fetch with the "dataloader_fetch" nanotron timer. Convert numpy arrays
+    # to torch tensors, then move every non-TensorPointer value to CUDA (contiguous, non-blocking). Unless
+    # config.general.ignore_sanity_checks is set: for each tensor key (sorted, skipping keys containing "mask" or
+    # "position_ids") assert the tensor is NOT identical across the DP group (expected to fail on all ranks but rank 0,
+    # via assert_fail_except_rank_with); then assert every tensor is identical across the TP group. Yield the batch.
+    # Inputs: dataloader (iterable of dictionaries of arrays/tensors/TensorPointers), parallel_context, config (Config).
+    # Outputs: yields dictionaries of CUDA tensors or TensorPointers.
+    # Exceptions: AssertionError from failed sanity checks; see known issue for end of iteration.
+    # Side effects: host-to-device copies; collective communication over DP and TP groups during checks; timer updates.
+    # KNOWN ISSUE: re-raising StopIteration inside a generator is converted to RuntimeError (PEP 479) instead of ending
+    # iteration cleanly.
     """
     Run sanity checks on batches from the dataloader to ensure data is properly distributed and synchronized.
 
@@ -108,6 +129,21 @@ def dummy_infinite_data_generator(
     use_position_ids: bool = False,
     cp_pg: Optional[dist.ProcessGroup] = None,
 ):
+    # [FUNCTION DOC]
+    # Summary: returns a zero-argument generator function producing endless random CLM batches on CUDA.
+    # Behavior: compute the CP rank/size from cp_pg, assert sequence_length divides by cp_size and compute the local CP
+    # slice. The inner generator seeds a CUDA torch.Generator with seed times (1 + DP rank) times (1 + PP rank) so TP
+    # ranks agree. Without position ids it yields input_ids and input_mask (owned by input_pp_rank) and label_ids and
+    # label_mask (owned by output_pp_rank), each a random or all-True tensor of micro_batch_size by sequence_length cut to
+    # the CP slice, or a TensorPointer on non-owning ranks. With use_position_ids it precomputes position_ids where the
+    # first row contains documents of lengths 4, 6 and the remainder, other rows a single document, and yields
+    # position_ids instead of input_mask.
+    # Inputs: micro_batch_size, sequence_length, input_pp_rank, output_pp_rank, vocab_size (token id upper bound),
+    # seed, parallel_context, use_position_ids (default False), cp_pg (context-parallel process group, default None).
+    # Outputs: the generator function data_generator.
+    # Exceptions: AssertionError if sequence_length is not divisible by cp_size; AttributeError if cp_pg is None.
+    # Side effects: None until the returned generator is iterated (then CUDA allocations and RNG use).
+    # KNOWN ISSUE: cp_pg defaults to None but is used unconditionally, so the default always fails.
     """
     Generate dummy data for testing or benchmark purposes.
 
@@ -130,6 +166,12 @@ def dummy_infinite_data_generator(
     local_slice = slice(cp_rank * sequence_length // cp_size, (cp_rank + 1) * sequence_length // cp_size)
 
     def data_generator() -> Iterator[Dict[str, Union[torch.Tensor, TensorPointer]]]:
+        # [FUNCTION DOC]
+        # HELPER: the actual infinite batch generator returned by dummy_infinite_data_generator.
+        # Behavior, inputs: described in the enclosing function; uses closure variables only.
+        # Outputs: yields batch dictionaries forever.
+        # Exceptions: None explicitly raised.
+        # Side effects: creates a CUDA generator, allocates CUDA tensors each step.
         # Random generator
         generator = torch.Generator(device="cuda")
         # Make sure that TP are synced always
@@ -230,6 +272,12 @@ def dummy_infinite_data_generator(
 def set_tensor_pointers(
     input_dict: Dict[str, Union[torch.Tensor, TensorPointer]], group: dist.ProcessGroup, group_rank: int
 ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
+    # [FUNCTION DOC]
+    # Summary: keeps values only on group_rank; every other rank of group receives TensorPointers to group_rank.
+    # Inputs: input_dict (dictionary of tensors or pointers), group (process group), group_rank (owning rank in group).
+    # Outputs: new dictionary with the same keys.
+    # Exceptions: None explicitly raised.
+    # Side effects: None.
     """
     Make sure only the group_rank rank has the data, others have TensorPointers.
 
@@ -248,6 +296,12 @@ def set_tensor_pointers(
 
 
 def get_dataloader_worker_init(dp_rank: int):
+    # [FUNCTION DOC]
+    # Summary: builds a DataLoader worker_init_fn giving each worker a distinct but reproducible seed.
+    # Inputs: dp_rank, integer data-parallel rank.
+    # Outputs: function taking worker_id.
+    # Exceptions: None explicitly raised.
+    # Side effects: None (the returned function sets global RNG seeds).
     """
     Creates random states for each worker in order to get different state in each workers.
 
@@ -259,6 +313,13 @@ def get_dataloader_worker_init(dp_rank: int):
     """
 
     def dataloader_worker_init(worker_id):
+        # [FUNCTION DOC]
+        # HELPER: worker init function; seed is 2 to the power (1 + worker_id) times 3 to the power (1 + dp_rank), modulo 2^32,
+        # so it is identical across TP/PP ranks and distinct across DP ranks and workers.
+        # Inputs: worker_id, integer.
+        # Outputs: None.
+        # Exceptions: None explicitly raised.
+        # Side effects: calls set_random_seed, reseeding Python, numpy and torch RNGs in the worker process.
         # Dataloader is TP/PP synced in random states
         seed = 2 ** (1 + worker_id) * 3 ** (1 + dp_rank) % (2**32)
         set_random_seed(seed)
@@ -282,6 +343,24 @@ def get_train_dataloader(
     sequence_sep_tokens: List[int] = None,
     use_position_ids: bool = True,
 ) -> DataLoader:
+    # [FUNCTION DOC]
+    # Summary: creates the training DataLoader for a Hugging Face datasets.Dataset of pre-tokenised samples.
+    # Behavior: reject non datasets.Dataset inputs. On pipeline ranks that own inputs or labels, format the dataset as
+    # numpy over input_ids (keeping other columns). On other ranks, assert the only column is input_ids, remember the
+    # length, drop the column and replace the dataset by EmptyInfiniteDataset of that length, with 0 workers. Choose
+    # DataCollatorForCLMWithPositionIds if use_position_ids else DataCollatorForCLM. Build a sampler with get_sampler using
+    # the DP rank/size, seed_worker, micro_batch_size, drop_last and consumed_train_samples (to resume). Return a DataLoader
+    # with that sampler, collator, worker count, pin memory, worker init function and persistent workers when workers > 0.
+    # Inputs: train_dataset, sequence_length, parallel_context, input_pp_rank, output_pp_rank, micro_batch_size,
+    # consumed_train_samples, dataloader_num_workers, seed_worker, dataloader_drop_last (default True),
+    # dataloader_pin_memory (default True), use_loop_to_round_batch_size (default False), sequence_sep_tokens (list of
+    # separator token ids, default None), use_position_ids (default True).
+    # Outputs: torch DataLoader.
+    # Exceptions: ValueError for wrong dataset type; AssertionError on non-data ranks if columns are unexpected;
+    # TypeError (see known issue).
+    # Side effects: None beyond constructing objects.
+    # KNOWN ISSUE: sequence_sep_tokens is passed to DataCollatorForCLMWithPositionIds, which has no such field, so the
+    # default use_position_ids path raises TypeError.
     """
     Get a PyTorch DataLoader for training.
 

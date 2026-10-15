@@ -1,3 +1,17 @@
+# [PACKAGE DOC]
+# Purpose: package nanotron.data.nemo_dataset, a port of the NeMo/Megatron GPT dataset pipeline: memory-mapped
+# indexed token datasets split into train/valid/test, turned into fixed-length samples via cached index mappings,
+# optionally blended across several corpora and optionally augmented with Fill-In-the-Middle (FIM).
+# Main contents: build_dataset, build_train_valid_test_datasets, _build_train_valid_test_datasets,
+# get_indexed_dataset, FIM/EOD special token strings, GPTDataset, SubsetSplitLog, the index builders
+# (_build_index_mappings, _num_tokens, _num_epochs, _build_doc_idx, _build_sample_idx, _build_shuffle_idx) and permute.
+# Submodules: blendable_dataset (BlendableDataset), dataset_utils (split parsing, weights, C++ helper compile),
+# indexed_dataset (MMapIndexedDataset). An optional compiled C++ module "helpers" builds sample indices.
+# Index mapping semantics: doc_idx lists document ids repeated over epochs and shuffled; sample_idx has one row per
+# sample boundary (index into doc_idx, token offset in that document), sample i spanning rows i to i+1; shuffle_idx
+# permutes sample ids. They are saved as .npy files next to the data (or in index_mapping_dir) by the first rank and
+# memory-mapped by all ranks.
+# Import-time side effects: creates a module logger, defines the token string constants.
 # Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -50,7 +64,25 @@ def build_dataset(
     name: str,
     parallel_context: ParallelContext,
 ) -> Union["GPTDataset", BlendableDataset]:
+    # [FUNCTION DOC]
+    # Summary: builds one GPTDataset (single prefix) or a BlendableDataset (several prefixes) covering all documents.
+    # Behavior: with exactly one prefix build a GPTDataset over all of its documents for num_samples. Otherwise parse
+    # data_prefix as alternating weights and prefixes with get_datasets_weights_and_num_samples, build one GPTDataset per
+    # prefix with its own sample count and blend them with the weights into num_samples samples.
+    # Inputs: cfg (config object with validation_drop_last, eod_mask_loss, FIM settings, index_mapping_dir, etc.),
+    # tokenizer (Hugging Face tokenizer with FIM and EOD tokens), data_prefix (list of path prefixes, optionally with
+    # weights), num_samples, seq_length, seed, skip_warmup (skip memmap warm-up read), name ("train", "valid" or "test";
+    # for "valid" drop_last follows cfg.validation_drop_last), parallel_context.
+    # Outputs: GPTDataset or BlendableDataset.
+    # Exceptions: propagates errors from dataset construction.
+    # Side effects: file I/O for index mappings; rank 0 logging.
     def _build_dataset(current_data_prefix: str, current_num_samples: int) -> "GPTDataset":
+        # [FUNCTION DOC]
+        # HELPER: builds a GPTDataset for one prefix over all its documents.
+        # Inputs: current_data_prefix (string path prefix), current_num_samples (int).
+        # Outputs: GPTDataset.
+        # Exceptions: None explicitly raised.
+        # Side effects: loads the indexed dataset, logs document counts on rank 0.
         indexed_dataset = get_indexed_dataset(current_data_prefix, skip_warmup)
         total_num_of_documents = indexed_dataset.sizes.shape[0]
         # Print stats about the splits.
@@ -108,6 +140,21 @@ def build_train_valid_test_datasets(
     Union["GPTDataset", "BlendableDataset", None],
     Union["GPTDataset", "BlendableDataset", None],
 ]:
+    # [FUNCTION DOC]
+    # Summary: builds train, validation and test datasets either from explicit per-split prefixes or by splitting.
+    # Behavior: if data_prefix is a dictionary it must have train, test and validation keys; splits_string is ignored
+    # (warning logged if cfg.splits_string is set) and each split is built with build_dataset. Otherwise: an empty list
+    # returns early; a single prefix is split by document ranges via _build_train_valid_test_datasets; several prefixes
+    # are parsed into weights and per-dataset sample counts, split individually, and each non-empty split list is blended
+    # with BlendableDataset using the summed sample counts.
+    # Inputs: cfg, tokenizer, data_prefix (dictionary or list), splits_string (e.g. "969,30,1"),
+    # train_valid_test_num_samples (three integers), seq_length, seed, parallel_context, skip_warmup.
+    # Outputs: tuple of three datasets, each possibly None.
+    # Exceptions: AssertionError for a dictionary missing required keys.
+    # Side effects: file I/O, logging.
+    # KNOWN ISSUE: the empty-prefix branch returns a nested tuple plus an empty list instead of three values.
+    # KNOWN ISSUE: the blended branch passes the same weights to all splits even if some datasets produced an empty split,
+    # so weights and datasets can mismatch in length.
     if isinstance(data_prefix, dict):
         assert (
             data_prefix.get("train") is not None
@@ -229,6 +276,17 @@ def _build_train_valid_test_datasets(
     parallel_context: ParallelContext,
     skip_warmup: bool,
 ) -> Tuple["GPTDataset", Optional["GPTDataset"], Optional["GPTDataset"]]:
+    # [FUNCTION DOC]
+    # HELPER: splits a single indexed dataset into train/valid/test GPTDatasets by contiguous document ranges.
+    # Behavior: load the indexed dataset, compute split boundaries with get_train_valid_test_split_, log the ranges, and
+    # for each split with a non-empty range build a GPTDataset over those document ids with that split's sample count
+    # (drop_last from cfg.validation_drop_last for "valid").
+    # Inputs: cfg, tokenizer, data_prefix (string), splits_string, train_valid_test_num_samples (sequence of three ints),
+    # seq_length, seed, parallel_context, skip_warmup.
+    # Outputs: tuple of three GPTDataset or None.
+    # Exceptions: None explicitly raised.
+    # Side effects: file I/O, logging.
+    # KNOWN ISSUE: train_valid_test_num_samples is annotated as int but is indexed as a sequence.
     """Build train, valid, and test datasets."""
 
     # Indexed dataset.
@@ -241,6 +299,9 @@ def _build_train_valid_test_datasets(
     log_rank(" > dataset split:", logger=logger, level=logging.INFO, rank=0)
 
     def print_split_stats(name, index):
+        # [FUNCTION DOC]
+        # HELPER: logs the document range and count of split number index under the given name.
+        # Inputs: name (string), index (0, 1 or 2). Outputs: None. Exceptions: None explicitly raised. Side effects: logging.
         log_rank("    {}:".format(name), logger=logger, level=logging.INFO, rank=0)
         log_rank(
             "     document indices in [{}, {}) total of {} "
@@ -255,6 +316,10 @@ def _build_train_valid_test_datasets(
     print_split_stats("test", 2)
 
     def build_dataset(index: int, name: str) -> GPTDataset:
+        # [FUNCTION DOC]
+        # HELPER: builds the GPTDataset for split number index, or None if the range is empty.
+        # Inputs: index (int), name (string). Outputs: GPTDataset or None.
+        # Exceptions: None explicitly raised. Side effects: index-mapping file I/O.
         dataset = None
         if splits[index + 1] > splits[index]:
             documents = np.arange(start=splits[index], stop=splits[index + 1], step=1, dtype=np.int32)
@@ -284,6 +349,12 @@ def _build_train_valid_test_datasets(
 
 
 def get_indexed_dataset(data_prefix: str, skip_warmup: bool) -> MMapIndexedDataset:
+    # [FUNCTION DOC]
+    # Summary: opens the memory-mapped indexed dataset at data_prefix via make_indexed_dataset and logs timing and count.
+    # Inputs: data_prefix (path prefix of .bin/.idx files), skip_warmup (bool).
+    # Outputs: MMapIndexedDataset.
+    # Exceptions: propagates file errors.
+    # Side effects: file reads, logging on rank 0.
     """Build indexed dataset."""
     log_rank(" > building dataset index ...", logger=logger, level=logging.INFO, rank=0)
 
@@ -310,6 +381,14 @@ EOD = "<|endoftext|>"
 
 
 class GPTDataset(Dataset):
+    # [CLASS DOC]
+    # Purpose: torch Dataset returning fixed-length token samples of seq_length (+1 extra token unless
+    # cfg.no_seqlen_plus_one_input_tokens) from a document subset, with optional FIM augmentation.
+    # Key attributes: name, indexed_dataset, drop_last, seq_length, eod_mask_loss, add_extra_token (1 or 0),
+    # index_mapping_dir, fim_rate, fim_spm_rate, tokenizer, special token ids (suffix, prefix, middle, pad, eod),
+    # fim_split_sample (token id or None), fragment_fim_rate, no_fim_prefix, np_rng (RandomState for FIM),
+    # doc_idx, sample_idx, shuffle_idx (index mappings), subset_log (SubsetSplitLog).
+    # Inherits from torch.utils.data.Dataset.
     def __init__(
         self,
         cfg: Any,
@@ -324,6 +403,20 @@ class GPTDataset(Dataset):
         parallel_context: ParallelContext,
         drop_last: bool = True,
     ):
+        # [FUNCTION DOC]
+        # Summary: stores configuration, resolves special token ids, creates the mapping directory and builds/loads the
+        # index mappings.
+        # Behavior: assert document ids lie within the indexed dataset; read eod/FIM settings from cfg; validate both FIM
+        # rates are in [0, 1]; look up FIM_SUFFIX, FIM_PREFIX, FIM_MIDDLE, FIM_PAD and EOD in tokenizer.vocab; resolve
+        # fim_split_sample; seed a RandomState. When distributed is initialised, create index_mapping_dir rank by rank
+        # (main rank first). Call _build_index_mappings, keep the three arrays and the log, then release the indexed dataset's
+        # cached index memory.
+        # Inputs: cfg, tokenizer, name, data_prefix, documents (int32 array of document ids), indexed_dataset, num_samples,
+        # seq_length, seed, parallel_context, drop_last (default True).
+        # Outputs: None.
+        # Exceptions: AssertionError for invalid documents; ValueError for rates outside [0, 1]; KeyError if the tokenizer
+        # lacks the special tokens.
+        # Side effects: directory creation, index file I/O, barriers inside main_rank_first.
         super().__init__()
         self.name = name
         self.indexed_dataset = indexed_dataset
@@ -387,11 +480,26 @@ class GPTDataset(Dataset):
         self.subset_log = subset_log
 
     def __len__(self):
+        # [FUNCTION DOC]
+        # Summary: number of samples, rows of sample_idx minus one. Inputs: None. Outputs: int.
+        # Exceptions: None explicitly raised. Side effects: None.
         # -1 is due to data structure used to retrieve the index:
         #    sample i --> [sample_idx[i], sample_idx[i+1])
         return self.sample_idx.shape[0] - 1
 
     def _get_text(self, idx: int) -> np.ndarray:
+        # [FUNCTION DOC]
+        # HELPER: assembles the token sample for an index, used by __getitem__.
+        # Behavior: map idx through shuffle_idx; read start (document position, offset) and end rows from sample_idx. If both
+        # are in the same document, read the span of the right length; otherwise concatenate the tail of the first document,
+        # all middle documents, and the head of the last one. If the length is not seq_length plus add_extra_token, warn and
+        # right-pad with -1. If fim_rate is 0 return as int64. Otherwise split the sample on EOD tokens, FIM-permute each
+        # non-empty segment (via the nested helpers) re-inserting EOD separators, then truncate or pad with the pad token back
+        # to the original length.
+        # Inputs: idx (int).
+        # Outputs: 1-D int64 numpy array.
+        # Exceptions: AssertionError if the final FIM length mismatches.
+        # Side effects: advances np_rng; reads memmap; may log warnings.
         # Get the shuffled index.
         idx = self.shuffle_idx[idx]
         # Start and end documents and offsets.
@@ -444,6 +552,11 @@ class GPTDataset(Dataset):
         segment_breaks = np.argwhere(sample == self.eod_tok_id)  # split sample by document
 
         def fim_permute_sequence(sequence, rate):
+            # [FUNCTION DOC]
+            # HELPER: calls permute on a sequence with the dataset's rng, SPM rate, tokenizer and special tokens, without
+            # truncation/padding.
+            # Inputs: sequence (int array), rate (FIM probability). Outputs: permuted array.
+            # Exceptions: None explicitly raised. Side effects: advances np_rng.
             return permute(
                 sequence,
                 self.np_rng,
@@ -459,6 +572,13 @@ class GPTDataset(Dataset):
             )
 
         def fim_split_and_permute_sequence(sequence):
+            # [FUNCTION DOC]
+            # HELPER: applies FIM to a segment, optionally at fragment level.
+            # Behavior: without fim_split_sample (or if the split token is absent) permute the whole sequence with fim_rate.
+            # Otherwise draw once with fim_rate whether to apply FIM at all; if yes, split on the split token and permute every
+            # non-empty fragment with fragment_fim_rate, keeping the split tokens between them.
+            # Inputs: sequence (int array). Outputs: array.
+            # Exceptions: None explicitly raised. Side effects: advances np_rng.
             """
             If self.fim_split_sample is not None, split the sequence.
             Then apply FIM on the fragments, or the whole sequence if self.fim_split_sample is None.
@@ -519,12 +639,20 @@ class GPTDataset(Dataset):
         return sample.astype(np.int64)
 
     def __getitem__(self, idx: int) -> Dict[str, np.ndarray]:
+        # [FUNCTION DOC]
+        # Summary: returns a dictionary with "input_ids" set to the sample from _get_text.
+        # Inputs: idx (int). Outputs: dictionary of string to int64 array.
+        # Exceptions: None explicitly raised. Side effects: as _get_text.
         text = self._get_text(idx)
         return {"input_ids": text}
 
 
 @dataclass
 class SubsetSplitLog:
+    # [CLASS DOC]
+    # Purpose: dataclass recording how a split's index mappings were built, for logging/inspection.
+    # Attributes: name, data_prefix, doc_idx_filename, sample_idx_filename, shuffle_idx_filename, tokens_per_epoch,
+    # num_epochs, num_samples (rows of sample_idx), seq_length.
     name: str
     data_prefix: str
     doc_idx_filename: str
@@ -549,6 +677,20 @@ def _build_index_mappings(
     drop_last: bool = True,
     add_extra_token: int = 1,
 ) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], SubsetSplitLog]:
+    # [FUNCTION DOC]
+    # HELPER: builds (if missing) and loads doc_idx, sample_idx and shuffle_idx for GPTDataset.
+    # Behavior: compute tokens per epoch and the epochs needed for num_samples. Derive file names from the prefix (or
+    # index_mapping_dir plus its basename) plus name, num_samples, seq_length and seed. Inside main_rank_first over the
+    # world group, if any file is missing: decide separate_last_epoch (only when more than one epoch and the last epoch
+    # would contain less than 80 percent of a full epoch's samples, with sanity asserts); build and save doc_idx; assert
+    # int32 dtypes, import (compiling if needed) the C++ helpers and build/save sample_idx; build/save shuffle_idx where,
+    # if the last epoch is separated, the first epochs and last epoch are shuffled separately. Then every rank memory-maps
+    # the three files, logs counts and builds a SubsetSplitLog.
+    # Inputs: name, data_prefix, documents, sizes (int32 document lengths), num_samples, seq_length, seed,
+    # parallel_context, index_mapping_dir (default None), drop_last (default True), add_extra_token (default 1).
+    # Outputs: tuple of (doc_idx, sample_idx, shuffle_idx) read-only memmaps and a SubsetSplitLog.
+    # Exceptions: AssertionError on sample count or dtype checks; ImportError if the C++ helpers cannot be compiled.
+    # Side effects: writes .npy files, may compile C++ code, barrier-style ordering from main_rank_first, logging.
     """Build doc-idx, sample-idx, and shuffle-idx.
     doc-idx: is an array (ordered) of documents to be used in training.
     sample-idx: is the start document index and document offset for each
@@ -752,11 +894,20 @@ def _build_index_mappings(
 
 
 def _num_tokens(documents: np.ndarray, sizes: np.ndarray) -> int:
+    # [FUNCTION DOC]
+    # HELPER: total tokens of the selected documents, the sum of sizes at the document ids.
+    # Inputs: documents (int array), sizes (int array). Outputs: integer. Exceptions: None explicitly raised. Side effects: None.
     """Total number of tokens in the dataset."""
     return np.sum(sizes[documents])
 
 
 def _num_epochs(tokens_per_epoch: int, seq_length: int, num_samples: int, add_extra_token: int = 1) -> int:
+    # [FUNCTION DOC]
+    # HELPER: smallest number of epochs whose tokens, minus add_extra_token, integer-divided by seq_length reach num_samples.
+    # Inputs: tokens_per_epoch, seq_length, num_samples, add_extra_token (default 1).
+    # Outputs: int.
+    # Exceptions: None explicitly raised (loops forever if tokens_per_epoch is 0).
+    # Side effects: None.
     """Based on number of samples and sequence length, calculate how many
     epochs will be needed."""
     num_epochs = 0
@@ -772,6 +923,14 @@ def _num_epochs(tokens_per_epoch: int, seq_length: int, num_samples: int, add_ex
 
 
 def _build_doc_idx(documents: np.ndarray, num_epochs: int, np_rng: Any, separate_last_epoch: bool) -> np.ndarray:
+    # [FUNCTION DOC]
+    # HELPER: builds the shuffled document order over epochs.
+    # Behavior: unless separate_last_epoch (and more than one epoch), tile documents num_epochs times, cast to int32 and
+    # shuffle all together. Otherwise build the first num_epochs - 1 epochs and the last epoch separately (each shuffled)
+    # and concatenate, so the last partial epoch does not mix with the others.
+    # Inputs: documents, num_epochs, np_rng (RandomState), separate_last_epoch (bool).
+    # Outputs: 1-D int32 array.
+    # Exceptions: None explicitly raised. Side effects: advances np_rng.
     """Build an array with length = number-of-epochs * number-of-dcuments.
     Each index is mapped to a corresponding document."""
     if not separate_last_epoch or num_epochs == 1:
@@ -788,6 +947,17 @@ def _build_doc_idx(documents: np.ndarray, num_epochs: int, np_rng: Any, separate
 
 
 def _build_sample_idx(sizes, doc_idx, seq_length, num_epochs, tokens_per_epoch, drop_last=True, add_extra_token=1):
+    # [FUNCTION DOC]
+    # HELPER: pure-Python reference of the C++ sample index builder (unused; kept for reference).
+    # Behavior: number of samples is (num_epochs times tokens_per_epoch minus add_extra_token) divided by seq_length,
+    # rounded down when drop_last else up. Starting at document position 0 offset 0, repeatedly consume seq_length plus
+    # add_extra_token tokens across documents in doc_idx order, recording the (doc position, offset) where each sample ends
+    # so that consecutive samples overlap by add_extra_token tokens. On the last document without enough tokens the final
+    # offset is clamped and the loop ends.
+    # Inputs: sizes, doc_idx, seq_length, num_epochs, tokens_per_epoch, drop_last (default True), add_extra_token (default 1).
+    # Outputs: int32 array of shape number of samples plus one by 2.
+    # Exceptions: AssertionError if documents run out before the last sample.
+    # Side effects: None.
     """Sample index mapping is a 2D array with sizes
     [number-of-samples + 1, 2] where [..., 0] contains
     the index into `doc_idx` and [..., 1] is the
@@ -845,6 +1015,12 @@ def _build_sample_idx(sizes, doc_idx, seq_length, num_epochs, tokens_per_epoch, 
 
 
 def _build_shuffle_idx(num_samples: int, total_size: int, np_rng: Any) -> np.ndarray:
+    # [FUNCTION DOC]
+    # HELPER: returns a permutation of 0 to total_size - 1 where the first num_samples ids and the remaining ids are
+    # shuffled separately and concatenated. Uses uint32 unless total_size is near the uint32 limit, then int64.
+    # Inputs: num_samples, total_size, np_rng.
+    # Outputs: 1-D integer array of length total_size.
+    # Exceptions: None explicitly raised. Side effects: logs; advances np_rng.
     """Build the range [0, size) and shuffle."""
     logger.info(
         " > building shuffle index with split [0, {}) and [{}, {}) "
@@ -880,6 +1056,21 @@ def permute(
     pad_tok_id: int = None,
     no_fim_prefix: str = None,
 ):
+    # [FUNCTION DOC]
+    # Summary: Fill-In-the-Middle transform of one token sequence (from GPT-NeoX).
+    # Behavior: with probability fim_rate: decode the tokens to text; return unchanged if it starts with no_fim_prefix;
+    # pick two sorted random character boundaries to split into prefix, middle, suffix; re-encode each. If truncate_or_pad,
+    # adjust the suffix so the total including 3 sentinel tokens equals the original length (pad with pad_tok_id, or
+    # truncate; if the suffix is too short to truncate, give up). Then with probability fim_spm_rate produce SPM order
+    # (prefix token, suffix token, suffix, middle token, prefix, middle) else PSM order (prefix token, prefix, suffix
+    # token, suffix, middle token, middle). Without FIM the sample is returned unchanged.
+    # Inputs: sample (1-D int array), np_rng (RandomState), fim_rate, fim_spm_rate (probabilities), tokenizer,
+    # truncate_or_pad (default True), suffix_tok_id, prefix_tok_id, middle_tok_id, pad_tok_id (ints), no_fim_prefix
+    # (optional string).
+    # Outputs: 1-D array of tokens.
+    # Exceptions: re-raises ValueError from boundary sampling after printing diagnostics.
+    # Side effects: advances np_rng; prints on error.
+    # KNOWN ISSUE: when the suffix cannot be truncated it returns a tuple (sample, np_rng) instead of an array.
     """
     Take in a sample (np array w/ size (0,chunklength)) and perform a FIM transformation on it.
     Maintain the same sample length (if transform creates a few extra tokens, drop them).

@@ -1,4 +1,14 @@
 # coding=utf-8
+# [MODULE DOC]
+# Purpose: nanotron implementation of the Mamba (selective state space) language model for the examples/mamba
+# project, with tensor parallelism (column/row parallel projections, sharded per-channel SSM parameters) and
+# pipeline parallelism (each layer wrapped in a PipelineBlock), plus incremental decoding via AttachableStore.
+# Contents: Mamba (mixer), Embedding, MambaDecoderLayer, MambaModel (embedding, decoder stack, final RMSNorm,
+# lm_head, fp32 cast), masked_mean and Loss (TP-sharded cross entropy), MambaForTraining (NanotronModel with loss,
+# random init, tying names, compute costs, flops).
+# Import-time side effects: optional imports of causal_conv1d (conv kernels), mamba_ssm Triton selective_state_update
+# and RMSNorm / fused norm functions; each falls back to None when missing (RMSNorm None breaks construction).
+# Requires the sibling modules config and selective_scan_interface (imported as top-level modules).
 # Copyright 2018 HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -65,6 +75,13 @@ logger = logging.get_logger(__name__)
 
 
 class Mamba(nn.Module, AttachableStore):
+    # [CLASS DOC]
+    # Mamba mixer block (one SSM layer), one TP shard per rank. Channels d_inner (expand times d_model) are split across
+    # the TP group; in_proj is column parallel producing interleaved x and z for local channels; conv1d (depthwise,
+    # causal via left padding), dt_proj, A_log and D are sharded on dim 0; x_proj and out_proj are row parallel
+    # (all-reduce outputs). Inherits AttachableStore so generation can attach a per-layer cache store.
+    # Key attributes: d_model, d_state, d_conv, expand, d_inner, dt_rank, use_fast_path, layer_idx, tp_pg, tp_rank,
+    # in_proj, conv1d, activation ("silu"), act, x_proj, dt_proj, A_log (local d_inner by d_state, fp32), D, out_proj.
     def __init__(
         self,
         d_model: int,
@@ -86,6 +103,23 @@ class Mamba(nn.Module, AttachableStore):
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores hyperparameters; d_inner is expand times d_model; dt_rank is ceil of d_model / 16 when "auto".
+        # Resolves tp_mode (ALL_REDUCE when parallel_config is None) and async communication flag. Builds in_proj
+        # (column parallel, d_model to 2 d_inner, no bias), asserts d_inner divisible by TP size, builds the local
+        # depthwise Conv1d (padding d_conv - 1) and converts its weight/bias to TP-sharded parameters, x_proj (row parallel
+        # d_inner to dt_rank + 2 d_state), local dt_proj Linear (dt_rank to local d_inner, bias). Initialises dt_proj bias
+        # to the inverse softplus of dt sampled log-uniformly in [dt_min, dt_max] and clamped at dt_init_floor, then shards
+        # dt_proj weight and bias. A_log is log of 1..d_state repeated per local channel (S4D real init); D is ones; both
+        # sharded. out_proj is row parallel d_inner to d_model without bias.
+        # Inputs: d_model (int); parallel_config (optional ParallelismArgs); tp_pg (process group); d_state (16); d_conv (4);
+        # expand (2); dt_rank ("auto" or int); dt_min (0.001); dt_max (0.1); dt_init ("random"); dt_scale (1.0);
+        # dt_init_floor (1e-4); conv_bias (True); bias (False); use_fast_path (True); layer_idx (optional int);
+        # device, dtype (optional).
+        # Outputs: None. Exceptions: AssertionError on unsupported TP config or indivisible d_inner.
+        # Side effects: consumes torch RNG (dt sampling), allocates parameters.
+        # KNOWN ISSUE: the assertion's message string is a separate statement so it is never shown, and the condition
+        # uses "or" so any non-ALL_REDUCE mode passes when async is off; dt_init, dt_scale and bias are accepted but unused here.
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         self.d_model = d_model
@@ -201,6 +235,21 @@ class Mamba(nn.Module, AttachableStore):
         )
 
     def forward(self, hidden_states: Union[torch.Tensor, TensorPointer]):
+        # [FUNCTION DOC]
+        # Behavior: reads (batch, seqlen, dim). If a generation store is attached: initialises its memory list and
+        # seqlen_offset, fetches conv/ssm states; after the first call it runs step (single-token decode, states updated in
+        # place), increments the offset and returns; on the first call increments the offset and continues (prefill).
+        # Computes xz from in_proj transposed to (b, channels, l) and A as minus exp of A_log in fp32. Fast path (use_fast_path
+        # and no store): mamba_inner_fn fused kernel with input-dependent B and C, D and dt bias in fp32, softplus.
+        # Slow path: splits interleaved x and z (local width d_inner / 2 if TP size above 1, else d_inner); stores the last
+        # d_conv inputs (zero-padded) into conv_state when caching; causal conv with silu (PyTorch conv truncated to seqlen,
+        # or causal_conv1d_fn); x_proj then splits into dt, B, C; dt projected by dt_proj weight; B, C reshaped to
+        # (b, d_state, l); selective_scan_fn with z gating, D, dt bias and softplus, returning and copying the last state into
+        # ssm_state when caching. Finally applies out_proj on (b, l, local d).
+        # Inputs: hidden_states (b, l, d_model) tensor. Outputs: tensor (b, l, d_model).
+        # Exceptions: AssertionError if activation is not silu/swish or layer_idx missing when caching.
+        # Side effects: mutates the attached store and cached states; TP all-reduce in row-parallel projections; CUDA kernels.
+        # KNOWN ISSUE: x/z split uses d_inner / 2 for any TP size above 1, correct only for TP 2.
         """
         hidden_states: (B, L, D)
         Returns: same shape as hidden_states
@@ -308,6 +357,17 @@ class Mamba(nn.Module, AttachableStore):
         conv_state: torch.Tensor,
         ssm_state: torch.Tensor,
     ):
+        # [FUNCTION DOC]
+        # Behavior: single-token recurrent decode. Asserts seqlen 1, projects with in_proj, splits interleaved x and z
+        # (same TP width rule as forward). Conv step: without causal_conv1d_update rolls conv_state left, writes x in the
+        # last slot, dot-products with conv weights, adds bias and applies silu; otherwise uses the fused update. Computes
+        # dt, B, C from x_proj, dt projected by dt_proj weight (bias added later), A from A_log. SSM step: without Triton
+        # kernel applies softplus(dt + bias), discretises dA = exp(dt A) and dB = dt B, updates ssm_state in place, reads
+        # out y = state contracted with C plus D times x, gated by silu(z); otherwise selective_state_update. Applies out_proj.
+        # Inputs: hidden_states (b, 1, d_model); conv_state (b, local d, d_conv); ssm_state (b, local d, d_state).
+        # Outputs: tuple of output (b, 1, d_model), conv_state, ssm_state (same objects, updated).
+        # Exceptions: AssertionError if seqlen is not 1. Side effects: in-place state updates; TP all-reduce; CUDA kernels.
+        # KNOWN ISSUE: same TP split width issue as forward (d_inner / 2 for TP above 2).
         batch_size, seqlen, dim = hidden_states.shape
         dtype = hidden_states.dtype
         assert seqlen == 1, "Only support decoding with 1 token at a time for now"
@@ -371,6 +431,14 @@ class Mamba(nn.Module, AttachableStore):
         return out.unsqueeze(1), conv_state, ssm_state
 
     def _get_states_from_cache(self, batch_size: int, initialize_states: bool = False):
+        # [FUNCTION DOC]
+        # HELPER: fetches or allocates this layer's decoding states from the attached store.
+        # Behavior: asserts layer_idx set; if the store's memory list is empty allocates zero conv_state (b, local d,
+        # d_conv) in conv weight dtype/device and zero ssm_state (b, local d, d_state) in dt_proj weight dtype/device, and
+        # stores the pair; otherwise returns the stored pair, zeroing them if initialize_states.
+        # Inputs: batch_size (int); initialize_states (bool, default False). Outputs: tuple (conv_state, ssm_state).
+        # Exceptions: AssertionError if layer_idx is None. Side effects: writes into the store; allocates CUDA memory.
+        # KNOWN ISSUE: reused states are not resized if batch size changes between generations (noted TODO).
         assert self.layer_idx is not None
 
         store = self.get_local_store()
@@ -401,12 +469,20 @@ class Mamba(nn.Module, AttachableStore):
 
 
 class Embedding(nn.Module, AttachableStore):
+    # [CLASS DOC]
+    # Token embedding pipeline stage: wraps a TensorParallelEmbedding (vocab_size by d_model, padding_idx pad_token_id,
+    # vocab sharded across TP) and tracks past_length in an attachable generation store.
+    # Attributes: token_embedding, pg (TP group).
     def __init__(
         self,
         tp_pg: dist.ProcessGroup,
         config: MambaModelConfig,
         parallel_config: Optional[ParallelismArgs],
     ):
+        # [FUNCTION DOC]
+        # Behavior: builds the TP embedding with mode from parallel_config (ALL_REDUCE if None) and stores tp_pg.
+        # Inputs: tp_pg; config (MambaModelConfig); parallel_config (optional). Outputs: None.
+        # Exceptions: None explicitly raised. Side effects: parameter allocation.
         super().__init__()
         self.token_embedding = TensorParallelEmbedding(
             num_embeddings=config.vocab_size,
@@ -418,6 +494,12 @@ class Embedding(nn.Module, AttachableStore):
         self.pg = tp_pg
 
     def forward(self, input_ids: torch.Tensor, input_mask: torch.Tensor):  # [batch_size, seq_length]
+        # [FUNCTION DOC]
+        # Behavior: if a store is attached, updates store past_length by adding the count of unmasked tokens per sequence
+        # (starting from zeros); then embeds input_ids (batch-first, no transpose).
+        # Inputs: input_ids (b, l int tensor); input_mask (b, l bool/int tensor).
+        # Outputs: dictionary with input_embeds (b, l, d_model).
+        # Exceptions: None explicitly raised. Side effects: store mutation; TP collective inside the embedding.
         store = self.get_local_store()
         if store is not None:
             if "past_length" in store:
@@ -436,6 +518,10 @@ class Embedding(nn.Module, AttachableStore):
 
 
 class MambaDecoderLayer(nn.Module):
+    # [CLASS DOC]
+    # One residual block: pre-norm (RMSNorm or LayerNorm, optionally fused with the residual add) followed by the Mamba
+    # mixer. Pipeline stage taking and returning hidden_states, sequence_mask and residual.
+    # Attributes: layer_idx, residual_in_fp32, fused_add_norm, mixer (Mamba built with ssm_cfg kwargs), norm.
     def __init__(
         self,
         config: MambaModelConfig,
@@ -445,6 +531,13 @@ class MambaDecoderLayer(nn.Module):
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: uses config.ssm_cfg (empty dict if None) as extra Mamba kwargs; builds the mixer and the norm
+        # (LayerNorm when rms_norm is False else Triton RMSNorm) with eps rms_norm_eps on device/dtype; when fused_add_norm
+        # asserts RMSNorm imported and the norm type is supported.
+        # Inputs: config (MambaModelConfig); parallel_config (optional); tp_pg; layer_idx (int); device, dtype (optional).
+        # Outputs: None. Exceptions: AssertionError for missing RMSNorm with fused_add_norm; TypeError if RMSNorm is None and
+        # rms_norm set. Side effects: parameter allocation, RNG use in mixer init.
         super().__init__()
 
         factory_kwargs = {"device": device, "dtype": dtype}
@@ -485,6 +578,13 @@ class MambaDecoderLayer(nn.Module):
         sequence_mask: Union[torch.Tensor, TensorPointer],
         residual: Optional[Union[torch.Tensor, TensorPointer]],
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
+        # [FUNCTION DOC]
+        # Behavior: unfused: residual becomes hidden_states at layer 0 else hidden_states plus residual; normalises it (in norm
+        # weight dtype); optionally casts residual to fp32. Fused: calls rms_norm_fn or layer_norm_fn with prenorm, returning
+        # normalised states and updated residual (residual ignored at layer 0). Then runs the mixer.
+        # Inputs: hidden_states (b, l, d_model); sequence_mask (b, l, passed through unused); residual (b, l, d_model or None).
+        # Outputs: dictionary with hidden_states (mixer output), sequence_mask, residual.
+        # Exceptions: None explicitly raised. Side effects: TP collectives in the mixer.
         if not self.fused_add_norm:
             # self.layer_idx was assigned when calling create_block
             # residual=None happens only at the first block
@@ -513,6 +613,11 @@ class MambaDecoderLayer(nn.Module):
 
 
 class MambaModel(nn.Module):
+    # [CLASS DOC]
+    # Pipeline-parallel Mamba backbone plus LM head. Holds a P2P helper on the PP group and PipelineBlocks for
+    # token_position_embeddings (Embedding), decoder (one MambaDecoderLayer per layer, dtype from config.dtype),
+    # final_layer_norm (RMSNorm taking x and residual), lm_head (TensorParallelColumnLinear producing vocab-sharded logits),
+    # and cast_to_fp32. Attributes also include config, parallel_config, parallel_context, tp_mode.
     def __init__(
         self,
         config: MambaModelConfig,
@@ -520,6 +625,12 @@ class MambaModel(nn.Module):
         parallel_config: Optional[ParallelismArgs],
         random_states: Optional[RandomStates] = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: creates the P2P on CUDA, resolves tp_mode and async flag (defaults ALL_REDUCE/False), and declares the
+        # pipeline blocks listed in the class doc with their input/output keys (blocks are built lazily on their PP rank).
+        # Inputs: config (MambaModelConfig); parallel_context; parallel_config (optional); random_states (optional, unused).
+        # Outputs: None. Exceptions: None explicitly raised. Side effects: none beyond object creation.
+        # KNOWN ISSUE: final_layer_norm always uses RMSNorm regardless of config.rms_norm and ignores config dtype.
         super().__init__()
 
         # Declare all the nodes
@@ -602,6 +713,10 @@ class MambaModel(nn.Module):
         input_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
         input_mask: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
     ):
+        # [FUNCTION DOC]
+        # Behavior: returns only the fp32 sharded logits from forward_with_hidden_states.
+        # Inputs: input_ids, input_mask ((b, l) tensors or TensorPointers). Outputs: logits (b, l, local vocab) or TensorPointer.
+        # Exceptions: None explicitly raised. Side effects: pipeline P2P sends/receives, TP collectives.
         return self.forward_with_hidden_states(input_ids=input_ids, input_mask=input_mask)[0]
 
     def forward_with_hidden_states(
@@ -609,8 +724,14 @@ class MambaModel(nn.Module):
         input_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
         input_mask: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
     ):
+        # [FUNCTION DOC]
+        # Behavior: embeds tokens, seeds both hidden_states and residual with the embeddings, runs every decoder block, applies
+        # final_layer_norm on hidden_states plus residual, computes sharded logits with lm_head and casts them to fp32.
+        # Inputs: input_ids, input_mask (tensors on the first PP rank, TensorPointers elsewhere).
+        # Outputs: tuple of fp32 sharded logits and final hidden states (tensors or TensorPointers depending on rank).
+        # Exceptions: None explicitly raised. Side effects: P2P communication between PP stages, TP collectives.
         # all tensors are optional as most ranks don't need anything from the dataloader.
-
+        #
         output = self.token_position_embeddings(input_ids=input_ids, input_mask=input_mask)
 
         hidden_encoder_states = {
@@ -633,6 +754,10 @@ class MambaModel(nn.Module):
         return fp32_sharded_logits, hidden_states
 
     def get_block_compute_costs(self):
+        # [FUNCTION DOC]
+        # Behavior: placeholder costs for pipeline load balancing: MambaDecoderLayer 1, TensorParallelColumnLinear 0; logs on
+        # rank 0 that it is not implemented. Inputs: none. Outputs: dictionary mapping module classes to costs.
+        # Exceptions: None. Side effects: logging.
         """Computes the compute cost of each block in the model so that we can do a better job of load balancing."""
         # model_config = self.config
         # d_ff = model_config.intermediate_size
@@ -660,6 +785,15 @@ class MambaModel(nn.Module):
         return block_compute_costs
 
     def get_flops_per_sec(self, iteration_time_in_sec, sequence_length, global_batch_size):
+        # [FUNCTION DOC]
+        # Behavior: estimates model TFLOPs per second per GPU. Reads expand, d_state, dt_rank from ssm_cfg with defaults
+        # (2, 16, ceil of d_model / 16). Per layer forward flops: scan 9 * l * d_state * d_model, in_proj, x_proj, dt_proj,
+        # out_proj matmuls (2 flops per MAC); plus the vocab projection. Backward is twice forward. Divides total times
+        # global_batch_size by iteration time, world size and 1e12. Hardware flops are reported as 0.
+        # Inputs: iteration_time_in_sec (float); sequence_length (int); global_batch_size (int).
+        # Outputs: tuple (model TFLOPs per second, 0).
+        # Exceptions: TypeError if ssm_cfg is None. Side effects: None.
+        # KNOWN ISSUE: fails when ssm_cfg is None (membership test on None); scan term uses d_model rather than d_inner.
         """
         Get flops per second for a Mamba model.
         Terms such as nonlinearities, biases, and layer normalization are omitted (https://arxiv.org/pdf/2001.08361.pdf)
@@ -722,12 +856,22 @@ class MambaModel(nn.Module):
 
 
 def masked_mean(loss, label_mask, dtype):
+    # [FUNCTION DOC]
+    # HELPER: mean of loss over masked positions.
+    # Behavior: sums loss times label_mask in the given dtype and divides by the mask count.
+    # Inputs: loss (b, l tensor); label_mask (b, l bool/int); dtype (torch dtype). Outputs: scalar tensor.
+    # Exceptions: None (division by zero yields nan/inf). Side effects: None.
     # type: (Tensor, Tensor, torch.dtype) -> Tensor
     return (loss * label_mask).sum(dtype=dtype) / label_mask.sum()
 
 
 class Loss(nn.Module):
+    # [CLASS DOC]
+    # Pipeline stage computing the language-model loss from vocab-sharded logits using sharded_cross_entropy over the TP
+    # group, then masked mean. Attribute: tp_pg.
     def __init__(self, tp_pg: dist.ProcessGroup):
+        # [FUNCTION DOC]
+        # Behavior: stores tp_pg. Inputs: tp_pg (process group). Outputs: None. Exceptions: None. Side effects: None.
         super().__init__()
         self.tp_pg = tp_pg
 
@@ -737,14 +881,20 @@ class Loss(nn.Module):
         label_ids: torch.Tensor,  # [batch_size, seq_length]
         label_mask: torch.Tensor,  # [batch_size, seq_length]
     ) -> Dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Behavior: per-token fp32 cross entropy across vocab shards (TP collectives), then masked_mean in fp32.
+        # Inputs: sharded_logits (b, l, local vocab); label_ids (b, l); label_mask (b, l).
+        # Outputs: dictionary with loss (scalar tensor).
+        # Exceptions: None explicitly raised. Side effects: TP all-reduce communications.
+        # KNOWN ISSUE: the inline shape comment says sharded_logits is sequence-first, but the code treats it batch-first.
         # Megatron by defaults cast everything in fp32. `--f16-lm-cross-entropy` is an option you can use to keep current precision.
         # https://github.com/NVIDIA/Megatron-LM/blob/f267e6186eae1d6e2055b412b00e2e545a8e896a/megatron/model/gpt_model.py#L38
-
+        #
         # NOTE(fmom): undo transpose for now since Mamba is not using TP
         # loss = sharded_cross_entropy(
         #     sharded_logits, label_ids.transpose(0, 1).contiguous(), group=self.tp_pg, dtype=torch.float
         # ).transpose(0, 1)
-
+        #
         loss = sharded_cross_entropy(sharded_logits, label_ids, group=self.tp_pg, dtype=torch.float)
 
         # TODO @thomasw21: It's unclear what kind of normalization we want to do.
@@ -755,6 +905,10 @@ class Loss(nn.Module):
 
 
 class MambaForTraining(NanotronModel):
+    # [CLASS DOC]
+    # NanotronModel wrapper used for training: MambaModel plus a Loss PipelineBlock sharing its P2P. Provides the hooks the
+    # trainer expects: forward returning a loss dict, parameter groups without weight decay, random init, tied embedding
+    # names, block costs and flops. Attributes: parallel_context, config, parallel_config, model, loss.
     def __init__(
         self,
         config: MambaModelConfig,
@@ -762,6 +916,10 @@ class MambaForTraining(NanotronModel):
         parallel_config: Optional[ParallelismArgs],
         random_states: Optional[RandomStates] = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: stores contexts/config, builds MambaModel and the Loss block (inputs sharded_logits, label_ids, label_mask).
+        # Inputs: config (MambaModelConfig); parallel_context; parallel_config (optional); random_states (optional).
+        # Outputs: None. Exceptions: None explicitly raised. Side effects: object construction only.
         super().__init__()
 
         self.parallel_context = parallel_context
@@ -794,6 +952,11 @@ class MambaForTraining(NanotronModel):
         label_ids: Union[torch.Tensor, TensorPointer],
         label_mask: Union[torch.Tensor, TensorPointer],
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
+        # [FUNCTION DOC]
+        # Behavior: runs the model to get sharded logits, then the loss block.
+        # Inputs: input_ids, input_mask, label_ids, label_mask ((b, l) tensors or TensorPointers).
+        # Outputs: dictionary with loss (tensor on the last PP rank, TensorPointer elsewhere).
+        # Exceptions: None explicitly raised. Side effects: PP and TP communication.
         sharded_logits = self.model(
             input_ids=input_ids,
             input_mask=input_mask,
@@ -806,6 +969,12 @@ class MambaForTraining(NanotronModel):
         return {"loss": loss}
     
     def get_named_params_without_weight_decay(self):
+        # [FUNCTION DOC]
+        # Behavior: returns names of model parameters containing "A_log" or the letter "D" (SSM parameters excluded from
+        # weight decay). Inputs: none. Outputs: list of names (relative to self.model, not prefixed with "model.").
+        # Exceptions: None. Side effects: None.
+        # KNOWN ISSUE: substring match on "D" catches any name with an uppercase D; names lack the "model." prefix that
+        # full parameter names carry, which may cause mismatches with callers using full names.
         # get full name with "A_log", "D"
         named_param_without_weight_decay = []
         for name, _ in self.model.named_parameters():
@@ -815,6 +984,23 @@ class MambaForTraining(NanotronModel):
 
     @torch.no_grad()
     def init_model_randomly(self, config):
+        # [FUNCTION DOC]
+        # Behavior (no grad): builds a map from module id to name prefix; reads initializer_range, n_residuals_per_layer,
+        # num_hidden_layers, rescale_prenorm_residual, d_model and, if ssm_cfg is set, dt_init, dt_rank, dt_scale. For each
+        # parameter (must be a NanotronParameter) resolves its full name (tied params use their tied full name) and skips
+        # already initialised ones, then by owning module type: TP column/row linear weights get Kaiming uniform (a sqrt 5),
+        # out_proj weights additionally divided by sqrt of n_residuals_per_layer times layers when rescaling; Conv1d and
+        # Linear weights Kaiming uniform and biases uniform within 1 / sqrt(fan_in); for Linear (dt_proj) with ssm_cfg the
+        # weight is then reset to constant or uniform with std dt_rank to the minus one half times dt_scale; TP embedding
+        # normal with initializer_range; RMSNorm/LayerNorm weight 1, bias 0; parameters owned directly by Mamba (A_log, D)
+        # keep their constructor values. Finally asserts the initialised set equals all parameter names.
+        # Inputs: config (full MambaConfig with model.init_method a MambaInit). Outputs: None.
+        # Exceptions: ValueError for unexpected linear bias or unknown parameter names; NotImplementedError for unknown dt_init;
+        # Exception for parameters of unhandled modules; AssertionError for non-Nanotron params or set mismatch; KeyError if
+        # ssm_cfg lacks dt keys.
+        # Side effects: overwrites parameter values in place; consumes RNG.
+        # KNOWN ISSUE: the Linear branch reinitialises dt_proj bias uniformly, discarding the inverse-softplus dt bias set
+        # in Mamba.__init__; the dt-specific weight init runs for both weight and bias iterations.
         model = self
         initialized_parameters = set()
 
@@ -938,6 +1124,9 @@ class MambaForTraining(NanotronModel):
 
     @staticmethod
     def get_embeddings_lm_head_tied_names():
+        # [FUNCTION DOC]
+        # Behavior: returns the two full names of the token embedding weight and lm_head weight to tie.
+        # Inputs: none (static). Outputs: list of two strings. Exceptions: None. Side effects: None.
         return [
             "model.token_position_embeddings.pp_block.token_embedding.weight",
             "model.lm_head.pp_block.weight",
@@ -945,10 +1134,16 @@ class MambaForTraining(NanotronModel):
 
     # TODO(fmom): implement get_block_compute_costs
     def get_block_compute_costs(self):
+        # [FUNCTION DOC]
+        # Behavior: delegates to MambaModel.get_block_compute_costs. Outputs: dictionary of class to cost.
+        # Exceptions: None. Side effects: logging.
         """Computes the compute cost of each block in the model so that we can do a better job of load balancing."""
         return self.model.get_block_compute_costs()
 
     # TODO(fmom): implement get_flops_per_sec
     def get_flops_per_sec(self, iteration_time_in_sec, sequence_length, global_batch_size):
+        # [FUNCTION DOC]
+        # Behavior: delegates to MambaModel.get_flops_per_sec with the same arguments.
+        # Outputs: tuple (model TFLOPs/s, hardware TFLOPs/s). Exceptions: as delegate. Side effects: None.
         """Get flops per second for a given model"""
         return self.model.get_flops_per_sec(iteration_time_in_sec, sequence_length, global_batch_size)

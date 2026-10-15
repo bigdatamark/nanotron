@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Purpose: builds the training DataLoader for Nanoset datasets (pre-tokenised datatrove shards).
+# Main contents: build_nanoset_dataloader.
+# Fits in nanotron: the Nanoset counterpart of get_train_dataloader in nanotron.data.dataloader.
+# Import-time side effects: creates a module logger.
 from torch.utils.data import DataLoader
 
 import nanotron.distributed as dist
@@ -31,8 +36,22 @@ def build_nanoset_dataloader(
     use_position_ids: bool = True,
     use_doc_masking: bool = True,
 ) -> DataLoader:
-
+    # [FUNCTION DOC]
+    # Summary: wraps a Nanoset in a DataLoader with the CLM collators and a non-shuffling DP-aware sampler.
+    # Behavior: on pipeline ranks owning neither inputs nor labels, replace the dataset by EmptyInfiniteDataset of the
+    # same length and use 0 workers. Choose DataCollatorForCLMWithPositionIds (forwarding use_doc_masking) when
+    # use_position_ids, else DataCollatorForCLM. Build a sampler with get_sampler for the DP rank/size, drop_last,
+    # consumed_train_samples and shuffle disabled (Nanoset is already shuffled). Return a DataLoader with batch size
+    # micro_batch_size, pin memory, worker init per DP rank and persistent workers when workers > 0.
+    # Inputs: dataset (Nanoset), sequence_length, parallel_context, input_pp_rank, output_pp_rank, micro_batch_size,
+    # dataloader_num_workers, consumed_train_samples (default 0, used to skip already-seen samples on resume),
+    # dataloader_drop_last (default True), dataloader_pin_memory (default True), use_position_ids (default True),
+    # use_doc_masking (default True).
+    # Outputs: torch DataLoader.
+    # Exceptions: None explicitly raised.
+    # Side effects: None.
     # Case of ranks not requiring data. We give them a dummy dataset, then the collator will do his job
+
     if dist.get_rank(parallel_context.pp_pg) not in [input_pp_rank, output_pp_rank]:
         dataset_length = len(dataset)
         dataset = EmptyInfiniteDataset(length=dataset_length)

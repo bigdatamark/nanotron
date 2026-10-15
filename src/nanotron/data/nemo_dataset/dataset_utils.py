@@ -1,3 +1,8 @@
+# [MODULE DOC]
+# Purpose: utilities for the NeMo/Megatron dataset port: compiling the C++ helpers, parsing weighted data prefixes,
+# and computing train/valid/test document splits.
+# Main contents: compile_helper, get_datasets_weights_and_num_samples, get_train_valid_test_split_.
+# Import-time side effects: creates a module logger.
 # Copyright (c) 2022, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -23,6 +28,11 @@ logger = logging.get_logger(__name__)
 
 
 def compile_helper():
+    # [FUNCTION DOC]
+    # HELPER: builds the C++ helpers extension by running make in this package directory; should run on one process.
+    # Inputs: None. Outputs: None.
+    # Exceptions: SystemExit (exit code 1) if make fails.
+    # Side effects: spawns a subprocess, writes the compiled module next to the sources, logs on failure.
     """Compile helper function ar runtime. Make sure this
     is invoked on a single process."""
 
@@ -38,6 +48,15 @@ def compile_helper():
 def get_datasets_weights_and_num_samples(
     data_prefix: List[str], num_samples: Union[int, List[int]]
 ) -> Tuple[List[str], List[float], List[int]]:
+    # [FUNCTION DOC]
+    # Summary: parses an alternating list of weights and prefixes and computes per-dataset sample counts.
+    # Behavior: require an even-length list; read weight at even positions (as float) and stripped prefix at odd ones;
+    # normalise weights (sum must be positive). For each weight, the sample count is the ceiling of num_samples times
+    # weight times 1.005 (0.5 percent margin); if num_samples is a list (train/valid/test), do it per element.
+    # Inputs: data_prefix (list of strings), num_samples (int or list of ints).
+    # Outputs: tuple (prefixes, normalised weights, per-dataset sample counts as ints or lists of ints).
+    # Exceptions: ValueError for odd length or non-positive weight sum.
+    # Side effects: None.
     """Return tuple of:
     - list of prefixes
     - list of associated normalized weights
@@ -77,6 +96,17 @@ def get_datasets_weights_and_num_samples(
 
 
 def get_train_valid_test_split_(splits_string: str, size: int) -> Tuple[int]:
+    # [FUNCTION DOC]
+    # Summary: converts a split string such as "969,30,1" or "98/1/1" into four document boundaries for a dataset of size.
+    # Behavior: split on commas, else slashes, else treat as one value; require exactly three values; normalise to
+    # fractions; cumulative boundaries use rounded fraction times size; then shift all boundaries after the first by the
+    # overshoot so the last equals size.
+    # Inputs: splits_string (string), size (number of documents).
+    # Outputs: list of four ints, starting at 0 and ending at size.
+    # Exceptions: ValueError if not exactly three values; AssertionError if the sum is not positive.
+    # Side effects: None.
+    # KNOWN ISSUE: padding to three values with zeros is dead code because fewer than three values already raised.
+    # KNOWN ISSUE: the return annotation says a tuple but a list is returned.
     """Get dataset splits from comma or '/' separated string list."""
 
     splits = []

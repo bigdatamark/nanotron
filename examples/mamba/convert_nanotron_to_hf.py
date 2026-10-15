@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Purpose: script converting a nanotron Mamba checkpoint (as produced by training or by
+# convert_hf_to_nanotron) back to HuggingFace transformers MambaForCausalLM format, then smoke-testing it by
+# generating text. Contents: convert_checkpoint_and_save, check_converted_model_generation, main block
+# (parses --checkpoint_path and --save_path, converts, then generates). Run with torchrun, single process.
+# Side effects: CUDA use, distributed init, file reads/writes, stdout prints, possible tokenizer download.
 # ruff: noqa: E402
 """
 Converts a nanotron model to HF format
@@ -28,6 +34,22 @@ logger = logging.get_logger(__name__)
 
 
 def convert_checkpoint_and_save(checkpoint_path: Path, save_path: Path):
+    # [FUNCTION DOC]
+    # Behavior:
+    # 1. Reads tokenizer name from checkpoint_path/config.yaml and MambaModelConfig from model_config.json;
+    #    dtype comes from model_config.dtype.
+    # 2. Builds a 1x1x1 ParallelismArgs/ParallelContext, constructs MambaForTraining on CUDA, marks tied params,
+    #    loads the checkpoint weights, keeps only its state dict and deletes the model.
+    # 3. Builds an HF MambaConfig from the nanotron config (vocab, layers, residual_in_fp32, eps, hidden size,
+    #    plus SSM fields d_state, expand, d_conv, bias, conv_bias, dt_rank, dt_scale, dt_min, dt_max, dt_init,
+    #    dt_init_floor when ssm_cfg is given) and instantiates MambaForCausalLM on device and dtype.
+    # 4. Maps each HF parameter to its nanotron name (prefixed with "model."), un-interleaves in_proj rows with the
+    #    inverse permutation, and copies into the HF parameter without grad.
+    # 5. Saves the HF model and the tokenizer to save_path, printing progress.
+    # Inputs: checkpoint_path (Path to nanotron checkpoint dir); save_path (Path output dir).
+    # Outputs: None. Exceptions: KeyError for missing config keys or unmapped parameters; file errors.
+    # Side effects: initialises torch.distributed via ParallelContext (requires a single-rank launch), CUDA
+    # allocations, disk writes, network access for the tokenizer, stdout prints.
     device = torch.device("cuda")
 
     with open(checkpoint_path / "config.yaml", "r") as f:
@@ -131,6 +153,11 @@ def convert_checkpoint_and_save(checkpoint_path: Path, save_path: Path):
         hf_to_nanotron[f"backbone.layers.{i}.norm.weight"] = f"decoder.{i}.pp_block.norm.weight"
 
     def _reverse_interleave_pattern(N):
+        # [FUNCTION DOC]
+        # HELPER: inverse of the interleave permutation used in convert_hf_to_nanotron.
+        # Behavior: computes the interleave pattern P of size N and returns R with R at position P[k] equal to k,
+        # so indexing nanotron rows by R restores HF order (8 gives 0, 2, 4, 6, 1, 3, 5, 7).
+        # Inputs: N (even int). Outputs: list of N ints. Exceptions: AssertionError if N is odd. Side effects: None.
         """
         Compute the reverse of the interleave pattern given by _interleave_pattern.
         Example:
@@ -140,6 +167,9 @@ def convert_checkpoint_and_save(checkpoint_path: Path, save_path: Path):
         assert N % 2 == 0, "N must be even"
 
         def __interleave_pattern(N):
+            # [FUNCTION DOC]
+            # HELPER: forward interleave permutation: for each i below N/2 emits i then i + N/2.
+            # Inputs: N (even int). Outputs: list of ints. Exceptions: AssertionError if N is odd. Side effects: None.
             """
             interleave_pattern(4) -> [0, 2, 1, 3]
             interleave_pattern(8) -> [0, 4, 1, 5, 2, 6, 3, 7]
@@ -182,6 +212,12 @@ def convert_checkpoint_and_save(checkpoint_path: Path, save_path: Path):
 
 
 def check_converted_model_generation(save_path: Path):
+    # [FUNCTION DOC]
+    # HELPER: smoke test of the converted model.
+    # Behavior: loads tokenizer and MambaForCausalLM (CPU) from save_path, tokenizes the fixed prompt
+    # "What is your ", prints decoded inputs, greedily generates 100 new tokens and prints the decoded output.
+    # Inputs: save_path (Path). Outputs: None. Exceptions: None explicitly raised.
+    # Side effects: disk reads, stdout prints.
     HARCODED_PROMPT = "What is your "
 
     tokenizer = AutoTokenizer.from_pretrained(save_path)

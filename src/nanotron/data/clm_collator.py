@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Purpose: batch collators for causal language modelling that turn a list of tokenised samples of length
+# sequence_length + 1 into model inputs/labels, aware of pipeline and context parallelism.
+# Main contents: DataCollatorForCLM (input_ids/input_mask/label_ids/label_mask) and
+# DataCollatorForCLMWithPositionIds (input_ids/position_ids/label_ids/label_mask, with document masking).
+# Parallel semantics shared by both: only the pipeline rank holding the first stage (input_pp_rank) gets real
+# inputs and only the rank holding the last stage (output_pp_rank) gets real labels; every other entry is a
+# TensorPointer naming the pipeline rank that owns the data. With context parallelism of size cp_size, each CP rank
+# keeps the contiguous slice of the sequence from cp_rank times sequence_length divided by cp_size up to the next
+# such boundary. Outputs are numpy arrays (conversion to torch happens later in sanity_check_dataloader).
 import dataclasses
 from typing import Dict, List, Union
 
@@ -11,6 +21,11 @@ from nanotron.parallel.pipeline_parallel.tensor_pointer import TensorPointer
 
 @dataclasses.dataclass
 class DataCollatorForCLM:
+    # [CLASS DOC]
+    # Purpose: callable dataclass collator for plain CLM training.
+    # Attributes: sequence_length (int, model sequence length; samples must have one extra token), input_pp_rank and
+    # output_pp_rank (pipeline ranks owning inputs and labels), parallel_context (ParallelContext giving pp_pg and cp_pg),
+    # use_numpy (bool, default True; choose numpy or torch for stacking and the input mask).
     """
     Data collator used for causal language modeling.
 
@@ -28,6 +43,27 @@ class DataCollatorForCLM:
 
     @torch.profiler.record_function("DataCollatorForCLM.__call__")
     def __call__(self, examples: List[Dict[str, List[np.ndarray]]]) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
+        # [FUNCTION DOC]
+        # Summary: collates examples into a dictionary of input_ids, input_mask, label_ids and label_mask.
+        # Behavior:
+        #   1. Determine this rank's pipeline rank. If it owns neither inputs nor labels, assert all examples are empty and
+        #      return four TensorPointers (inputs pointing to input_pp_rank, labels to output_pp_rank).
+        #   2. Vertically stack the input_ids of all examples into a batch by (sequence_length + 1) array; assert the length.
+        #   3. Start every field as a TensorPointer.
+        #   4. On the input rank: input_ids drops the last token; input_mask is all True; both are then cut to the CP slice.
+        #   5. On the output rank: label_ids drops the first token. If examples carry "positions", stack them, drop the first
+        #      column and set label_mask False where that shifted position equals 0 (the label that crosses into a new
+        #      document), True elsewhere; otherwise label_mask is all True. Both cut to the CP slice.
+        #   6. Validate that non-pointer input_ids and label_ids have length sequence_length divided by cp_size.
+        # Inputs: examples, list of dictionaries each with "input_ids" (1-D array of sequence_length + 1 tokens) and optionally
+        # "positions"; empty dictionaries on non-data ranks.
+        # Outputs: dictionary mapping the four names to arrays of shape batch by local sequence length (bool masks,
+        # integer ids) or TensorPointers.
+        # Exceptions: AssertionError for non-empty examples on non-data ranks or a wrong sample length; ValueError when the
+        # resulting length mismatches.
+        # Side effects: queries process-group ranks; recorded under a torch profiler range.
+        # KNOWN ISSUE: the positions stacking and label_mask always use numpy even when use_numpy is False.
+        # KNOWN ISSUE: the error message for a wrong input_ids length says "labels" instead of "input_ids".
 
         vstack = np.vstack if self.use_numpy else torch.vstack
         ones = np.ones if self.use_numpy else torch.ones
@@ -136,6 +172,12 @@ class DataCollatorForCLM:
 
 @dataclasses.dataclass
 class DataCollatorForCLMWithPositionIds:
+    # [CLASS DOC]
+    # Purpose: callable dataclass collator for CLM with explicit position ids (packed documents, document masking).
+    # Attributes: sequence_length, input_pp_rank, output_pp_rank, parallel_context (as DataCollatorForCLM);
+    # use_doc_masking (bool, default True; use the samples' "positions" for position_ids and label masking);
+    # cp_return_global_position_ids (bool, default True; when True every CP rank keeps the full-length position_ids
+    # rather than only its slice).
     """
     Data collator used for causal language modeling with position IDs.
 
@@ -152,6 +194,26 @@ class DataCollatorForCLMWithPositionIds:
     cp_return_global_position_ids: bool = True
 
     def __call__(self, examples: List[Dict[str, List[np.ndarray]]]) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
+        # [FUNCTION DOC]
+        # Summary: collates examples into input_ids, position_ids, label_ids and label_mask.
+        # Behavior:
+        #   1. Non-data pipeline ranks: assert examples are empty, return TensorPointers.
+        #   2. Stack input_ids, check length sequence_length + 1, initialise all fields as TensorPointers.
+        #   3. Input rank: input_ids drops the last token. If examples have "positions" and use_doc_masking is set, positions
+        #      are the stacked positions without their last column; otherwise 0 to sequence_length - 1 repeated per row.
+        #      input_ids is cut to the CP slice; positions is cut too only when cp_return_global_position_ids is False.
+        #      The result is stored under position_ids.
+        #   4. Output rank: label_ids drops the first token; label_mask is False where the next-token position equals 0
+        #      (when positions and use_doc_masking are present), else all True; both cut to the CP slice.
+        #   5. Shape validation (see known issue).
+        # Inputs: examples as for DataCollatorForCLM.
+        # Outputs: dictionary of numpy arrays or TensorPointers.
+        # Exceptions: AssertionError for non-empty examples on non-data ranks or wrong sample length; NameError (see issue).
+        # Side effects: queries process-group ranks.
+        # KNOWN ISSUE: cp_rank and cp_size are only defined in the input-rank branch, so on an output rank that is not also
+        # the input rank (pipeline parallel size above 1) slicing labels raises NameError.
+        # KNOWN ISSUE: the non-data-rank early return uses the key "positions" while data ranks return "position_ids".
+        # KNOWN ISSUE: shape validation checks for torch.Tensor but the values are numpy arrays, so it never runs.
         # Process the case when current rank doesn't require data
         current_pp_rank = dist.get_rank(self.parallel_context.pp_pg)
         if current_pp_rank not in [self.input_pp_rank, self.output_pp_rank]:

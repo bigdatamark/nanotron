@@ -1,3 +1,12 @@
+# [MODULE DOC]
+# Purpose: autograd wrappers around the CUDA selective-scan (Mamba SSM) and causal conv1d kernels, adapted
+# from the original mamba_ssm package (Tri Dao, Albert Gu) with tensor-parallel awareness for nanotron's Mamba
+# example. Contents: SelectiveScanFn and selective_scan_fn (fused scan), selective_scan_ref (pure PyTorch
+# reference), MambaInnerFn and mamba_inner_fn (fused conv1d + x_proj + delta projection + scan + gating,
+# TP-aware, without out_proj), mamba_inner_ref (reference including out_proj).
+# Notation: b batch, d channels (d_inner, possibly TP-local), l sequence length, n / dstate state size.
+# Import-time side effects: imports compiled extensions causal_conv1d_cuda and selective_scan_cuda (ImportError
+# if not installed).
 # Copyright (c) 2023, Tri Dao, Albert Gu.
 
 import causal_conv1d_cuda
@@ -10,6 +19,10 @@ from torch.cuda.amp import custom_bwd, custom_fwd
 
 
 class SelectiveScanFn(torch.autograd.Function):
+    # [CLASS DOC]
+    # torch.autograd.Function running the selective scan with the selective_scan_cuda kernel.
+    # Context state saved in forward: squeeze_B / squeeze_C flags (B or C were 3-D and got a group axis added),
+    # delta_softplus, has_z, and the tensors needed for backward (inputs, scan intermediates x, and out when z given).
     @staticmethod
     def forward(
         ctx,
@@ -24,6 +37,16 @@ class SelectiveScanFn(torch.autograd.Function):
         delta_softplus=False,
         return_last_state=False,
     ):
+        # [FUNCTION DOC]
+        # Behavior: makes u, delta, B, C, z contiguous in the last dim (D always contiguous); adds a group axis of size 1
+        # to 3-D B or C; calls selective_scan_cuda.fwd; extracts the last state from the odd positions of the last
+        # chunk of x; saves tensors for backward (including out when z is present); returns out, or the z-gated output
+        # when z is given, optionally with last_state.
+        # Inputs: ctx; u (b, d, l); delta (b, d, l); A (d, n) real or complex; B and C (d, n) or (b, n, l) or (b, g, n, l);
+        # D (optional d); z (optional b, d, l gate); delta_bias (optional d, fp32); delta_softplus (bool, default False);
+        # return_last_state (bool, default False).
+        # Outputs: tensor (b, d, l), or pair of that and last_state (b, d, n).
+        # Exceptions: kernel errors propagate. Side effects: CUDA kernel launch; stores state on ctx.
         if u.stride(-1) != 1:
             u = u.contiguous()
         if delta.stride(-1) != 1:
@@ -56,6 +79,13 @@ class SelectiveScanFn(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, *args):
+        # [FUNCTION DOC]
+        # Behavior: restores saved tensors (z and out None when no gate), makes dout contiguous, calls
+        # selective_scan_cuda.bwd (dz allocated by the kernel, no recompute of out_z), takes dz from the extra
+        # outputs when gated, squeezes the group axis of dB/dC if added in forward, and returns gradients for u, delta,
+        # A, B, C, D (if given), z, delta_bias (if given) and None for the two flags.
+        # Inputs: ctx; dout (gradient of output, b, d, l); extra ignored gradients (for last_state).
+        # Outputs: tuple of 10 gradients. Exceptions: kernel errors propagate. Side effects: CUDA kernel launch.
         if not ctx.has_z:
             u, delta, A, B, C, D, delta_bias, x = ctx.saved_tensors
             z = None
@@ -112,6 +142,10 @@ def selective_scan_fn(
     delta_softplus=False,
     return_last_state=False,
 ):
+    # [FUNCTION DOC]
+    # Behavior: functional entry point applying SelectiveScanFn with the same arguments (see SelectiveScanFn.forward).
+    # Outputs: out, or out with last_state (b, d, n) when return_last_state; last_state receives no gradient.
+    # Exceptions: None explicitly raised. Side effects: CUDA kernel launch.
     """if return_last_state is True, returns (out, last_state)
     last_state has shape (batch, dim, dstate). Note that the gradient of the last state is
     not considered in the backward pass.
@@ -131,6 +165,17 @@ def selective_scan_ref(
     delta_softplus=False,
     return_last_state=False,
 ):
+    # [FUNCTION DOC]
+    # Behavior: pure PyTorch reference of the selective scan. Casts u and delta to float, adds delta_bias and
+    # applies softplus if requested. If A is complex and B/C are input-dependent, views their last axis as
+    # interleaved real/imag pairs; otherwise casts to float. Computes deltaA as exp of delta times A per
+    # (b, d, l, n) and deltaB_u as delta times B times u (B shared, per-batch (b, n, l), or grouped (b, g, n, l)
+    # repeated to d channels). Iterates over time: state x becomes deltaA times x plus deltaB_u; output y is the
+    # contraction of x with C (shared, per-batch or grouped); records the final state; complex y is replaced by
+    # twice its real part. Stacks to (b, d, l), adds u times D if given, multiplies by silu(z) if given, casts back
+    # to the input dtype.
+    # Inputs: same as SelectiveScanFn.forward. Outputs: out (b, d, l) in u's dtype, plus last_state (b, d, n)
+    # when return_last_state. Exceptions: None explicitly raised. Side effects: None.
     """
     u: r(B D L)
     delta: r(B D L)
@@ -199,6 +244,12 @@ def selective_scan_ref(
 
 
 class MambaInnerFn(torch.autograd.Function):
+    # [CLASS DOC]
+    # torch.autograd.Function fusing the inner Mamba mixer path (causal depthwise conv1d with silu, x_proj,
+    # delta projection, selective scan with z gating) for one TP shard; out_proj is applied by the caller
+    # (tensor-parallel row linear). Input xz has x and z interleaved along a size-2 axis per channel (nanotron's
+    # column-parallel layout) rather than concatenated halves.
+    # Context state: d_inner, tp_pg, delta_softplus, checkpoint_lvl, variable-B/C and bias flags, saved tensors.
     @staticmethod
     @custom_fwd
     def forward(
@@ -220,6 +271,23 @@ class MambaInnerFn(torch.autograd.Function):
         delta_softplus=True,
         checkpoint_lvl=1,
     ):
+        # [FUNCTION DOC]
+        # Behavior: asserts checkpoint_lvl is 0 or 1; under autocast casts x_proj and delta_proj weights to the autocast
+        # dtype; makes xz contiguous; reshapes conv weight (d, 1, w) to (d, w); splits xz viewed as (b, channels, 2, l)
+        # into x and z, where channels is d_inner divided by 2 when the TP group has more than one rank and d_inner
+        # otherwise; runs causal_conv1d_fwd with silu; computes x_dbl = x_proj of the conv output flattened to
+        # (b*l, d); delta = delta_proj applied to the first delta_rank columns, laid out (b, d, l); if B/C are not
+        # given, slices them from x_dbl (after delta_rank, and the last d_state columns), adds optional biases and
+        # reshapes to (b, 1, n, l) (complex variant interleaves pairs); runs selective_scan_cuda.fwd with z gating;
+        # with checkpoint_lvl 1 drops conv output and delta to recompute in backward; saves tensors.
+        # Inputs: ctx; d_inner (int, full inner width); tp_pg (process group); xz (b, 2*local d, l); conv1d_weight
+        # (d, 1, w); conv1d_bias (optional d); x_proj_weight (delta_rank + 2n, d); delta_proj_weight (d, delta_rank);
+        # A (d, n); B, C (optional fixed); D (optional d); delta_bias (optional d); B_proj_bias, C_proj_bias (optional);
+        # delta_softplus (bool, default True); checkpoint_lvl (0 or 1, default 1).
+        # Outputs: gated scan output rearranged to (b, l, d).
+        # Exceptions: AssertionError for invalid checkpoint_lvl. Side effects: CUDA kernels; stores ctx state.
+        # KNOWN ISSUE: forward divides d_inner by 2 whenever TP size exceeds 1, but backward divides by the TP size; these
+        # only agree for TP 1 or 2.
         """
         xz: (batch, dim, seqlen)
         """
@@ -315,6 +383,18 @@ class MambaInnerFn(torch.autograd.Function):
     @staticmethod
     @custom_bwd
     def backward(ctx, dout):
+        # [FUNCTION DOC]
+        # Behavior: restores saved tensors, re-splits xz into x and z using d_inner divided by TP size (asserting
+        # divisibility); with checkpoint_lvl 1 recomputes conv output and delta; allocates dxz and takes dx/dz as views
+        # into it so kernels write directly; transposes dout to (b, d, l); calls selective_scan_cuda.bwd (recomputing
+        # out_z, writing dz in place); for variable B/C flattens their gradients to (b*l, n), sums them for bias
+        # gradients and writes them into dx_dbl; computes delta_proj weight gradient and dx_dbl's delta part; computes
+        # x_proj weight gradient and adds x_proj backprop into the conv output gradient (addmm in place); runs
+        # causal_conv1d_bwd writing dx into dxz; reshapes conv weight gradient to (d, 1, w).
+        # Inputs: ctx; dout (b, l, d). Outputs: tuple of gradients aligned with forward inputs (None for d_inner, tp_pg).
+        # Exceptions: AssertionError if d_inner is not divisible by TP size. Side effects: CUDA kernels.
+        # KNOWN ISSUE: returns 15 gradients while forward takes 16 inputs (no entry for checkpoint_lvl), which autograd
+        # may reject; dB/dC are returned as None for variable B/C, as intended.
         # dout: (batch, seqlen, dim)
         (
             xz,
@@ -448,6 +528,9 @@ def mamba_inner_fn(
     C_proj_bias=None,
     delta_softplus=True,
 ):
+    # [FUNCTION DOC]
+    # Behavior: functional wrapper calling MambaInnerFn.apply with the given arguments and default checkpoint_lvl 1.
+    # Inputs/Outputs: as MambaInnerFn.forward. Exceptions: None explicitly raised. Side effects: CUDA kernels.
     return MambaInnerFn.apply(
         d_inner,
         tp_pg,
@@ -484,6 +567,16 @@ def mamba_inner_ref(
     C_proj_bias=None,
     delta_softplus=True,
 ):
+    # [FUNCTION DOC]
+    # Behavior: unfused reference of the full Mamba inner path including out_proj: chunks xz into x and z halves
+    # along channels, applies causal_conv1d_fn with silu, computes x_dbl, delta, and variable B/C (with biases,
+    # reshaped to (b, n, l)), runs selective_scan_fn with z gating and softplus, and applies out_proj linear to
+    # the (b, l, d) result.
+    # Inputs: xz (b, 2d, l); conv1d_weight; conv1d_bias; x_proj_weight; delta_proj_weight; out_proj_weight;
+    # out_proj_bias; A; B, C, D, delta_bias, B_proj_bias, C_proj_bias (optional); delta_softplus (default True).
+    # Outputs: tensor (b, l, out features). Exceptions: None explicitly raised. Side effects: CUDA kernels.
+    # KNOWN ISSUE: delta_softplus argument is ignored (softplus always applied); uses the concatenated-halves xz
+    # layout rather than the interleaved layout of MambaInnerFn, and has no TP support.
     L = xz.shape[-1]
     delta_rank = delta_proj_weight.shape[1]
     d_state = A.shape[-1] * (1 if not A.is_complex() else 2)

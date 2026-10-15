@@ -1,3 +1,20 @@
+# [MODULE DOC]
+# Purpose: script converting a HuggingFace transformers Mamba checkpoint (e.g. state-spaces/mamba-130m-hf)
+# into a nanotron checkpoint usable by the Mamba example. Run with torchrun (one process per rank).
+# Contents: load_config_hf, get_weight_from_hf, and a main block.
+# Main block behavior: parses --inp_path, --out_path, --dp, --pp, --tp; builds ParallelismArgs (all-forward
+# all-backward engine, ALL_REDUCE TP, no async comm) and a ParallelContext; sets per-rank log levels; reads the HF
+# config and writes a MambaModelConfig (float32 dtype, RMSNorm, fused add norm, residual in fp32, ssm_cfg null)
+# from a YAML template; loads the HF model on CUDA in float32 (eval mode); builds MambaForTraining with
+# build_model; maps every nanotron parameter name to its HF name (embeddings, final norm, lm_head and per
+# layer mixer A_log, D, in_proj, conv1d, x_proj, dt_proj, out_proj, norm); for each local nanotron parameter
+# copies the HF tensor, either slice by slice using sharded local/global slice pairs for TP-sharded params or
+# whole after asserting equal shapes; marks tied params; runs sanity_check; saves weights and meta
+# (step 0, 0 samples); on global rank 0 writes config.yaml (MambaConfig with MambaInit and tokenizer = inp_path)
+# and model_config.json.
+# Side effects: network downloads, CUDA allocations, distributed init, file writes under out_path, logging.
+# KNOWN ISSUE: device_map is computed but never used; the YAML template lists is_mamba_config twice and
+# ignores the HF SSM hyperparameters (ssm_cfg left null, so non-default HF state/expand/conv sizes would mismatch).
 # ruff: noqa: E402
 """
 Converts a HF model to a Nanotron model
@@ -42,6 +59,13 @@ logger = logging.get_logger(__name__)
 
 
 def load_config_hf(model_name):
+    # [FUNCTION DOC]
+    # HELPER: fetches a raw HF config dictionary.
+    # Behavior: resolves config.json for model_name via cached_file (no error on missing entry) and parses it as JSON.
+    # Inputs: model_name (hub id or local path string). Outputs: dictionary of config values.
+    # Exceptions: TypeError/OSError if the file cannot be resolved (cached_file returns None).
+    # Side effects: possible network download and cache write; leaves the file handle to be closed by GC.
+    # KNOWN ISSUE: unused in this script.
     resolved_archive_file = cached_file(model_name, CONFIG_NAME, _raise_exceptions_for_missing_entries=False)
     return json.load(open(resolved_archive_file))
 
@@ -54,9 +78,27 @@ def get_weight_from_hf(
     get_grad: bool = False,
     param_is_tp_sharded: bool = False,
 ) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: returns the HF tensor corresponding to a nanotron parameter name.
+    # Behavior: looks up the HF name in nanotron_to_hf; reads either the tensor from ref_module_state_dict
+    # (get_grad False) or the gradient of the HF parameter (get_grad True). For in_proj weights it logs (rank 0) and
+    # returns rows reordered by the interleave pattern (row i of the first half followed by row i of the second
+    # half), because nanotron splits the x/z projection with a column-parallel view while HF chunks it in two
+    # halves. Otherwise returns the tensor as is.
+    # Inputs: name (nanotron parameter name); ref_module_state_dict (name to tensor dictionary); ref_module (HF
+    # MambaForCausalLM); nanotron_to_hf (name mapping dictionary); get_grad (bool, default False);
+    # param_is_tp_sharded (bool, default False).
+    # Outputs: torch tensor (full, unsharded) or gradient tensor (may be None).
+    # Exceptions: KeyError if name is unmapped; AssertionError if in_proj row count is odd.
+    # Side effects: logging.
+    # KNOWN ISSUE: param_is_tp_sharded is accepted but never used.
     """From our brrr implementation, we get the equivalent tensor in transformers implementation"""
 
     def _interleave_pattern(N):
+        # [FUNCTION DOC]
+        # HELPER: builds the interleaving permutation.
+        # Behavior: for i from 0 to N/2 - 1 appends i then i + N/2 (e.g. 4 gives 0, 2, 1, 3).
+        # Inputs: N (even int). Outputs: list of N ints. Exceptions: AssertionError if N is odd. Side effects: None.
         """
         interleave_pattern(4) -> [0, 2, 1, 3]
         interleave_pattern(8) -> [0, 4, 1, 5, 2, 6, 3, 7]
@@ -73,11 +115,18 @@ def get_weight_from_hf(
     if get_grad is False:
 
         def _get_tensor(path: str):
+            # [FUNCTION DOC]
+            # HELPER: reads a tensor by HF name from the reference state dict (closure variant used when get_grad is False).
+            # Inputs: path (HF parameter name). Outputs: tensor. Exceptions: KeyError if missing. Side effects: None.
             return ref_module_state_dict[path]
 
     else:
 
         def _get_tensor(path: str):
+            # [FUNCTION DOC]
+            # HELPER: returns the gradient of the HF parameter at path (closure variant used when get_grad is True).
+            # Inputs: path. Outputs: gradient tensor or None. Exceptions: AttributeError if the parameter does not exist.
+            # Side effects: None.
             param = ref_module.get_parameter(path)
             return param.grad
 

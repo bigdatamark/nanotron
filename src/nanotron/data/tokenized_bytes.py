@@ -1,3 +1,13 @@
+# [MODULE DOC]
+# Purpose: streaming "tokenized bytes" datasets (raw token files, .ds, on S3 or local disk), their blending into a
+# training dataset, and the Megatron-sampler based dataloader used for multi-stage training with resume.
+# Main contents: log dataclasses (TBFileDatasetLog, TBFolderDatasetLog, TrainDataLog), TokenizedBytesFileDataset
+# (one file streamed sequentially), OldTokenizedBytesFolderDataset (legacy folder of files), TokenizedBytesFolderDataset
+# (datatrove based, with S3 file-list caching), build_dataset, get_tb_datasets, get_tb_dataloader.
+# Fits in nanotron: alternative to Nanoset for pretraining from S3-hosted shards; get_tb_datasets builds a
+# BlendableDataset and get_tb_dataloader wraps it with a MegatronPretrainingSampler and the CLM collators.
+# Import-time side effects: creates a module logger; sets tb_logger_available.
+# KNOWN ISSUE: the try block guarding tb_logger_available imports nothing, so the flag is always True.
 import os
 import re
 import time
@@ -34,6 +44,9 @@ logger = logging.get_logger(__name__)
 
 @dataclass
 class TBFileDatasetLog:
+    # [CLASS DOC]
+    # Purpose: dataclass logging a single-file dataset: dataset_type (class name), file_path, seq_len, dtype name,
+    # skip_in_stream, num_samples, num_tokens, human_format_num_tokens, num_epochs.
     dataset_type: str
     file_path: str
     seq_len: int
@@ -47,6 +60,10 @@ class TBFileDatasetLog:
 
 @dataclass
 class TBFolderDatasetLog:
+    # [CLASS DOC]
+    # Purpose: dataclass logging a folder dataset: dataset_type, folder_path, filename_pattern, recursive, seq_len, dtype,
+    # skip_in_stream, num_samples, num_tokens, human_format_num_tokens, shuffle, seed, num_epochs, files_order (list of
+    # file paths in read order).
     dataset_type: str
     folder_path: str
     filename_pattern: str
@@ -65,6 +82,9 @@ class TBFolderDatasetLog:
 
 @dataclass
 class TrainDataLog:
+    # [CLASS DOC]
+    # Purpose: dataclass summarising training data: global_batch_size, sequence_length, total_training_tokens,
+    # human_total_train_tokens, train/eval/test sample counts and subset logs (eval/test are None in practice).
     global_batch_size: int
     sequence_length: int
     total_training_tokens: int
@@ -78,6 +98,12 @@ class TrainDataLog:
 
 
 class TokenizedBytesFileDataset(Dataset):
+    # [CLASS DOC]
+    # Purpose: Dataset over one binary file of fixed-width tokens, returning consecutive non-overlapping windows of
+    # seq_len + 1 tokens; indices wrap around (looping), and sequential access reuses an open stream.
+    # Key attributes: file_path, seq_len, dtype, dtype_size, skip_in_stream, skip_tokens, _len (number of windows),
+    # _stream (generator of windows or None), _last_item_requested, subset_log.
+    # Inherits from torch Dataset.
     def __init__(
         self,
         file_path: str,
@@ -88,6 +114,17 @@ class TokenizedBytesFileDataset(Dataset):
         max_tokens: Optional[int] = None,
         skip_tokens: Optional[int] = None,
     ):
+        # [FUNCTION DOC]
+        # Summary: measures the file and computes how many windows it holds.
+        # Behavior: token count is the file size (S3 content length or local size) divided by dtype size, minus skip_tokens;
+        # optionally capped at max_tokens; divided by seq_len + 1 gives _len. Builds a TBFileDatasetLog (num_epochs is
+        # num_samples divided by _len when given).
+        # Inputs: file_path (S3 URI or local path), seq_len (int), dtype (default uint16), skip_in_stream (default True),
+        # num_samples (optional, informative only), max_tokens (optional cap), skip_tokens (optional tokens to skip at start).
+        # Outputs: None.
+        # Exceptions: ImportError for S3 without boto3; OSError for missing files; ZeroDivisionError if num_samples is given
+        # and the file is empty.
+        # Side effects: S3 HEAD request or file stat.
         """Streaming dataset for a single TokenizedByte file
         We loop on the dataset if asking for an index larger than the dataset size
 
@@ -128,6 +165,13 @@ class TokenizedBytesFileDataset(Dataset):
         )
 
     def _get_new_stream(self, index):
+        # [FUNCTION DOC]
+        # HELPER: generator opening the file at window index (plus skip_tokens) and yielding each window as an int64 tensor.
+        # Inputs: index (int window index). Outputs: yields 1-D int64 torch tensors of seq_len + 1 tokens.
+        # Exceptions: AssertionError if a chunk is shorter than a full window (e.g. the file tail).
+        # Side effects: network or file I/O.
+        # KNOWN ISSUE: skip_tokens is a token count but is added to a window index (offset is in windows), so the skip is
+        # wrong by a factor of seq_len + 1.
         """Get a new stream starting from index (in sequence length contexts)
 
         Note: we pick chunks of seq_len + 1 to account for the label/target of the last tokens
@@ -143,6 +187,14 @@ class TokenizedBytesFileDataset(Dataset):
             yield torch.as_tensor(np.frombuffer(chunk, self.dtype).astype(np.int64), dtype=torch.int64)
 
     def __getitem__(self, item):
+        # [FUNCTION DOC]
+        # Summary: returns the window at item modulo length, using the current stream when possible.
+        # Behavior: if a stream exists, the request moves forward and skip_in_stream is on, consume windows until just before
+        # the target; otherwise, if there is no stream or the request is not the next window, open a new stream at the
+        # target. Then read the next window.
+        # Inputs: item (int). Outputs: dictionary with "input_ids" tensor.
+        # Exceptions: ZeroDivisionError when the dataset is empty; errors from _get_next_from_stream.
+        # Side effects: mutates _stream and _last_item_requested; I/O.
         # We loop on the dataset if asking for an index larger than the dataset size
         epoch_item = item % len(self)
         # if item >= len(self):
@@ -161,6 +213,12 @@ class TokenizedBytesFileDataset(Dataset):
         return {"input_ids": self._get_next_from_stream()}
 
     def _get_next_from_stream(self):
+        # [FUNCTION DOC]
+        # HELPER: reads the next window, retrying on any exception by reopening the stream at the last requested item with
+        # exponential back-off from 0.01 s, giving up once the delay reaches 2 s.
+        # Inputs: None. Outputs: tensor.
+        # Exceptions: re-raises the last error after giving up (including StopIteration at end of file).
+        # Side effects: sleeps, reopens streams, error logging.
         sleep_time = 0.01
         while True:
             try:
@@ -175,10 +233,17 @@ class TokenizedBytesFileDataset(Dataset):
                 sleep_time *= 2
 
     def __len__(self):
+        # [FUNCTION DOC]
+        # Summary: number of windows. Inputs: None. Outputs: int. Exceptions: None explicitly raised. Side effects: None.
         return self._len
 
 
 class OldTokenizedBytesFolderDataset(Dataset):
+    # [CLASS DOC]
+    # Purpose: legacy dataset concatenating many TokenizedBytesFileDataset files of a folder; indices wrap around.
+    # Key attributes: folder_path, filename_pattern (compiled regex), files (list of file datasets), lens (cumulative
+    # window counts starting at 0), current_file (cached file position), subset_log.
+    # Inherits from torch Dataset.
     def __init__(
         self,
         folder_path: str,
@@ -193,6 +258,21 @@ class OldTokenizedBytesFolderDataset(Dataset):
         shuffle: bool = False,
         seed: int = 42,
     ):
+        # [FUNCTION DOC]
+        # Summary: lists matching files and builds per-file datasets honouring max_tokens and skip_tokens.
+        # Behavior: list files (S3 listing, or os.walk with regex match on the full path), sort, require at least one. For each
+        # file build a TokenizedBytesFileDataset with the remaining token budget and remaining skip; files entirely consumed
+        # by the skip are dropped; stop once max_tokens is reached. Optionally shuffle file order with a numpy generator from
+        # seed. Compute cumulative lengths and the log.
+        # Inputs: folder_path, seq_len, filename_pattern (regex string or pattern, default None), recursive (default True),
+        # dtype (default uint16), skip_in_stream (default True), num_samples (optional), max_tokens (optional), skip_tokens
+        # (optional), shuffle (default False), seed (default 42).
+        # Outputs: None.
+        # Exceptions: FileNotFoundError if nothing matches.
+        # Side effects: S3 listing or directory walk, file stats, logging.
+        # KNOWN ISSUE: for local folders a None filename_pattern raises AttributeError.
+        # KNOWN ISSUE: each file is constructed with the whole remaining skip even if it exceeds the file size, giving a
+        # negative length for skipped files, and the skip for the first kept file is again applied in window units.
         """Dataset for a folder of TokenizedBytes files
         We loop on the dataset if asking for an index larger than the dataset size
 
@@ -277,6 +357,11 @@ class OldTokenizedBytesFolderDataset(Dataset):
         )
 
     def __getitem__(self, item):
+        # [FUNCTION DOC]
+        # Summary: maps item modulo length to a file by bisecting cumulative lengths (cached current_file when still inside
+        # it) and returns that file's item at the local offset.
+        # Inputs: item (int). Outputs: dictionary with "input_ids".
+        # Exceptions: ZeroDivisionError if empty. Side effects: updates current_file; I/O.
         epoch_item = item % len(self)
         # if item >= len(self):
         #     raise IndexError(
@@ -291,10 +376,16 @@ class OldTokenizedBytesFolderDataset(Dataset):
         return self.files[self.current_file][epoch_item - self.lens[self.current_file]]
 
     def __len__(self):
+        # [FUNCTION DOC]
+        # Summary: total windows across files (0 if none). Inputs: None. Outputs: int.
+        # Exceptions: None explicitly raised. Side effects: None.
         return self.lens[-1] if self.lens else 0
 
 
 class TokenizedBytesFolderDataset(DatatroveFolderDataset):
+    # [CLASS DOC]
+    # Purpose: DatatroveFolderDataset subclass that caches S3 file listings and sizes on disk and adds a subset log.
+    # Key attributes: those of DatatroveFolderDataset (files, lens, folder_path, current_file_path, ...), subset_log.
     def __init__(
         self,
         folder_path: str,
@@ -312,6 +403,22 @@ class TokenizedBytesFolderDataset(DatatroveFolderDataset):
         folder_read_path: Optional[str] = None,
         force_update_cache: bool = os.environ.get("FORCE_UPDATE_CACHE_S3", 0) == "1",
     ):
+        # [FUNCTION DOC]
+        # Summary: resolves the S3 file list (with cache) and initialises the datatrove folder dataset.
+        # Behavior: warn if return_positions without eos_token_id. For S3 folders: cache file is the md5 of folder, pattern
+        # and recursive flag under ~/.cache/nanotron/s3_cache. Within main_rank_first (world group), global rank 0 loads the
+        # pickle cache unless force_update_cache, else lists files via datatrove url_to_fs (find or glob, depth 1 when not
+        # recursive), records each file size, and saves the cache. Every other rank then reads the cache. Pass the list and
+        # sizes to DatatroveFolderDataset along with sequence, token size, shuffle, seed, positions and read path. Build the
+        # TBFolderDatasetLog (dtype derived from token_size).
+        # Inputs: folder_path, seq_len, filename_pattern (glob, default None), recursive (default True), token_size (default
+        # 2 bytes), max_tokens (optional), shuffle (default False), seed (default 42), return_positions (default False),
+        # eos_token_id (optional), skip_in_stream (only logged), num_samples (optional, informative), folder_read_path
+        # (optional local mirror path), force_update_cache (default from env FORCE_UPDATE_CACHE_S3 equal to "1", evaluated
+        # once at import time).
+        # Outputs: None.
+        # Exceptions: RuntimeError if a non-zero rank cannot read the cache.
+        # Side effects: creates the cache directory, S3 listing, pickle file I/O, barrier on the world group, logging.
         log_rank("Using DatatroveFolderDataset", logger=logger, level=logging.INFO, rank=0)
         if return_positions and not eos_token_id:
             log_rank(
@@ -466,6 +573,19 @@ def build_dataset(
     seed: Optional[int] = 6,
     folder_read_path: Optional[str] = None,
 ) -> "DatatroveFolderDataset":
+    # [FUNCTION DOC]
+    # Summary: builds one tokenized-bytes dataset for a folder.
+    # Behavior: with use_old_brrr_dataloader, log and return OldTokenizedBytesFolderDataset matching files ending in ".ds"
+    # (folder_read_path ignored with a warning; dtype uint16 for 2-byte tokens else uint32). Otherwise return
+    # TokenizedBytesFolderDataset with glob "*.ds", non-recursive, forwarding all options.
+    # Inputs: dataset_folder, seq_length, token_size, return_positions (default False), eos_token_id, use_old_brrr_dataloader
+    # (default False), skip_in_stream (default True), num_samples, max_tokens, skip_tokens (old path only), shuffle
+    # (default False), seed (default 6), folder_read_path.
+    # Outputs: dataset.
+    # Exceptions: propagated from constructors.
+    # Side effects: as the constructors.
+    # KNOWN ISSUE: the docstring documents a dataset_args parameter that does not exist, and the log message blames
+    # skip_in_stream rather than use_old_brrr_dataloader.
     """Build one TokenizedBytes dataset from a file or a folder on S3 or locally
 
     Args:
@@ -531,6 +651,27 @@ def get_tb_datasets(
     consumed_tokens_per_dataset_folder: Optional[Dict[str, int]] = None,
     last_stages_consumed_tokens_per_dataset_folder: Optional[Dict[str, int]] = None,
 ) -> Tuple[DataLoader, TrainDataLog]:
+    # [FUNCTION DOC]
+    # Summary: builds the blended training dataset for the current data stage and its log.
+    # Behavior: train_num_samples is train_steps times global_batch_size. Convert last-stage consumed tokens per folder
+    # to sample offsets by dividing by sequence_length. Build one dataset per configured folder (with optional per-folder
+    # max tokens and read path). If dataset_read_path is configured, normalise weights and, per dataset, read the sample
+    # at the estimated current position, log which file is read and how many tokens are needed, assert the dataset holds
+    # enough samples for all stages, and assert that every file overlapping the needed sample range exists locally. Then
+    # global rank 0 compiles the C++ helpers, all ranks barrier, and the datasets are blended with BlendableDataset using
+    # config weights (default equal), the seed, consumed tokens and offsets.
+    # Inputs: config (NanosetDatasetsArgs-like with dataset_folder, dataset_weights, dataset_max_tokens,
+    # token_size_in_bytes, return_positions, use_old_brrr_dataloader, skip_in_stream, dataset_read_path),
+    # sequence_length, global_batch_size, train_steps, current_iteration, parallel_context, eos_token_id, shuffle (default
+    # False), seed (default 6), consumed_samples (default 0), consumed_tokens_per_dataset_folder (optional),
+    # last_stages_consumed_tokens_per_dataset_folder (optional).
+    # Outputs: tuple (BlendableDataset, TrainDataLog).
+    # Exceptions: AssertionError for missing data; ImportError path; errors from dataset builds.
+    # Side effects: S3/file I/O, C++ compilation on rank 0, barrier on the world group, logging.
+    # KNOWN ISSUE: last_stages_consumed_tokens_per_dataset_folder defaults to None but is iterated unconditionally.
+    # KNOWN ISSUE: the single-dataset branch is disabled by an always-false condition (dead code).
+    # KNOWN ISSUE: compile_helper exits the process on failure instead of raising ImportError, so the except is dead.
+    # KNOWN ISSUE: the return annotation says a DataLoader but a dataset is returned.
     """Build TokenizedBytes datasets
 
     Args:
@@ -666,6 +807,19 @@ def get_tb_dataloader(
     use_position_ids: bool = False,
     use_doc_masking: bool = False,
 ) -> DataLoader:
+    # [FUNCTION DOC]
+    # Summary: wraps a dataset in a DataLoader driven by MegatronPretrainingSampler.
+    # Behavior: pipeline ranks owning neither inputs nor labels get an EmptyInfiniteDataset of the same length. Build the
+    # sequential Megatron sampler for this DP rank from consumed_samples to num_samples with global_batch_size and the
+    # config's padding option. Choose DataCollatorForCLMWithPositionIds (with use_doc_masking) or DataCollatorForCLM.
+    # Return a DataLoader with the batch sampler, collator, worker count, pin memory and per-DP-rank worker seeding.
+    # Inputs: dataset, sequence_length, micro_batch_size, global_batch_size, cfg (provides
+    # pad_samples_to_global_batch_size), num_workers, consumed_samples, num_samples, parallel_context, input_pp_rank,
+    # output_pp_rank, dataloader_drop_last (default True), dataloader_pin_memory (default True), use_position_ids
+    # (default False), use_doc_masking (default False).
+    # Outputs: torch DataLoader.
+    # Exceptions: RuntimeError from sampler validation.
+    # Side effects: logging.
     # Only some rank require to run the dataloader.
     if dist.get_rank(parallel_context.pp_pg) not in [
         input_pp_rank,

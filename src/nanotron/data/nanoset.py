@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Purpose: Nanoset, a torch Dataset that blends several datatrove tokenised folders by weight into a fixed number of
+# training samples, plus the numba helper that builds the blending index.
+# Main contents: Nanoset, build_nanoset_index_helper.
+# Fits in nanotron: the dataset used for pre-tokenised training data; wrapped by build_nanoset_dataloader.
+# Import-time side effects: creates a module logger; numba compiles build_nanoset_index_helper lazily with caching.
 import hashlib
 import json
 import os
@@ -18,6 +24,16 @@ logger = logging.get_logger(__name__)
 
 
 class Nanoset(torch.utils.data.Dataset):
+    # [CLASS DOC]
+    # Purpose: weighted blend of DatatroveFolderDataset instances indexed by a global sample index.
+    # Key attributes: dataset_folders, sequence_length, eos_token_id, return_positions, token_size (bytes per token in the
+    # .ds files), train_split_num_samples (total samples to expose), random_seed, use_cache, cache_dir
+    # ("./.nanoset_cache"), datatrove_datasets (one per folder), dataset_lengths, dataset_weights (normalised array),
+    # dataset_index and dataset_sample_index (arrays of length train_split_num_samples giving which dataset and which
+    # sample of it each global index maps to).
+    # Inherits from torch.utils.data.Dataset.
+    # KNOWN ISSUE: the docstring lists a vocab_size argument; the code takes token_size, random_seed, use_cache,
+    # eos_token_id and return_positions instead.
     """
     The Nanoset dataset
 
@@ -41,8 +57,23 @@ class Nanoset(torch.utils.data.Dataset):
         eos_token_id: int = None,
         return_positions: bool = True,
     ) -> None:
-
+        # [FUNCTION DOC]
+        # Summary: opens each folder as a datatrove dataset and builds the blending index.
+        # Behavior: a single string for dataset_folders is wrapped into a list with a warning. Store parameters, assert
+        # return_positions or eos_token_id is set. Create one DatatroveFolderDataset per folder matching "*.ds" (non
+        # recursive, shuffle on, sequence length seq_len, returning positions if requested). Record their lengths; weights
+        # default to the lengths normalised (consume everything proportionally) else the given weights normalised; assert one
+        # weight per folder. Build the index with build_nanoset_index and log a summary.
+        # Inputs: dataset_folders (list of paths), sequence_length (int), token_size (int, 2 or 4), train_split_num_samples
+        # (int), dataset_weights (optional list of floats), random_seed (default 1234), use_cache (default True, only used by
+        # new_build_nanoset_index), eos_token_id (optional int), return_positions (default True).
+        # Outputs: None.
+        # Exceptions: AssertionError for the checks above.
+        # Side effects: warning, file system reads by datatrove, logging on rank 0.
+        # KNOWN ISSUE: the assertion message says eos_token_id is needed when return_positions is True, but the check
+        # actually requires eos_token_id only when return_positions is False.
         # Checks
+
         if isinstance(dataset_folders, str):
             warnings.warn("dataset_folders should be of type List[str] but str was provided. Converting to List[str]")
             dataset_folders = [dataset_folders]
@@ -96,6 +127,9 @@ class Nanoset(torch.utils.data.Dataset):
         self.print_nanoset_info()
 
     def __len__(self) -> int:
+        # [FUNCTION DOC]
+        # Summary: number of samples, the length of dataset_index (equals train_split_num_samples).
+        # Inputs: None. Outputs: int. Exceptions: None explicitly raised. Side effects: None.
         """
         Returns:
             int: The number of samples of the Nanoset
@@ -104,6 +138,13 @@ class Nanoset(torch.utils.data.Dataset):
         return len(self.dataset_index)
 
     def __getitem__(self, idx: int) -> Dict[str, np.ndarray]:
+        # [FUNCTION DOC]
+        # Summary: looks up which dataset and local sample a global index maps to, wraps the local index modulo that
+        # dataset's length, and returns the datatrove sample (sequence_length + 1 tokens, plus positions if enabled).
+        # Inputs: idx, int global sample index.
+        # Outputs: dictionary with "input_ids" (and "positions") arrays/tensors as produced by datatrove.
+        # Exceptions: IndexError for an out-of-range idx.
+        # Side effects: reads from memory-mapped files.
         """
         Returns sequence_length + 1 tokens from the memmap dataset using sequential access
         """
@@ -116,6 +157,18 @@ class Nanoset(torch.utils.data.Dataset):
         return self.datatrove_datasets[dataset][actual_sample]
 
     def new_build_nanoset_index(self) -> Tuple[np.ndarray, np.ndarray]:
+        # [FUNCTION DOC]
+        # Summary: alternative (currently unused) index builder with on-disk cache allowing sequential reads per dataset.
+        # Behavior: hash the index-affecting parameters (folders, lengths, weights, sample count, seed, token size, sequence
+        # length) with md5 into a cache file name under cache_dir; if it exists try to load it. Otherwise give each dataset
+        # floor(weight times total) samples, distribute the remainder to datasets with the largest fractional parts, repeat
+        # dataset ids by those counts, shuffle with the seed, and assign each slot the next sequential sample of its dataset.
+        # Try to save the result as an npz cache.
+        # Inputs: None (uses self).
+        # Outputs: tuple (dataset_index, dataset_sample_index), int64 arrays of length train_split_num_samples.
+        # Exceptions: cache load/save failures are caught and logged.
+        # Side effects: file reads/writes in cache_dir, logging, tqdm progress output.
+        # KNOWN ISSUE: use_cache is ignored; the cache is always consulted and written.
         """
         Build dataset index that enables sequential reading while respecting weights.
         Uses cache if available and parameters match.
@@ -182,6 +235,17 @@ class Nanoset(torch.utils.data.Dataset):
         return dataset_index, dataset_sample_index
 
     def build_nanoset_index(self) -> np.ndarray:
+        # [FUNCTION DOC]
+        # Summary: builds the index actually used: one weighted epoch, shuffled, repeated to cover all training samples.
+        # Behavior: samples_per_epoch is the sum of dataset lengths; num_epochs is the integer part of
+        # train_split_num_samples over that, plus one. Call build_nanoset_index_helper for one epoch, shuffle both arrays with
+        # two fresh RandomState(random_seed) so they get the same permutation, concatenate num_epochs copies and truncate to
+        # train_split_num_samples.
+        # Inputs: None (uses self).
+        # Outputs: tuple of two arrays (dataset ids, per-dataset sample ids).
+        # Exceptions: None explicitly raised.
+        # Side effects: None.
+        # KNOWN ISSUE: the return annotation says a single ndarray but a tuple of two arrays is returned.
         """
         Build dataset index and dataset sample index
         """
@@ -206,6 +270,12 @@ class Nanoset(torch.utils.data.Dataset):
         return dataset_index, dataset_sample_index
 
     def print_nanoset_info(self):
+        # [FUNCTION DOC]
+        # HELPER: logs dataset statistics on global rank 0.
+        # Behavior: log the total samples and tokens (samples times sequence_length), then for each folder the number of
+        # samples drawn from it and its share.
+        # Inputs: None. Outputs: None. Exceptions: None explicitly raised.
+        # Side effects: logging.
 
         log_rank(f"> Total number of samples: {len(self)}", logger=logger, level=logging.INFO, rank=0)
         log_rank(
@@ -227,6 +297,15 @@ class Nanoset(torch.utils.data.Dataset):
 def build_nanoset_index_helper(
     n_samples: int, weights: np.ndarray, dataset_sizes: List[int]
 ) -> Tuple[np.ndarray, np.ndarray]:
+    # [FUNCTION DOC]
+    # HELPER: numba-jitted greedy blender used by Nanoset.build_nanoset_index.
+    # Behavior: for each output position, compute for every dataset the error between its target count (weight times
+    # the current position, using at least 1) and the samples already taken; pick the dataset with the largest error,
+    # record it and its next local sample id (modulo its size), and increment its counter.
+    # Inputs: n_samples (int), weights (normalised float array), dataset_sizes (list of ints).
+    # Outputs: tuple (dataset_index as unsigned ints, dataset_sample_index as longs), both of length n_samples.
+    # Exceptions: None explicitly raised.
+    # Side effects: None.
     """
     Given multiple datasets and a weighting array, build samples indexes
     such that it follows those weights

@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Purpose: small helpers shared by the nanotron config dataclasses: enums for recompute granularity and init
+# scaling, recursive dataclass serialisation, and string/object conversions for dtypes and pipeline engines.
+# Main contents: RecomputeGranularity, InitScalingMethod, serialize, str_to_dtype and dtype_to_str lookup tables,
+# cast_str_to_torch_dtype, cast_str_to_pipeline_engine, cast_pipeline_engine_to_str.
+# Fits in nanotron: used when loading YAML configs into dataclasses and when dumping configs back to YAML/JSON.
+# Import-time side effects: builds the two module-level dtype dictionaries.
 from dataclasses import fields
 from enum import Enum, auto
 from pathlib import Path
@@ -14,11 +21,17 @@ from nanotron.parallel.tensor_parallel.nn import TensorParallelLinearMode
 
 
 class RecomputeGranularity(Enum):
+    # [CLASS DOC]
+    # Purpose: enum of activation recomputation granularity: SELECTIVE (only some ops) or FULL (whole layer).
+    # Attributes: two auto-numbered members. No construction inputs beyond Enum semantics.
     SELECTIVE = auto()
     FULL = auto()
 
 
 class InitScalingMethod(Enum):
+    # [CLASS DOC]
+    # Purpose: enum of how weight initialisation std is scaled: NONE, NUM_LAYERS (by total layer count),
+    # LAYER_INDEX (by the layer position), MODEL_SCALE (by model size). Auto-numbered members.
     NONE = auto()
     NUM_LAYERS = auto()
     LAYER_INDEX = auto()
@@ -26,6 +39,18 @@ class InitScalingMethod(Enum):
 
 
 def serialize(data) -> dict:
+    # [FUNCTION DOC]
+    # Summary: recursively converts a (possibly nested) dataclass into a plain dictionary suitable for YAML/JSON.
+    # Behavior: None returns None; any non-dataclass value is returned unchanged. For each dataclass field: nested
+    # dataclasses are serialised recursively; Path becomes its string; PipelineEngine becomes "afab"/"1f1b";
+    # TensorParallelLinearMode, RecomputeGranularity, InitScalingMethod and SamplerType become their member name;
+    # torch dtypes become their name via dtype_to_str; lists and tuples become lists with each element serialised;
+    # an empty dictionary becomes None (to keep the datasets library happy); anything else is kept as is.
+    # Non-empty dictionaries are not recursed into.
+    # Inputs: data, a dataclass instance, None, or any value.
+    # Outputs: dictionary of field name to serialised value, None, or the original value.
+    # Exceptions: KeyError if a torch dtype is not present in dtype_to_str.
+    # Side effects: None.
     """Recursively serialize a nested dataclass to a dict - do some type conversions along the way"""
     if data is None:
         return None
@@ -94,6 +119,12 @@ dtype_to_str = {
 
 
 def cast_str_to_torch_dtype(str_dtype: str):
+    # [FUNCTION DOC]
+    # Summary: maps a dtype name such as "bfloat16" to the torch dtype using str_to_dtype.
+    # Inputs: str_dtype, string.
+    # Outputs: torch.dtype.
+    # Exceptions: ValueError if the name is not in the table.
+    # Side effects: None.
     if str_dtype in str_to_dtype:
         return str_to_dtype[str_dtype]
     else:
@@ -101,6 +132,13 @@ def cast_str_to_torch_dtype(str_dtype: str):
 
 
 def cast_str_to_pipeline_engine(str_pp_engine: str) -> PipelineEngine:
+    # [FUNCTION DOC]
+    # Summary: builds a pipeline engine from its short name: "afab" gives AllForwardAllBackwardPipelineEngine,
+    # "1f1b" gives OneForwardOneBackwardPipelineEngine.
+    # Inputs: str_pp_engine, string.
+    # Outputs: a new PipelineEngine instance.
+    # Exceptions: ValueError for any other string.
+    # Side effects: None.
     if str_pp_engine == "afab":
         return AllForwardAllBackwardPipelineEngine()
     elif str_pp_engine == "1f1b":
@@ -110,6 +148,12 @@ def cast_str_to_pipeline_engine(str_pp_engine: str) -> PipelineEngine:
 
 
 def cast_pipeline_engine_to_str(pp_engine: PipelineEngine) -> str:
+    # [FUNCTION DOC]
+    # Summary: inverse of cast_str_to_pipeline_engine; returns "afab" or "1f1b" depending on the engine's class.
+    # Inputs: pp_engine, a PipelineEngine instance.
+    # Outputs: string.
+    # Exceptions: ValueError for other engine types.
+    # Side effects: None.
     if isinstance(pp_engine, AllForwardAllBackwardPipelineEngine):
         return "afab"
     elif isinstance(pp_engine, OneForwardOneBackwardPipelineEngine):

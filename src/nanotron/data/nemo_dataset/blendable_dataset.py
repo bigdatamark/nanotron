@@ -1,3 +1,10 @@
+# [MODULE DOC]
+# Purpose: datasets that interleave samples from several datasets according to weights.
+# Main contents: BlendedSubsetSplitLog (log record), BlendableDataset (index built by the compiled C++ helper, with
+# per-dataset token consumption tracking and resume offsets), MemoryEfficientBlendableDataset (index computed on the
+# fly from weight bins).
+# Fits in nanotron: used by nanotron.data.nemo_dataset to blend GPTDatasets for multi-corpus training.
+# Import-time side effects: creates a module logger.
 # Copyright (c) 2021, NVIDIA CORPORATION.  All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,12 +42,22 @@ logger = logging.get_logger(__name__)
 
 @dataclass
 class BlendedSubsetSplitLog:
+    # [CLASS DOC]
+    # Purpose: dataclass describing a blend: blended_total_num_samples (int), blended_per_subset_samples (list of samples
+    # drawn from each dataset), blended_subset (list of each child dataset's SubsetSplitLog).
     blended_total_num_samples: int
     blended_per_subset_samples: List[int]
     blended_subset: List["SubsetSplitLog"]
 
 
 class BlendableDataset(torch.utils.data.Dataset):
+    # [CLASS DOC]
+    # Purpose: torch Dataset mapping each global index to (dataset, sample) by a precomputed weighted interleave.
+    # Key attributes: datasets, size, dataset_index (int16 per global index), dataset_sample_index (int64, sequential per
+    # dataset), dataset_num_samples (per-dataset counts), random_seed, subset_log, consumed_tokens (dictionary from
+    # dataset position to tokens consumed in the current stage), sequence_length (set on first metrics update),
+    # offsets_in_samples (dictionary from dataset position to a sample offset carried over from earlier stages).
+    # Inherits from torch.utils.data.Dataset.
     def __init__(
         self,
         datasets: List["GPTDataset"],
@@ -51,6 +68,23 @@ class BlendableDataset(torch.utils.data.Dataset):
         consumed_tokens_per_dataset_folder: Optional[Dict[str, int]] = None,
         offsets_in_samples: Optional[Dict[str, int]] = None,
     ):
+        # [FUNCTION DOC]
+        # Summary: normalises weights, builds the blending index, and initialises consumption tracking.
+        # Behavior: assert one weight per dataset, positive total weight and fewer than 32767 datasets; allocate index arrays.
+        # Inside main_rank_first over the world group import the C++ helpers module (compiling it via compile_helper if the
+        # import fails). Call helpers.build_blending_indices (verbose on global rank 0) to fill dataset_index,
+        # dataset_sample_index and dataset_num_samples. Log elapsed time, build the subset log. Initialise consumed_tokens to
+        # zero and override entries whose dataset folder_path matches a key of consumed_tokens_per_dataset_folder; likewise
+        # set offsets_in_samples from offsets_in_samples.
+        # Inputs: datasets (list of datasets with subset_log, and folder_path when tracking is used), weights (list of
+        # floats), size (total samples), parallel_context, seed (int, stored only), consumed_tokens_per_dataset_folder
+        # (optional dictionary path to tokens), offsets_in_samples (optional dictionary path to sample offset).
+        # Outputs: None.
+        # Exceptions: AssertionError for invalid weights/count; ImportError if helpers cannot be built.
+        # Side effects: may compile C++ code; ordering across ranks via main_rank_first; logging.
+        # KNOWN ISSUE: seed is a required parameter but the callers in nanotron.data.nemo_dataset do not pass it, so those
+        # calls raise TypeError.
+        # KNOWN ISSUE: GPTDataset has no folder_path attribute, so passing either tracking dictionary with GPTDatasets fails.
         self.datasets = datasets
         num_datasets = len(datasets)
         assert num_datasets == len(weights)
@@ -137,9 +171,17 @@ class BlendableDataset(torch.utils.data.Dataset):
                         log_rank(f"[BlendableDataset] Applying offset {offset} samples to dataset {idx} ({dataset.folder_path})", logger=logger, level=logging.INFO, rank=0)
 
     def __len__(self):
+        # [FUNCTION DOC]
+        # Summary: returns size. Inputs: None. Outputs: int. Exceptions: None explicitly raised. Side effects: None.
         return self.size
 
     def __getitem__(self, idx):
+        # [FUNCTION DOC]
+        # Summary: looks up the dataset and its sequential sample id for idx, adds that dataset's offset_in_samples, and
+        # returns the child dataset's item.
+        # Inputs: idx (int). Outputs: whatever the child dataset returns.
+        # Exceptions: IndexError for out-of-range indices.
+        # Side effects: None.
         dataset_idx = self.dataset_index[idx]
         sample_idx = self.dataset_sample_index[idx]
 
@@ -158,6 +200,16 @@ class BlendableDataset(torch.utils.data.Dataset):
     #     return None if self.last_dataset_idx[-1] == -1 else self.datasets[self.last_dataset_idx[-1]].folder_path
 
     def update_consumption_metrics(self, start_idx: int, end_idx: int, sequence_length: int):
+        # [FUNCTION DOC]
+        # Summary: adds tokens consumed by a global batch to consumed_tokens.
+        # Behavior: remember sequence_length on first call; count how many indices in dataset_index between start_idx
+        # (inclusive) and end_idx (exclusive) belong to each dataset; add count times sequence_length to each.
+        # Inputs: start_idx, end_idx (global sample indices covering all DP ranks), sequence_length (int).
+        # Outputs: None.
+        # Exceptions: None explicitly raised.
+        # Side effects: mutates consumed_tokens and sequence_length.
+        # KNOWN ISSUE: dictionary keys come from numpy int16 values; they hash equal to the int keys so this works, but
+        # sequence_length is stored only once and later different values are still used for counting.
         """Update consumed samples/tokens for the current batch.
 
         Args:
@@ -177,6 +229,11 @@ class BlendableDataset(torch.utils.data.Dataset):
             self.consumed_tokens[dataset_idx] += int(count * sequence_length)
 
     def get_consumption_stats(self):
+        # [FUNCTION DOC]
+        # Summary: returns a dictionary from each dataset's folder_path to a dictionary with its consumed "tokens".
+        # Inputs: None. Outputs: dictionary.
+        # Exceptions: AssertionError if a folder_path does not contain "s3".
+        # Side effects: None.
         """Get current consumption statistics for all datasets.
 
         Returns:
@@ -192,6 +249,12 @@ class BlendableDataset(torch.utils.data.Dataset):
 
 
 class MemoryEfficientBlendableDataset(torch.utils.data.Dataset):
+    # [CLASS DOC]
+    # Purpose: blend datasets without storing per-sample indices; global index idx uses bin idx modulo weight_bins, and
+    # each bin is statically assigned to a dataset in proportion to weights.
+    # Key attributes: datasets, size, weight_bins, weights (normalised), ds_index (dataset per bin), ds_index_size (bins
+    # per dataset), ds_bias (rank of the bin within its dataset's bins), ds_size (length of each dataset).
+    # Inherits from torch.utils.data.Dataset.
     """
     A BlendableDataset implementation that uses less memory than the original implementation.
     Indices are computed algorithmically instead of storing them in memory.
@@ -200,6 +263,17 @@ class MemoryEfficientBlendableDataset(torch.utils.data.Dataset):
     """
 
     def __init__(self, datasets, weights, size, weight_bins=100):
+        # [FUNCTION DOC]
+        # Summary: builds the bin tables.
+        # Behavior: cap weight_bins at size; normalise weights (all must be positive); give dataset i the integer part of
+        # weight times weight_bins consecutive bins with biases 0, 1, and so on; fill the remaining bins with the last dataset,
+        # continuing its biases; assert every dataset got at least one bin; record dataset lengths.
+        # Inputs: datasets (list), weights (list of floats), size (int), weight_bins (default 100).
+        # Outputs: None.
+        # Exceptions: AssertionError for non-positive weights or datasets with no bins.
+        # Side effects: None.
+        # KNOWN ISSUE: filler bins start their bias at the last existing bias instead of one past it, so the last dataset gets
+        # a duplicated bias value.
         self.datasets = datasets
         num_datasets = len(datasets)
         assert num_datasets == len(weights)
@@ -238,6 +312,11 @@ class MemoryEfficientBlendableDataset(torch.utils.data.Dataset):
         self.ds_size = np.array([len(ds) for ds in datasets], dtype=np.uint32)
 
     def get_ds_sample_idx(self, idx):
+        # [FUNCTION DOC]
+        # Summary: computes the dataset and local sample for a global idx: dataset is that of bin idx modulo weight_bins;
+        # local sample is bin bias plus (idx divided by weight_bins) times the dataset's bin count, modulo the dataset length.
+        # Inputs: idx (int). Outputs: tuple (dataset index, sample index).
+        # Exceptions: None explicitly raised. Side effects: None.
         """Returns ds index and sample index (within the ds) for the given index in the blendable dataset."""
 
         bin = idx % self.weight_bins
@@ -249,15 +328,26 @@ class MemoryEfficientBlendableDataset(torch.utils.data.Dataset):
         return ds_idx, sample_idx
 
     def __len__(self):
+        # [FUNCTION DOC]
+        # Summary: returns size. Inputs: None. Outputs: int. Exceptions: None explicitly raised. Side effects: None.
         return self.size
 
     def __getitem__(self, idx):
+        # [FUNCTION DOC]
+        # Summary: returns the child item located by get_ds_sample_idx.
+        # Inputs: idx. Outputs: child dataset item. Exceptions: None explicitly raised. Side effects: None.
         ds_idx, sample_idx = self.get_ds_sample_idx(idx)
 
         return self.datasets[ds_idx][sample_idx]
 
     @classmethod
     def test_index_blending(cls):
+        # [FUNCTION DOC]
+        # HELPER: manual visual test; builds three toy datasets with weights 0.5, 0.3 and 0.2, blends 50 samples with 10 and
+        # 100 bins and plots dataset id and sample id per index with matplotlib in interactive mode.
+        # Inputs: cls. Outputs: None.
+        # Exceptions: ImportError if matplotlib is missing.
+        # Side effects: opens matplotlib figures.
         """Visualize indices of blended dataset"""
 
         import matplotlib.pyplot as plt
@@ -265,14 +355,25 @@ class MemoryEfficientBlendableDataset(torch.utils.data.Dataset):
         plt.ion()
 
         class DS(torch.utils.data.Dataset):
+            # [CLASS DOC]
+            # HELPER: toy dataset of a given size whose items are characters of a string, used by test_index_blending.
+            # Attributes: size (int), data (indexable sequence).
             def __init__(self, size, data):
+                # [FUNCTION DOC]
+                # HELPER: stores size and data. Inputs: size (int), data (sequence). Outputs: None.
+                # Exceptions: None explicitly raised. Side effects: sets attributes.
                 self.size = size
                 self.data = data
 
             def __len__(self):
+                # [FUNCTION DOC]
+                # HELPER: returns size. Inputs: None. Outputs: int. Exceptions: None explicitly raised. Side effects: None.
                 return self.size
 
             def __getitem__(self, idx):
+                # [FUNCTION DOC]
+                # HELPER: returns the element of data at idx. Inputs: idx. Outputs: element.
+                # Exceptions: IndexError if out of range. Side effects: None.
                 return self.data[idx]
 
         for weight_bins in [10, 100]:

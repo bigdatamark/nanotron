@@ -1,3 +1,9 @@
+# [MODULE DOC]
+# Purpose: inference script for a trained nanotron Mamba checkpoint; loads the model across dp/pp/tp ranks
+# (launched via torchrun) and greedily generates text with nanotron.generation.decode.
+# Contents: get_args, main. Import-time side effects: tries to import transformers AutoTokenizer (sets it to
+# None if unavailable); creates a module logger.
+# KNOWN ISSUE: usage text in the module docstring shows a triple-dash option instead of --ckpt-path.
 """
 Nanotron Inference Script
 
@@ -56,6 +62,11 @@ logger = logging.get_logger(__name__)
 
 
 def get_args():
+    # [FUNCTION DOC]
+    # HELPER: command-line parsing.
+    # Behavior: defines --ckpt-path (Path, required), --dp, --pp, --tp (ints, default 1) and --max-new-tokens
+    # (int, default 128) and parses sys.argv.
+    # Inputs: none. Outputs: argparse Namespace. Exceptions: SystemExit on bad args. Side effects: reads sys.argv.
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt-path", type=Path, required=True, help="Checkpoint path")
     parser.add_argument("--dp", type=int, default=1)
@@ -66,6 +77,26 @@ def get_args():
 
 
 def main():
+    # [FUNCTION DOC]
+    # Behavior:
+    # 1. Parses args, asserts the checkpoint dir exists, loads config.yaml as MambaConfig (MambaModelConfig as model config).
+    # 2. Builds ParallelismArgs (1F1B engine, ALL_REDUCE TP, no async), prints it, creates ParallelContext, sets
+    #    per-rank log levels to info, logs model config and tokenizer path on rank 0.
+    # 3. Seeds RNG with 42; with ALL_REDUCE TP builds RandomStates holding a TP-synced state, else empty.
+    # 4. Builds MambaForTraining in the configured dtype, marks tied params, sanity-checks, loads weights, sets eval.
+    # 5. If transformers is available: loads the tokenizer, fills a missing pad token (eos, then model pad/eos ids,
+    #    else adds a "[PAD]" token), left padding/truncation, and runs decode_text on the prompt "What is your "
+    #    (greedy, cache on, micro batch 2, bench mode if env USE_BENCH is "1", logits not batch first); on ranks that
+    #    hold outputs (non-TensorPointer) logs decoded input (first 1000 chars) and generated continuation on rank 0.
+    #    Then tokenizes the prompts to CUDA (result unused).
+    #    Otherwise: runs decode_tokenized on a single zero token (12 new tokens) and logs generated ids.
+    # 6. Barrier across all ranks.
+    # Inputs: none (command line). Outputs: None.
+    # Exceptions: AssertionError if checkpoint path missing or output types inconsistent.
+    # Side effects: distributed init and collectives, CUDA usage, file reads, stdout print, logging, RNG seeding,
+    # reads env USE_BENCH, possible tokenizer download.
+    # KNOWN ISSUE: the else branch of the random-state setup is unreachable since tp_mode is hardcoded to ALL_REDUCE;
+    # the final tokenization into input_ids ("Model ref") is dead code.
     args = get_args()
 
     assert args.ckpt_path.exists(), f"Checkpoint path {args.ckpt_path} does not exist"

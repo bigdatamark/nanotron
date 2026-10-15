@@ -1,4 +1,13 @@
 # coding=utf-8
+# [MODULE DOC]
+# Purpose: nanotron implementation of LlaMoE, a Llama-style decoder where each MLP is replaced by a dropless
+# mixture-of-experts layer (dMoE from the sibling moe.py, supporting expert parallelism). Supports tensor
+# parallelism (head-sharded attention, vocab-sharded embedding/lm_head), pipeline parallelism (PipelineBlocks) and
+# KV-cached generation via AttachableStore. Activations are sequence-first (seq, batch, hidden) between blocks.
+# Contents: RotaryEmbedding, CoreAttention (flash-attn varlen), pad_to_right, CausalSelfAttention, LlaMoEDecoderLayer,
+# Embedding, LlaMoEModel, masked_mean, Loss, LlaMoEForTraining, get_flops.
+# Import-time side effects: imports flash_attn and the local config_llamoe module (which itself prints a parameter
+# count and creates a checkpoints directory at import) and moe; compiles masked_mean with TorchScript.
 # Copyright 2018 HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -52,7 +61,16 @@ logger = logging.get_logger(__name__)
 
 
 class RotaryEmbedding(nn.Module):
+    # [CLASS DOC]
+    # Rotary position embedding using a lazily built CUDA buffer freqs_cis of shape (end, dim / 2, 2) storing cos/sin
+    # pairs as real floats (complex buffers break DDP). Used on the inference path; pairs adjacent channels (interleaved).
+    # Attributes: dim (even head dim), end (current max positions, doubled on demand), theta (base, 10000),
+    # freqs_cis, _initialized_buffer flag.
     def __init__(self, dim: int, end: int, theta: float = 10000.0):
+        # [FUNCTION DOC]
+        # Behavior: asserts dim even and stores dim, end, theta; buffer is created later.
+        # Inputs: dim (int); end (int max positions); theta (float, default 10000.0). Outputs: None.
+        # Exceptions: AssertionError if dim is odd. Side effects: None.
         super().__init__()
         assert dim % 2 == 0
         self.dim = dim
@@ -64,6 +82,12 @@ class RotaryEmbedding(nn.Module):
         self._initialized_buffer = False
 
     def init_rotary_embeddings(self):
+        # [FUNCTION DOC]
+        # Behavior: no-op if already initialised. Registers a non-persistent float CUDA buffer, computes inverse frequencies
+        # theta to the power of minus 2i / dim, the outer product with positions 0..end-1, converts to unit complex numbers and
+        # stores their real/imag parts; marks initialised.
+        # Inputs: none. Outputs: None. Exceptions: AssertionError if buffer not on CUDA or not float.
+        # Side effects: allocates a CUDA buffer on the module.
         if self._initialized_buffer is True:
             # Buffer if already initialized
             return
@@ -93,6 +117,14 @@ class RotaryEmbedding(nn.Module):
         x: torch.Tensor,  # [batch_size, seq_length, num_heads, d_qk]
         position_ids: Optional[torch.LongTensor],  # [batch_size, seq_length]
     ):
+        # [FUNCTION DOC]
+        # Behavior: doubles end (and invalidates the buffer) while the last position id or the sequence length reaches it,
+        # printing and rebuilding the buffer if needed. Views x as complex pairs (bf16 upcast to float), selects frequencies
+        # for positions 0..seq-1 (no position_ids) or by position_ids, multiplies, and returns in the input dtype.
+        # Inputs: x (batch, seq, heads, d_qk); position_ids (optional (batch, seq) long tensor).
+        # Outputs: rotated tensor with the shape and dtype of x.
+        # Exceptions: AssertionError if d_qk odd; ValueError if the last position id is negative or out of range.
+        # Side effects: may mutate end and rebuild the buffer; stdout print; possible CPU-GPU sync.
         batch_size, seq_length, num_heads, inner_dim = x.shape
         while (
             position_ids is not None and position_ids[-1, -1] >= self.end
@@ -123,7 +155,14 @@ class RotaryEmbedding(nn.Module):
 
 
 class CoreAttention(nn.Module):
+    # [CLASS DOC]
+    # Thin flash-attention wrapper for training on packed (varlen) sequences. Attributes: d_qk, d_v (hidden / heads),
+    # checkpoint_attention (False; flash-attn already recomputes). Construction asserts hidden_size divisible by heads.
     def __init__(self, config: LlaMoEConfig, parallel_config: Optional[ParallelismArgs], layer_idx: int):
+        # [FUNCTION DOC]
+        # Behavior: asserts divisibility, stores head dims, disables activation checkpointing.
+        # Inputs: config (LlaMoEConfig); parallel_config (optional, unused); layer_idx (int, unused). Outputs: None.
+        # Exceptions: AssertionError if hidden_size is not divisible by num_attention_heads. Side effects: None.
         super().__init__()
         assert (
             config.hidden_size % config.num_attention_heads == 0
@@ -142,6 +181,16 @@ class CoreAttention(nn.Module):
         q_sequence_mask: torch.Tensor,  # torch.BoolTensor [batch_size, q_length] (can be broadcasted to that size)
         kv_sequence_mask: torch.Tensor,  # torch.BoolTensor [batch_size, kv_length] (can be broadcasted to that size)
     ):
+        # [FUNCTION DOC]
+        # Behavior: builds int32 cumulative sequence lengths from the q and kv masks (prefix zero), sets causal unless the
+        # query length is 1, and calls flash_attn_varlen_func with no dropout and default scale. Wrapped by checkpoint_method
+        # (inactive since checkpoint_attention is False).
+        # Inputs: query_states (batch*q_len, local q heads, d_qk); key_states and value_states (batch*kv_len, local kv heads,
+        # dim); q_sequence_mask (batch, q_len bool); kv_sequence_mask (batch, kv_len bool).
+        # Outputs: attention output (batch*q_len, local q heads, d_v).
+        # Exceptions: None explicitly raised. Side effects: CUDA kernels.
+        # KNOWN ISSUE: cu_seqlens are derived from mask sums but q/k are the full unpacked batch*len tensors, so this is only
+        # correct when masks are all true (no padding).
         # TODO @thomasw21: Compute once, instead of computing for each layers.
         cu_seqlens_q = torch.zeros((q_sequence_mask.shape[0] + 1), dtype=torch.int32, device=query_states.device)
         cu_seqlens_k = torch.zeros((kv_sequence_mask.shape[0] + 1), dtype=torch.int32, device=query_states.device)
@@ -169,6 +218,13 @@ class CoreAttention(nn.Module):
 
 
 def pad_to_right(tensor, mask, new_tensor=None):
+    # [FUNCTION DOC]
+    # HELPER: converts left-padded key/value states into right-padded layout for the KV cache during prefill.
+    # Behavior: counts valid tokens per row, builds a right-padded mask (positions below the count), gathers the valid
+    # entries of tensor and scatters them into the first positions of new_tensor (zeros like tensor if not given).
+    # Inputs: tensor (batch, seq, d1, d2); mask (batch, seq bool); new_tensor (optional (batch, longer seq, d1, d2)).
+    # Outputs: tuple (new_tensor, right_padded_mask (batch, seq)).
+    # Exceptions: None explicitly raised. Side effects: writes into new_tensor in place when provided.
     """Transform a left-padded tensor into a right-padded tensor. (Useful for prefilling key/value states)
     Args:
         tensor: (batch_size, seqlen, d1, d2)
@@ -197,6 +253,13 @@ def pad_to_right(tensor, mask, new_tensor=None):
 
 
 class CausalSelfAttention(nn.Module, AttachableStore):
+    # [CLASS DOC]
+    # Multi-head / grouped-query self-attention with TP sharding over heads. qkv_proj is column parallel (q, k, v
+    # contiguous chunks so sharding happens within each), o_proj row parallel. Training uses flash-attn rotary
+    # (interleaved) plus CoreAttention; inference (store attached) uses RotaryEmbedding with position ids, varlen
+    # flash-attn for prefill with a preallocated KV cache, and flash_attn_with_kvcache for decoding.
+    # Attributes: n_local_q_heads, n_local_kv_heads, n_repeats, is_gqa, d_qk, d_v, d_model, qkv_proj, rotary_embedding,
+    # flash_rotary_embedding, o_proj, attention, prefill_kv_len (max_position_embeddings).
     def __init__(
         self,
         config: LlaMoEConfig,
@@ -204,6 +267,13 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         tp_pg: dist.ProcessGroup,
         layer_idx: int,
     ):
+        # [FUNCTION DOC]
+        # Behavior: asserts q heads and kv heads divisible by TP size (falling back to kv heads = q heads with a warning if
+        # the attribute is missing) and q heads divisible by kv heads; computes local head counts and dims; resolves TP mode
+        # and async flag; builds qkv_proj, both rotary embeddings, o_proj and CoreAttention.
+        # Inputs: config (LlaMoEConfig, may be mutated); parallel_config (optional); tp_pg; layer_idx (int).
+        # Outputs: None. Exceptions: AssertionError on divisibility violations.
+        # Side effects: may set config.num_key_value_heads; logging; parameter allocation.
         super().__init__()
         # Tensor parallel considerations: We split tensors along head dimension
         assert (
@@ -288,6 +358,24 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         hidden_states,  # [seq_length, batch_size, hidden_size]
         sequence_mask,  # [batch_size, seq_length]
     ):
+        # [FUNCTION DOC]
+        # Behavior: projects to qkv (seq, batch, ...). GQA: splits into q, k, v and reshapes each to (batch, seq, heads, d);
+        # otherwise views as (seq, batch, 3, heads, d) and permutes to three (batch, seq, heads, d) tensors.
+        # Inference (store present): asserts no grad; position ids are previous offsets plus mask, or cumulative mask minus 1;
+        # applies RotaryEmbedding to q and k. Prefill (no cached key): asserts padding only on the left, allocates zero
+        # k/v caches of length prefill_kv_len, unpads q/k/v, runs causal varlen flash-attn, re-pads output, and copies k/v
+        # into the caches right-padded. Decode: loads caches, grows them with zeros if the rotary end grew, asserts cache length
+        # equals rotary end, and calls flash_attn_with_kvcache with cache_seqlens equal to the position offsets (appends new
+        # k/v in place). Stores key, value, position_offsets.
+        # Training: applies flash rotary to q and stacked k/v, flattens to (batch*seq, heads, d) and runs CoreAttention.
+        # Finally reshapes to (seq, batch, local heads * d_v) and applies o_proj.
+        # Inputs: hidden_states (seq, batch, hidden); sequence_mask (batch, seq bool).
+        # Outputs: dictionary with hidden_states (seq, batch, hidden) and sequence_mask.
+        # Exceptions: AssertionError for grad-enabled inference, middle-of-sequence masking or cache size mismatch.
+        # Side effects: mutates the attached store; TP collectives in projections; CUDA kernels.
+        # KNOWN ISSUE: decode-time cache_seqlens use the new position offset (already including the current token) rather than
+        # the number of cached tokens, which may be off by one; prefill caches are sized prefill_kv_len while decode asserts
+        # size equals rotary end, which fails if the rotary end grew during prefill.
         qkv_states = self.qkv_proj(
             hidden_states
         )  # [seq_length, batch_size, n_local_q_heads * d_qk + 2 * n_local_kv_heads * d_qk]
@@ -526,6 +614,9 @@ class CausalSelfAttention(nn.Module, AttachableStore):
 
 
 class LlaMoEDecoderLayer(nn.Module):
+    # [CLASS DOC]
+    # Pre-norm transformer block: TritonRMSNorm, CausalSelfAttention, residual add, TritonRMSNorm, dMoE sparse MLP,
+    # residual add. Attributes: input_layernorm, attn, post_attention_layernorm, block_sparse_moe.
     def __init__(
         self,
         config: LlaMoEConfig,
@@ -534,6 +625,10 @@ class LlaMoEDecoderLayer(nn.Module):
         parallel_context: ParallelContext,
         layer_idx: int,
     ):
+        # [FUNCTION DOC]
+        # Behavior: builds the two norms (eps rms_norm_eps), attention and the dMoE (given parallel_context for expert groups).
+        # Inputs: config; parallel_config (optional); tp_pg; parallel_context; layer_idx. Outputs: None.
+        # Exceptions: None explicitly raised. Side effects: parameter allocation.
         super().__init__()
         self.input_layernorm = TritonRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attn = CausalSelfAttention(
@@ -556,6 +651,11 @@ class LlaMoEDecoderLayer(nn.Module):
         hidden_states: Union[torch.Tensor, TensorPointer],
         sequence_mask: Union[torch.Tensor, TensorPointer],
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
+        # [FUNCTION DOC]
+        # Behavior: hidden = hidden + attention(norm(hidden)); hidden = hidden + moe(norm(hidden)); router logits discarded.
+        # Inputs: hidden_states (seq, batch, hidden); sequence_mask (batch, seq).
+        # Outputs: dictionary with hidden_states and sequence_mask.
+        # Exceptions: None explicitly raised. Side effects: TP and expert-parallel collectives.
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -575,7 +675,13 @@ class LlaMoEDecoderLayer(nn.Module):
 
 
 class Embedding(nn.Module, AttachableStore):
+    # [CLASS DOC]
+    # Token embedding pipeline stage with a vocab-sharded TensorParallelEmbedding; tracks past_length in a generation
+    # store and outputs sequence-first embeddings. Attributes: token_embedding, pg.
     def __init__(self, tp_pg: dist.ProcessGroup, config: LlaMoEConfig, parallel_config: Optional[ParallelismArgs]):
+        # [FUNCTION DOC]
+        # Behavior: builds the TP embedding (vocab_size by hidden_size, padding_idx pad_token_id, TP mode default ALL_REDUCE).
+        # Inputs: tp_pg; config; parallel_config (optional). Outputs: None. Exceptions: None. Side effects: allocation.
         super().__init__()
         self.token_embedding = TensorParallelEmbedding(
             num_embeddings=config.vocab_size,
@@ -587,6 +693,11 @@ class Embedding(nn.Module, AttachableStore):
         self.pg = tp_pg
 
     def forward(self, input_ids: torch.Tensor, input_mask: torch.Tensor):  # [batch_size, seq_length]
+        # [FUNCTION DOC]
+        # Behavior: when a store is attached adds the per-row count of valid tokens to store past_length (zeros initially);
+        # transposes input_ids to (seq, batch) and embeds.
+        # Inputs: input_ids (batch, seq); input_mask (batch, seq). Outputs: dictionary with input_embeds (seq, batch, hidden).
+        # Exceptions: None. Side effects: store mutation; TP collective.
         store = self.get_local_store()
         if store is not None:
             if "past_length" in store:
@@ -605,6 +716,10 @@ class Embedding(nn.Module, AttachableStore):
 
 
 class LlaMoEModel(nn.Module):
+    # [CLASS DOC]
+    # Pipeline graph of LlaMoE: token_position_embeddings, decoder (LlaMoEDecoderLayer per layer), final_layer_norm
+    # (TritonRMSNorm), lm_head (column-parallel, vocab-sharded logits), cast_to_fp32; all PipelineBlocks sharing one P2P on
+    # the PP group. Attributes: p2p, config, parallel_config, parallel_context, tp_mode.
     """Build pipeline graph"""
 
     def __init__(
@@ -613,6 +728,9 @@ class LlaMoEModel(nn.Module):
         parallel_context: ParallelContext,
         parallel_config: Optional[ParallelismArgs],
     ):
+        # [FUNCTION DOC]
+        # Behavior: creates P2P on CUDA, resolves TP mode/async defaults and declares the pipeline blocks with their keys.
+        # Inputs: config; parallel_context; parallel_config (optional). Outputs: None. Exceptions: None. Side effects: None beyond construction.
         super().__init__()
 
         # Declare all the nodes
@@ -694,6 +812,10 @@ class LlaMoEModel(nn.Module):
         input_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
         input_mask: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
     ):
+        # [FUNCTION DOC]
+        # Behavior: returns the first element (fp32 sharded logits) of forward_with_hidden_states.
+        # Inputs: input_ids, input_mask ((batch, seq) or TensorPointers). Outputs: logits (seq, batch, local vocab) or TensorPointer.
+        # Exceptions: None. Side effects: PP/TP communication.
         return self.forward_with_hidden_states(input_ids=input_ids, input_mask=input_mask)[0]
 
     def forward_with_hidden_states(
@@ -701,8 +823,12 @@ class LlaMoEModel(nn.Module):
         input_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
         input_mask: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
     ):
+        # [FUNCTION DOC]
+        # Behavior: embeds, runs all decoder blocks, final norm, lm_head and fp32 cast.
+        # Inputs: input_ids, input_mask. Outputs: tuple (fp32 sharded logits, final hidden states), tensors or TensorPointers.
+        # Exceptions: None. Side effects: PP P2P transfers, TP and expert collectives.
         # all tensors are optional as most ranks don't need anything from the dataloader.
-
+        #
         output = self.token_position_embeddings(input_ids=input_ids, input_mask=input_mask)
 
         hidden_encoder_states = {
@@ -721,6 +847,10 @@ class LlaMoEModel(nn.Module):
         return fp32_sharded_logits, hidden_states
 
     def get_block_compute_costs(self):
+        # [FUNCTION DOC]
+        # Behavior: relative costs for pipeline balancing: decoder layer 4 * heads * d_qkv * hidden + 3 * d_ff * hidden;
+        # lm_head vocab * hidden. Outputs: dictionary class to cost. Exceptions: None. Side effects: None.
+        # KNOWN ISSUE: treats the MoE MLP as a single dense MLP (ignores experts per token).
         """Computes the compute cost of each block in the model so that we can do a better job of load balancing."""
         model_config = self.config
         d_ff = model_config.intermediate_size
@@ -735,6 +865,11 @@ class LlaMoEModel(nn.Module):
         return block_compute_costs
 
     def get_flops_per_sec(self, iteration_time_in_sec, sequence_length, global_batch_size):
+        # [FUNCTION DOC]
+        # Behavior: calls get_flops with config sizes (kv heads default to q heads) and divides model and hardware flops by
+        # iteration time, world size and 1e12.
+        # Inputs: iteration_time_in_sec; sequence_length; global_batch_size. Outputs: tuple (model TFLOPs/s, hardware TFLOPs/s).
+        # Exceptions: None. Side effects: None.
         """Get flops per second for a given model"""
         world_size = self.parallel_context.world_pg.size()
         try:
@@ -760,12 +895,19 @@ class LlaMoEModel(nn.Module):
 
 @torch.jit.script
 def masked_mean(loss, label_mask, dtype):
+    # [FUNCTION DOC]
+    # HELPER: TorchScript-compiled mean of loss over label_mask positions (sum of products in dtype divided by mask sum).
+    # Inputs: loss, label_mask (batch, seq), dtype. Outputs: scalar tensor. Exceptions: None. Side effects: None.
     # type: (Tensor, Tensor, torch.dtype) -> Tensor
     return (loss * label_mask).sum(dtype=dtype) / label_mask.sum()
 
 
 class Loss(nn.Module):
+    # [CLASS DOC]
+    # Pipeline stage computing masked mean cross entropy from vocab-sharded sequence-first logits. Attribute: tp_pg.
     def __init__(self, tp_pg: dist.ProcessGroup):
+        # [FUNCTION DOC]
+        # Behavior: stores tp_pg. Inputs: tp_pg. Outputs: None. Exceptions: None. Side effects: None.
         super().__init__()
         self.tp_pg = tp_pg
 
@@ -775,6 +917,11 @@ class Loss(nn.Module):
         label_ids: torch.Tensor,  # [batch_size, seq_length]
         label_mask: torch.Tensor,  # [batch_size, seq_length]
     ) -> Dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Behavior: transposes labels to (seq, batch), computes fp32 sharded_cross_entropy across the TP group, transposes back
+        # and takes the masked mean.
+        # Inputs: sharded_logits (seq, batch, local vocab); label_ids (batch, seq); label_mask (batch, seq).
+        # Outputs: dictionary with loss scalar. Exceptions: None. Side effects: TP all-reduces.
         # Megatron by defaults cast everything in fp32. `--f16-lm-cross-entropy` is an option you can use to keep current precision.
         # https://github.com/NVIDIA/Megatron-LM/blob/f267e6186eae1d6e2055b412b00e2e545a8e896a/megatron/model/gpt_model.py#L38
         loss = sharded_cross_entropy(
@@ -788,6 +935,9 @@ class Loss(nn.Module):
 
 
 class LlaMoEForTraining(NanotronModel):
+    # [CLASS DOC]
+    # NanotronModel wrapper for training LlaMoE: LlaMoEModel plus a Loss PipelineBlock; provides random init, block
+    # costs and flops hooks. Attributes: model, loss, parallel_context, config, parallel_config.
     def __init__(
         self,
         config: LlaMoEConfig,
@@ -795,6 +945,10 @@ class LlaMoEForTraining(NanotronModel):
         parallel_config: Optional[ParallelismArgs],
         random_states: Optional[RandomStates] = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: builds LlaMoEModel and the Loss block, stores contexts.
+        # Inputs: config; parallel_context; parallel_config (optional); random_states (optional, unused). Outputs: None.
+        # Exceptions: None. Side effects: construction only.
         super().__init__()
         self.model = LlaMoEModel(config=config, parallel_context=parallel_context, parallel_config=parallel_config)
         self.loss = PipelineBlock(
@@ -819,6 +973,10 @@ class LlaMoEForTraining(NanotronModel):
         label_ids: Union[torch.Tensor, TensorPointer],
         label_mask: Union[torch.Tensor, TensorPointer],
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
+        # [FUNCTION DOC]
+        # Behavior: model logits then loss. Inputs: input_ids, input_mask, label_ids, label_mask.
+        # Outputs: dictionary with loss (tensor on last PP rank, TensorPointer elsewhere). Exceptions: None.
+        # Side effects: PP/TP/expert communication.
         sharded_logits = self.model(
             input_ids=input_ids,
             input_mask=input_mask,
@@ -832,6 +990,17 @@ class LlaMoEForTraining(NanotronModel):
 
     @torch.no_grad()
     def init_model_randomly(self, config):
+        # [FUNCTION DOC]
+        # Behavior (no grad): std and sigma both come from config.model.init_method.std. For each NanotronParameter, resolves the
+        # full (tied-aware) name, skips duplicates, then by owning module: TP column linear weight normal(0, std), bias zero;
+        # TP row linear weight normal(0, sigma / sqrt(2 * layers)), bias zero; TritonRMSNorm weight 1, bias 0; plain nn.Linear
+        # (e.g. the router) weight Kaiming uniform, bias uniform; TP embedding normal(0, std). Asserts all parameters initialised.
+        # Inputs: config (full nanotron Config with a RandomInit). Outputs: None.
+        # Exceptions: ValueError for unknown parameter names; Exception for parameters owned by unhandled module types (e.g.
+        # dMoE expert weights registered directly on a non-listed module); AssertionError for non-Nanotron params or mismatch.
+        # Side effects: in-place parameter writes; RNG consumption.
+        # KNOWN ISSUE: for nn.Linear biases fan_in is always None (set only in the weight iteration), so the bias bound is 0;
+        # the docstring mentions apply_layernorm_1p which the code does not use.
         """Initialize model parameters randomly.
         Note:
             Layernorm weight all 0 or 1 depending on `apply_layernorm_1p`
@@ -916,10 +1085,14 @@ class LlaMoEForTraining(NanotronModel):
         }, f"Somehow the initialized set of parameters don't match:\n - Expected: { {name for name, _ in model.named_parameters()} }\n - Got: {initialized_parameters}"
     
     def get_block_compute_costs(self):
+        # [FUNCTION DOC]
+        # Behavior: delegates to LlaMoEModel.get_block_compute_costs. Outputs: dictionary. Exceptions: None. Side effects: None.
         """Computes the compute cost of each block in the model so that we can do a better job of load balancing."""
         return self.model.get_block_compute_costs()
 
     def get_flops_per_sec(self, iteration_time_in_sec, sequence_length, global_batch_size):
+        # [FUNCTION DOC]
+        # Behavior: delegates to LlaMoEModel.get_flops_per_sec. Outputs: tuple of TFLOPs/s. Exceptions: None. Side effects: None.
         """Get flops per second for a given model"""
         return self.model.get_flops_per_sec(iteration_time_in_sec, sequence_length, global_batch_size)
 
@@ -934,6 +1107,15 @@ def get_flops(
     ffn_hidden_size,
     batch_size=1,
 ):
+    # [FUNCTION DOC]
+    # HELPER: analytic flop count for a decoder-only transformer.
+    # Behavior: per layer forward flops (2 per MAC) for q and kv projections, QK logits, attention-weighted values, output
+    # projection, and a gated FFN (first layer counted twice for gate and up, second once), plus lm_head; model flops are
+    # three times forward (forward plus double for backward); hardware flops equal model flops.
+    # Inputs: num_layers, hidden_size, num_heads, num_key_value_heads (None means num_heads), vocab_size, seq_len,
+    # ffn_hidden_size, batch_size (default 1). Outputs: tuple (model_flops, hardware_flops).
+    # Exceptions: None. Side effects: None.
+    # KNOWN ISSUE: ignores MoE top-k (counts one dense FFN per token) and the router.
     """Counts flops in an decoder-only model
     Args:
         num_layers: number of decoder layers
