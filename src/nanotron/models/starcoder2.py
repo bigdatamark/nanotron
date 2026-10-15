@@ -1,4 +1,15 @@
 # coding=utf-8
+# [MODULE DOC]
+# Purpose: nanotron implementation of StarCoder2 / GPT-BigCode style decoder models: LayerNorm, biased linears,
+# GELU-type MLP, dropout, GPT-NeoX rotary embeddings, sliding-window attention (SWA, except on global layers),
+# and either multi-query attention (MQA, one shared KV head duplicated across TP ranks with a custom fused,
+# communication-overlapping projection) or grouped-query attention (GQA). Supports TP, PP (PipelineBlocks),
+# KV-cache inference via AttachableStore, and TP-synchronized dropout RNG.
+# Main contents: pad_to_right, rotate_half, StarcoderRotaryEmbedding, MLP, CoreAttention, get_sliced_parameter,
+# _MQAColumnLinearReduceScatterAsyncCommunication, MQAColumnLinears, CausalSelfMQA, CausalSelfGQA, dropout_add helpers,
+# GPTBlock, Embedding, GPTModel, masked_mean, Loss, Starcoder2ForTraining, get_flops.
+# Layout: activations sequence-first [seq, batch, hidden]; masks [batch, seq]; logits vocab-sharded.
+# Import-time side effects: TorchScript-compiles rotate_half, dropout_add, dropout_add_fused_train and masked_mean.
 # Copyright 2018 HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -59,6 +70,12 @@ from nanotron.utils import checkpoint_method
 
 
 def pad_to_right(tensor, mask, new_tensor=None):
+    # [FUNCTION DOC]
+    # HELPER: converts left-padded KV states to right-padded caches during prefill.
+    # Behavior: count valid tokens per row, build a mask with that many leading True values, gather valid entries in row
+    # order and write them at the start of each row of new_tensor (zeros-like of tensor if None).
+    # Inputs: tensor [batch, seqlen, d1, d2]; mask boolean [batch, seqlen]; new_tensor optional [batch, new_len, d1, d2].
+    # Outputs: tuple (new_tensor, right_padded_mask). Exceptions: None explicitly raised. Side effects: mutates new_tensor in place.
     """Transform a left-padded tensor into a right-padded tensor. (Useful for prefilling key/value states)
     Args:
         tensor: (batch_size, seqlen, d1, d2)
@@ -89,14 +106,25 @@ def pad_to_right(tensor, mask, new_tensor=None):
 # rotary pos emb helpers (torch.jit.script does not seem to support staticmethod...)
 @torch.jit.script
 def rotate_half(x):
+    # [FUNCTION DOC]
+    # HELPER: TorchScript rotate-half for GPT-NeoX RoPE.
+    # Behavior: split last dim into halves x1, x2 and return concatenation of negated x2 and x1.
+    # Inputs: x tensor. Outputs: same-shape tensor. Exceptions: None. Side effects: None.
     x1, x2 = x[..., : x.shape[-1] // 2], x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
 
 class StarcoderRotaryEmbedding(nn.Module):
+    # [CLASS DOC]
+    # Purpose: GPT-NeoX (non-interleaved) rotary embedding with lazily computed inverse frequencies on CUDA and a
+    # cos/sin cache that grows with the longest requested length.
+    # State: base, head_dim, inv_freq (non-persistent buffer), seq_len_cached, cos_cached and sin_cached ([1, len, 1, head_dim]), _initialized_buffer.
     """Implementation of RotaryEmbedding from GPT-NeoX."""
 
     def __init__(self, head_dim: int, base: int):
+        # [FUNCTION DOC]
+        # Behavior: store base and head_dim, register an empty float buffer for inverse frequencies, empty caches.
+        # Inputs: head_dim (int), base (rope theta). Outputs: None. Exceptions: None. Side effects: buffer allocation (device from context).
         super().__init__()
         self.base = base
         self.head_dim = head_dim
@@ -113,6 +141,9 @@ class StarcoderRotaryEmbedding(nn.Module):
         self._initialized_buffer = False
 
     def init_rotary_embeddings(self):
+        # [FUNCTION DOC]
+        # Behavior: if not yet done: assert buffer on CUDA, force float32, then set inv_freq to 1 over base to the power of 2i/head_dim computed on CUDA; mark initialized.
+        # Inputs: none. Outputs: None. Exceptions: AssertionError if not on CUDA. Side effects: replaces the buffer.
         if self._initialized_buffer is True:
             # Buffer if already initialized
             return
@@ -130,6 +161,13 @@ class StarcoderRotaryEmbedding(nn.Module):
         self._initialized_buffer = True
 
     def cos_sin(self, seq_len: int, past_key_values_length: int, device="cpu", dtype=torch.bfloat16) -> torch.Tensor:
+        # [FUNCTION DOC]
+        # Behavior: if seq_len plus past length exceeds the cached length, recompute angle table for that many positions
+        # (float32 when dtype is half/bfloat16), store cos/sin with broadcast dims cast to dtype. Return the slices for
+        # positions past_key_values_length to past plus seq_len.
+        # Inputs: seq_len (int), past_key_values_length (int), device (default cpu), dtype (default bfloat16).
+        # Outputs: tuple (cos, sin), each [1, seq_len, 1, head_dim]. Exceptions: None explicitly raised. Side effects: updates caches.
+        # KNOWN ISSUE: the cache is keyed only on length, so a later call with a different dtype or device reuses stale tensors; the return annotation says a single tensor but a tuple is returned.
         total_length = seq_len + past_key_values_length
         if total_length > self.seq_len_cached:
             self.seq_len_cached = total_length
@@ -152,6 +190,11 @@ class StarcoderRotaryEmbedding(nn.Module):
         )
 
     def forward(self, query, key, past_key_values_length=0):
+        # [FUNCTION DOC]
+        # Behavior: lazily init, get cos/sin for the query length offset by past_key_values_length, return rotated query and key (x times cos plus rotate_half(x) times sin).
+        # Inputs: query [batch, seq, heads, d]; key [batch, seq, kv_heads, d]; past_key_values_length (int, default 0).
+        # Outputs: tuple (query, key). Exceptions: AssertionError from init. Side effects: cache updates.
+        # KNOWN ISSUE: positions are the same for every row (no position_ids), so left padding shifts positions during inference.
         """
         Args:
             query: [batch_size, seq_len, num_heads, head_dim]
@@ -173,12 +216,17 @@ class StarcoderRotaryEmbedding(nn.Module):
 
 
 class MLP(nn.Module):
+    # [CLASS DOC]
+    # Purpose: TP-sharded two-layer MLP with biases: column-parallel c_fc (hidden to d_ff, default 4 times hidden when n_inner is None), scripted activation, row-parallel c_proj.
     def __init__(
         self,
         config: Starcoder2Config,
         parallel_config: Optional[ParallelismArgs],
         tp_pg: dist.ProcessGroup,
     ):
+        # [FUNCTION DOC]
+        # Behavior: derive TP mode/async flag (c_proj async only in REDUCE_SCATTER) and build layers.
+        # Inputs: config, parallel_config (optional), tp_pg. Outputs: None. Exceptions: KeyError for unknown activation. Side effects: allocation.
         super().__init__()
 
         # TODO @thomasw21: refactor so that we store that default in a single place.
@@ -207,6 +255,9 @@ class MLP(nn.Module):
         )
 
     def forward(self, hidden_states):  # [seq_length, batch_size, hidden_dim]
+        # [FUNCTION DOC]
+        # Behavior: c_fc, activation, c_proj. Inputs: hidden_states [seq, batch, hidden]. Outputs: dict with hidden_states.
+        # Exceptions: None explicitly raised. Side effects: TP collectives.
         hidden_states = self.c_fc(hidden_states)
         hidden_states = self.act(hidden_states)
         hidden_states = self.c_proj(hidden_states)
@@ -214,11 +265,18 @@ class MLP(nn.Module):
 
 
 class CoreAttention(nn.Module):
+    # [CLASS DOC]
+    # Purpose: variable-length flash attention with optional sliding window and attention dropout during training.
+    # State: d_qk, d_v, dropout, checkpoint_attention (False), sliding_window_size (None on layers listed in global_attn_layers).
     """
     Attention module similar to CoreAttention where only the query is multi-headed.
     """
 
     def __init__(self, config: Starcoder2Config, parallel_config: Optional[ParallelismArgs], layer_idx: int):
+        # [FUNCTION DOC]
+        # Behavior: check flash-attn supports window_size if SWA is configured; assert hidden divisible by heads and scale_attn_weights true; store dims, dropout, window.
+        # Inputs: config, parallel_config (unused), layer_idx. Outputs: None.
+        # Exceptions: AssertionError on divisibility, scale_attn_weights false, or missing flash-attn window support. Side effects: None.
         super().__init__()
         from flash_attn.flash_attn_interface import flash_attn_varlen_func
 
@@ -254,6 +312,12 @@ class CoreAttention(nn.Module):
         q_sequence_mask: torch.Tensor,  # torch.BoolTensor [batch_size, q_length] (can be broadcasted to that size)
         kv_sequence_mask: torch.Tensor,  # torch.BoolTensor [batch_size, kv_length] (can be broadcasted to that size)
     ):
+        # [FUNCTION DOC]
+        # Behavior: cumulative sequence lengths from mask row sums; causal unless query length is 1; flash varlen attention
+        # with dropout only in training, default scale, window (size minus 1 to the left) or unlimited. Wrapped by checkpoint_method (disabled).
+        # Inputs: query [batch*q_len, heads, d]; key/value [batch*kv_len, kv_heads, d]; q/kv sequence masks [batch, len].
+        # Outputs: [batch*q_len, heads, d_v]. Exceptions: flash-attn errors. Side effects: consumes CUDA RNG for dropout.
+        # KNOWN ISSUE: assumes valid tokens are contiguous at row starts; the padded rows are not actually unpacked.
         from flash_attn.flash_attn_interface import flash_attn_varlen_func
 
         # TODO @thomasw21: Compute once, instead of computing for each layers.
@@ -285,6 +349,13 @@ class CoreAttention(nn.Module):
 
 # Hack to propagage gradient correctly
 def get_sliced_parameter(coalesced_tensor: torch.Tensor, slice_object: slice):
+    # [FUNCTION DOC]
+    # HELPER: exposes a slice of a coalesced buffer as an independent NanotronParameter sharing storage (used by MQAColumnLinears).
+    # Behavior: create a leaf NanotronParameter over the slice under no_grad; if the coalesced tensor requires grad, register a
+    # hook that, on its gradient, sets the slice parameter's grad to the matching slice of the coalesced grad (or of the incoming
+    # grad when the coalesced grad is None; resets coalesced grad if the slice grad was cleared).
+    # Inputs: coalesced_tensor; slice_object. Outputs: NanotronParameter view. Exceptions: AssertionError in the hook if the grad is non-contiguous.
+    # Side effects: registers an autograd hook.
     with torch.no_grad():
         # This allows us to create a leaf tensor, despite sharing the underlying storage
         result = NanotronParameter(tensor=coalesced_tensor[slice_object])
@@ -292,6 +363,9 @@ def get_sliced_parameter(coalesced_tensor: torch.Tensor, slice_object: slice):
     # We need sliced tensor to also get the gradient in order to run optimizer on them
     # TODO @thomasw21: It's really had to make sure that our sliced view keeps the same memory space as the original gradient
     def get_grad_view(orig_grad):
+        # [FUNCTION DOC]
+        # HELPER: autograd hook described above. Inputs: orig_grad. Outputs: orig_grad unchanged.
+        # Exceptions: AssertionError for non-contiguous grad. Side effects: sets result.grad and possibly clears coalesced_tensor.grad.
         assert orig_grad.is_contiguous()
         if result.grad is None:
             # The gradient was reset to None, we need to reset the coalesced_tensor.grad as well
@@ -311,6 +385,10 @@ def get_sliced_parameter(coalesced_tensor: torch.Tensor, slice_object: slice):
 
 
 class _MQAColumnLinearReduceScatterAsyncCommunication(torch.autograd.Function):
+    # [CLASS DOC]
+    # Purpose: custom autograd function computing the MQA q (TP-sharded) and kv (TP-duplicated) projections in
+    # REDUCE_SCATTER mode with async communication, overlapping the input all-gather with kv compute and the kv-output
+    # all-gather with q compute in forward, and the input all-gather and gradient reduce-scatter with matmuls in backward.
     """This computes `q` and `kv` computation in MQA setting.
 
     Basic assumptions:
@@ -339,6 +417,12 @@ class _MQAColumnLinearReduceScatterAsyncCommunication(torch.autograd.Function):
         qkv_weight: torch.Tensor,
         tp_pg: dist.ProcessGroup,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Behavior: save group and bias flags; if TP above 1 start async all-gather of the sequence-sharded input; compute kv on the
+        # local shard; wait; start async all-gather of kv output; compute q on the gathered input; wait; save input and fused qkv weight.
+        # Inputs: ctx; x [seq/tp, batch, hidden]; q_weight, q_bias (optional), kv_weight, kv_bias (optional); qkv_weight (concatenation, same storage); tp_pg.
+        # Outputs: tuple (q [seq, batch, q_local], gathered kv [seq, batch, kv]). Exceptions: None explicitly raised.
+        # Side effects: all_gather_into_tensor collectives over tp_pg.
         ctx.tp_pg = tp_pg
         ctx.use_q_bias = q_bias is not None
         ctx.use_kv_bias = kv_bias is not None
@@ -412,6 +496,14 @@ class _MQAColumnLinearReduceScatterAsyncCommunication(torch.autograd.Function):
     def backward(
         ctx, grad_q: torch.Tensor, grad_kv: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor], None, None]:
+        # [FUNCTION DOC]
+        # Behavior: re-gather the input asynchronously; compute input gradient as concatenated grads times the fused weight; wait;
+        # start async reduce-scatter of the input gradient; compute fused weight gradient from gathered input and split into q and kv
+        # parts; compute bias grads per flags; wait; return grads in forward-argument order (None for qkv_weight and group).
+        # Inputs: ctx, grad_q, grad_kv. Outputs: tuple of 7 gradients. Exceptions: None explicitly raised.
+        # Side effects: all_gather and reduce_scatter collectives over tp_pg.
+        # KNOWN ISSUE: the bias logic is inverted when q has no bias: grad_kv_bias is computed when kv has no bias and set to None when it does.
+        # KNOWN ISSUE: kv gradients are computed from the full gathered input although kv was computed from the local shard in forward; this relies on the SUM tie-reduction across TP to be consistent.
         tp_pg = ctx.tp_pg
         split_q_and_kv_id = ctx.split_q_and_kv_id
         use_q_bias = ctx.use_q_bias
@@ -502,6 +594,11 @@ class _MQAColumnLinearReduceScatterAsyncCommunication(torch.autograd.Function):
 
 
 class MQAColumnLinears(nn.Module):
+    # [CLASS DOC]
+    # Purpose: fused projection producing TP-sharded q and replicated kv for MQA, backed by one coalesced weight (and bias)
+    # buffer whose slices are exposed as parameters q.weight/q.bias (marked sharded on dim 0) and kv.weight/kv.bias (to be tied across TP).
+    # State: pg, world_size, in_features, q_out_features (local), kv_out_features, mode, async_communication,
+    # use_MQAColumnLinearReduceScatterAsyncCommunication, _qkv_weight and _qkv_bias buffers, q and kv ParameterDicts.
     def __init__(
         self,
         in_features: int,
@@ -514,6 +611,11 @@ class MQAColumnLinears(nn.Module):
         dtype=None,
         async_communication: bool = False,
     ):
+        # [FUNCTION DOC]
+        # Behavior: assert in_features divisible by TP size; allocate coalesced buffers (requiring grad unless the custom async path is used);
+        # create sliced parameters; mark q params as sharded; initialize like nn.Linear.
+        # Inputs: in_features, q_out_features (global), kv_out_features, pg, mode, bias (default True), device, dtype, async_communication (default False).
+        # Outputs: None. Exceptions: AssertionError on divisibility. Side effects: allocation, autograd hooks, RNG use.
         super().__init__()
         self.pg = pg
         self.world_size = pg.size()
@@ -579,6 +681,9 @@ class MQAColumnLinears(nn.Module):
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
+        # [FUNCTION DOC]
+        # Behavior: Kaiming-uniform init of the coalesced weight (a equal sqrt 5) and uniform bias in plus/minus 1 over sqrt(fan_in).
+        # Inputs: none. Outputs: None. Exceptions: None. Side effects: in-place parameter writes; RNG.
         """Copied from nn.Linear.reset_parameters"""
         # Setting a=sqrt(5) in kaiming_uniform is the same as initializing with
         # uniform(-1/sqrt(in_features), 1/sqrt(in_features)). For details, see
@@ -590,6 +695,10 @@ class MQAColumnLinears(nn.Module):
             init.uniform_(self._qkv_bias, -bound, bound)
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Behavior: in REDUCE_SCATTER plus async mode use the custom autograd function; else run column_linear on the coalesced weight/bias and split into q and kv.
+        # Inputs: x [seq(or seq/tp), batch, hidden]. Outputs: tuple (q [seq, batch, q_local], kv [seq, batch, kv]).
+        # Exceptions: AssertionError if buffers unexpectedly require grad in the async path. Side effects: TP collectives.
         if self.use_MQAColumnLinearReduceScatterAsyncCommunication:
             assert self._qkv_weight.requires_grad is False
             assert self._qkv_bias is None or self._qkv_bias.requires_grad is False
@@ -609,6 +718,9 @@ class MQAColumnLinears(nn.Module):
 
 
 class CausalSelfMQA(nn.Module, AttachableStore):
+    # [CLASS DOC]
+    # Purpose: multi-query self-attention (local q heads, single shared kv head) with optional RoPE and KV-cache inference.
+    # State: tp_pg_size, n_heads (local), d_qk, d_v, d_model, mode, pg, qkv (MQAColumnLinears), maybe_rotary, o (row-parallel), attention, prefill_kv_len.
     def __init__(
         self,
         config: Starcoder2Config,
@@ -616,6 +728,10 @@ class CausalSelfMQA(nn.Module, AttachableStore):
         tp_pg: dist.ProcessGroup,
         layer_idx: int,
     ):
+        # [FUNCTION DOC]
+        # Behavior: assert heads divisible by TP; build projections, rotary (or identity), output projection; assert multi_query true and grouped_query false; build CoreAttention.
+        # Inputs: config, parallel_config, tp_pg, layer_idx. Outputs: None. Exceptions: AssertionError on violations. Side effects: allocation.
+        # KNOWN ISSUE: the identity fallback for disabled rotary takes three positional args but is called with a keyword past_key_values_length, raising TypeError.
         super().__init__()
         # Tensor parallel considerations: We split tensors along head dimension
         assert (
@@ -680,6 +796,15 @@ class CausalSelfMQA(nn.Module, AttachableStore):
         hidden_states,  # [seq_length, batch_size, hidden_dim]
         sequence_mask,  # [batch_size, seq_length]
     ):
+        # [FUNCTION DOC]
+        # Behavior: project to q and kv, reshape (via shape) to batch-first per-head tensors with a single kv head. Inference (store
+        # attached): positions from stored offsets or cumulative mask; apply rotary with stored past length; on prefill assert no mid-row
+        # padding, allocate caches, unpad, causal varlen flash attention, re-pad, right-pad K/V into caches; on decode run
+        # flash_attn_with_kvcache with cache_seqlens equal to offsets; update store. Training: rotary with zero offset, flatten, CoreAttention.
+        # Finally unshape to [seq, batch, heads*d_v] and apply output projection.
+        # Inputs: hidden_states [seq, batch, hidden]; sequence_mask [batch, seq]. Outputs: dict with hidden_states and sequence_mask.
+        # Exceptions: AssertionError on grad-requiring inference inputs or mid-row padding. Side effects: store mutation; TP collectives.
+        # KNOWN ISSUE: past_key_values_length is stored unchanged (0 after prefill) and never advanced, so decoding steps reuse position 0 rotary phases.
         from flash_attn import bert_padding
         from flash_attn.flash_attn_interface import (
             flash_attn_varlen_func,
@@ -689,6 +814,9 @@ class CausalSelfMQA(nn.Module, AttachableStore):
         batch_size = hidden_states.shape[1]
 
         def unshape(states):
+            # [FUNCTION DOC]
+            # HELPER: converts attention output [batch*seq, heads, d_v] or [batch, seq, heads, d_v] to [seq, batch, heads*d_v].
+            # Inputs: states. Outputs: tensor. Exceptions: AssertionError if the token count is not divisible by batch size. Side effects: None.
             """Given a [batch_dim * seq_length, num_heads, d_v] returns a [seq_length, batch_dim, num_heads * d_v]"""
             if states.ndim == 3:
                 total = states.shape[0]
@@ -707,6 +835,10 @@ class CausalSelfMQA(nn.Module, AttachableStore):
             query_states,  # [q_length, batch_size, num_heads * d_qk]
             kv_states,  # [kv_length, batch_size, d_qk + d_v]
         ):
+            # [FUNCTION DOC]
+            # HELPER: converts projections to flash-attn layout.
+            # Behavior: q from [q_len, batch, heads*d] to [batch, q_len, heads, d]; split kv into k and v and make each [batch, kv_len, 1, d].
+            # Inputs: query_states, kv_states. Outputs: tuple (q, k, v). Exceptions: None. Side effects: None.
             # Shaping for use in `flash-attn` version of flash-attn: `flash_attn_unpadded_func`
             q_length = query_states.shape[0]
             kv_length = kv_states.shape[0]
@@ -882,6 +1014,11 @@ class CausalSelfMQA(nn.Module, AttachableStore):
 
 
 class CausalSelfGQA(nn.Module, AttachableStore):
+    # [CLASS DOC]
+    # Purpose: grouped-query self-attention with fused TP column-parallel QKV (bias) laid out per kv group as n_repeats query
+    # heads followed by one key and one value head, optional RoPE and KV-cache inference.
+    # State: hidden_size, num_heads, head_dim, split_size, maybe_rotary, num_kv_heads, n_local_q_heads, n_local_kv_heads, n_repeats,
+    # query_key_value, dense (row-parallel), attention, prefill_kv_len.
     def __init__(
         self,
         config: Starcoder2Config,
@@ -889,6 +1026,13 @@ class CausalSelfGQA(nn.Module, AttachableStore):
         tp_pg: dist.ProcessGroup,
         layer_idx: int,
     ):
+        # [FUNCTION DOC]
+        # Behavior: validate head divisibility, TP divisibility and kv heads at least TP size; build rotary, fused projection,
+        # output projection; assert grouped_query true and multi_query false; build CoreAttention.
+        # Inputs: config, parallel_config, tp_pg, layer_idx. Outputs: None.
+        # Exceptions: ValueError if hidden not divisible by heads; AssertionError on other violations. Side effects: allocation.
+        # KNOWN ISSUE: the identity rotary fallback has the same keyword-argument TypeError as in CausalSelfMQA.
+        # KNOWN ISSUE: n_local_kv_heads uses config.num_kv_heads instead of the computed num_kv_heads (irrelevant only because multi_query must be False).
         super().__init__()
         # Tensor parallel considerations: We split tensors along head dimension
         self.hidden_size = config.hidden_size
@@ -960,6 +1104,14 @@ class CausalSelfGQA(nn.Module, AttachableStore):
         hidden_states,  # (seq_length, batch_size, hidden_size)
         sequence_mask,  # (batch_size, seq_length)
     ):
+        # [FUNCTION DOC]
+        # Behavior: project, view as [seq, batch, local_kv_heads, n_repeats+2, d] and split into q (n_repeats), k (1), v (1) per group,
+        # then make batch-first tensors. Inference path as in CausalSelfMQA but with local kv heads, and the stored past length becomes
+        # the sequence length minus 1 after prefill and increases by 1 per decode step. Training path: rotary at zero offset, flatten, CoreAttention.
+        # Reshape output to [seq, batch, local_heads*d] and apply dense.
+        # Inputs: hidden_states [seq, batch, hidden]; sequence_mask [batch, seq]. Outputs: dict with hidden_states and sequence_mask.
+        # Exceptions: AssertionError on grad-requiring inference inputs or mid-row padding. Side effects: store mutation; TP collectives.
+        # KNOWN ISSUE: after prefill the past length is set to sequence length minus 1 although the next token's position is the sequence length; together with the plus-1 per step this is off by one relative to the comment.
         from flash_attn import bert_padding
         from flash_attn.flash_attn_interface import (
             flash_attn_varlen_func,
@@ -1139,6 +1291,9 @@ class CausalSelfGQA(nn.Module, AttachableStore):
 
 @torch.jit.script
 def dropout_add(x, residual, prob, training):
+    # [FUNCTION DOC]
+    # HELPER: TorchScript dropout followed by residual add (Megatron style).
+    # Inputs: x, residual tensors; prob (float); training (bool). Outputs: residual plus dropout(x). Exceptions: None. Side effects: consumes RNG.
     # type: (Tensor, Tensor, float, bool) -> Tensor
     # From: https://github.com/NVIDIA/Megatron-LM/blob/285068c8108e0e8e6538f54fe27c3ee86c5217a2/megatron/model/transformer.py#L586
     out = torch.nn.functional.dropout(x, p=prob, training=training)
@@ -1148,10 +1303,16 @@ def dropout_add(x, residual, prob, training):
 
 @torch.jit.script
 def dropout_add_fused_train(x: torch.Tensor, residual: torch.Tensor, prob: float) -> torch.Tensor:
+    # [FUNCTION DOC]
+    # HELPER: dropout_add with training fixed to True. Inputs: x, residual, prob. Outputs: tensor. Exceptions: None. Side effects: consumes RNG.
     return dropout_add(x, residual, prob, True)
 
 
 class GPTBlock(nn.Module):
+    # [CLASS DOC]
+    # Purpose: pre-LayerNorm transformer block (ln_1, MQA or GQA attention, dropout plus residual, ln_2, MLP, dropout plus residual).
+    # In training, dropout runs under the tp_synced random state when TP mode is ALL_REDUCE so replicated activations get identical masks across TP ranks.
+    # State: ln_1, attn, attn_dropout, ln_2, ff, ff_dropout, random_states, tp_mode.
     def __init__(
         self,
         config: Starcoder2Config,
@@ -1160,6 +1321,10 @@ class GPTBlock(nn.Module):
         random_states: RandomStates,
         layer_idx: int,
     ):
+        # [FUNCTION DOC]
+        # Behavior: build norms, attention by config (MQA when multi_query, GQA when grouped_query), MLP, and store dropout probs and RNG states.
+        # Inputs: config, parallel_config, tp_pg, random_states, layer_idx. Outputs: None.
+        # Exceptions: ValueError if neither multi_query nor grouped_query. Side effects: allocation.
         super(GPTBlock, self).__init__()
         self.ln_1 = TritonLayerNorm(config.hidden_size, eps=config.layer_norm_epsilon)
         if config.multi_query is True:
@@ -1192,6 +1357,10 @@ class GPTBlock(nn.Module):
         hidden_states: Union[torch.Tensor, TensorPointer],
         sequence_mask: Union[torch.Tensor, TensorPointer],
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
+        # [FUNCTION DOC]
+        # Behavior: as described for the class; in eval mode plain residual adds.
+        # Inputs: hidden_states, sequence_mask. Outputs: dict with hidden_states and sequence_mask. Exceptions: None explicitly raised.
+        # Side effects: RNG consumption and temporary RNG state switching; TP collectives.
         residual = hidden_states
         hidden_states = self.ln_1(hidden_states)
         output = self.attn(hidden_states=hidden_states, sequence_mask=sequence_mask)
@@ -1226,7 +1395,12 @@ class GPTBlock(nn.Module):
 
 
 class Embedding(nn.Module, AttachableStore):
+    # [CLASS DOC]
+    # Purpose: vocab-parallel token embedding (no padding_idx). State: token_embedding, pg.
     def __init__(self, tp_pg: dist.ProcessGroup, config: Starcoder2Config, parallel_config: Optional[ParallelismArgs]):
+        # [FUNCTION DOC]
+        # Behavior: build TensorParallelEmbedding with TP mode (default ALL_REDUCE). Inputs: tp_pg, config, parallel_config. Outputs: None.
+        # Exceptions: None. Side effects: allocation.
         super().__init__()
         self.token_embedding = TensorParallelEmbedding(
             num_embeddings=config.vocab_size,
@@ -1237,17 +1411,18 @@ class Embedding(nn.Module, AttachableStore):
         self.pg = tp_pg
 
     def forward(self, input_ids: torch.Tensor, input_mask: torch.Tensor):  # [batch_size, seq_length]
+        # [FUNCTION DOC]
+        # Behavior: transpose ids to [seq, batch] and embed (the inference past_length tracking is commented out).
+        # Inputs: input_ids, input_mask (unused) [batch, seq]. Outputs: dict with input_embeds. Exceptions: None. Side effects: TP collective.
         # store = self.get_local_store()
         # if store is not None:
         #     if "past_length" in store:
         #         past_length = store["past_length"]
         #     else:
         #         past_length = torch.zeros(1, dtype=torch.long, device=input_ids.device).expand(input_ids.shape[0])
-
         #     cumsum_mask = input_mask.cumsum(-1, dtype=torch.long)
         #     # Store new past_length in store
         #     store["past_length"] = past_length + cumsum_mask[:, -1]
-
         # Format input in `[seq_length, batch_size]` to support high TP with low batch_size
         input_ids = input_ids.transpose(0, 1)
         input_embeds = self.token_embedding(input_ids)
@@ -1255,6 +1430,9 @@ class Embedding(nn.Module, AttachableStore):
 
 
 class GPTModel(nn.Module):
+    # [CLASS DOC]
+    # Purpose: pipeline graph: token_embeddings, embeds_dropout, decoder GPTBlocks, final_layer_norm (TritonLayerNorm), lm_head (no bias, vocab-sharded), cast_to_fp32.
+    # State: p2p, random_states, tp_mode.
     """Build pipeline graph"""
 
     def __init__(
@@ -1264,6 +1442,9 @@ class GPTModel(nn.Module):
         parallel_config: Optional[ParallelismArgs],
         random_states: RandomStates,
     ):
+        # [FUNCTION DOC]
+        # Behavior: create P2P and all PipelineBlocks. Inputs: config, parallel_context, parallel_config, random_states. Outputs: None.
+        # Exceptions: None explicitly raised. Side effects: P2P setup.
         super().__init__()
 
         # Declare all the nodes
@@ -1350,8 +1531,11 @@ class GPTModel(nn.Module):
         input_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
         input_mask: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
     ):
+        # [FUNCTION DOC]
+        # Behavior: embed; dropout under tp_synced RNG when ALL_REDUCE; run decoder blocks; final norm; lm_head; cast to fp32.
+        # Inputs: input_ids, input_mask. Outputs: fp32 sharded logits [seq, batch, vocab/tp] or TensorPointer.
+        # Exceptions: None explicitly raised. Side effects: RNG state switching; PP and TP communication.
         # all tensors are optional as most ranks don't need anything from the dataloader.
-
         input_embeds = self.token_embeddings(input_ids=input_ids, input_mask=input_mask)["input_embeds"]
 
         with branch_random_state(
@@ -1374,12 +1558,20 @@ class GPTModel(nn.Module):
 
 @torch.jit.script
 def masked_mean(loss, label_mask, dtype):
+    # [FUNCTION DOC]
+    # HELPER: TorchScript masked mean (sum of loss times mask in dtype over mask sum).
+    # Inputs: loss, label_mask, dtype. Outputs: 0-dim tensor. Exceptions: None. Side effects: None.
+    # KNOWN ISSUE: NaN for an all-zero mask.
     # type: (Tensor, Tensor, torch.dtype) -> Tensor
     return (loss * label_mask).sum(dtype=dtype) / label_mask.sum()
 
 
 class Loss(nn.Module):
+    # [CLASS DOC]
+    # Purpose: vocab-parallel cross entropy in fp32 averaged over masked tokens. State: tp_pg.
     def __init__(self, tp_pg: dist.ProcessGroup):
+        # [FUNCTION DOC]
+        # Behavior: store tp_pg. Inputs: tp_pg. Outputs: None. Exceptions: None. Side effects: None.
         super().__init__()
         self.tp_pg = tp_pg
 
@@ -1389,6 +1581,10 @@ class Loss(nn.Module):
         label_ids: torch.Tensor,  # [batch_size, seq_length]
         label_mask: torch.Tensor,  # [batch_size, seq_length]
     ) -> Dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Behavior: sharded cross entropy against sequence-first labels, transpose back, masked mean.
+        # Inputs: sharded_logits [seq, batch, vocab/tp]; label_ids, label_mask [batch, seq]. Outputs: dict with loss.
+        # Exceptions: None explicitly raised. Side effects: TP collectives.
         # Megatron by defaults cast everything in fp32. `--f16-lm-cross-entropy` is an option you can use to keep current precision.
         # https://github.com/NVIDIA/Megatron-LM/blob/f267e6186eae1d6e2055b412b00e2e545a8e896a/megatron/model/gpt_model.py#L38
         loss = sharded_cross_entropy(
@@ -1404,6 +1600,9 @@ class Loss(nn.Module):
 
 
 class Starcoder2ForTraining(NanotronModel):
+    # [CLASS DOC]
+    # Purpose: NanotronModel wrapping GPTModel and a Loss PipelineBlock; ties duplicated MQA kv parameters across TP ranks.
+    # State: model, loss, config, parallel_config, parallel_context.
     def __init__(
         self,
         config: Starcoder2Config,
@@ -1411,6 +1610,9 @@ class Starcoder2ForTraining(NanotronModel):
         parallel_config: Optional[ParallelismArgs],
         random_states: RandomStates,
     ):
+        # [FUNCTION DOC]
+        # Behavior: build GPTModel and the loss block. Inputs: config, parallel_context, parallel_config, random_states. Outputs: None.
+        # Exceptions: None explicitly raised. Side effects: allocation.
         super().__init__()
         self.model = GPTModel(
             config=config,
@@ -1440,6 +1642,10 @@ class Starcoder2ForTraining(NanotronModel):
         label_ids: Union[torch.Tensor, TensorPointer],
         label_mask: Union[torch.Tensor, TensorPointer],
     ) -> Union[torch.Tensor, TensorPointer]:
+        # [FUNCTION DOC]
+        # Behavior: logits then loss; return a dict with loss. Inputs: input_ids, input_mask, label_ids, label_mask.
+        # Outputs: dict with loss (tensor or TensorPointer). Exceptions: None explicitly raised. Side effects: PP/TP communication.
+        # KNOWN ISSUE: return annotation says a tensor but a dict is returned.
         sharded_logits = self.model(
             input_ids=input_ids,
             input_mask=input_mask,
@@ -1453,6 +1659,11 @@ class Starcoder2ForTraining(NanotronModel):
         }
 
     def tie_custom_params(self) -> None:
+        # [FUNCTION DOC]
+        # Behavior: for every direct parameter whose qualified name contains .qkv.kv., assert it is not tied yet and tie it across all
+        # ranks of the TP group with SUM gradient reduction (kv is replicated in MQA).
+        # Inputs: none. Outputs: None. Exceptions: AssertionError if already tied.
+        # Side effects: marks parameters tied (may involve collectives inside tie_parameters).
         # find all params with names qkv.kv.weight and qkv.kv.bias in them
         for module_name, module in self.named_modules():
             for param_name, param in module.named_parameters(recurse=False):
@@ -1476,6 +1687,14 @@ class Starcoder2ForTraining(NanotronModel):
 
     @torch.no_grad()
     def init_model_randomly(self, config):
+        # [FUNCTION DOC]
+        # Behavior (no grad): with std from config.model.init_method and the layer count, initialize each parameter once (tied by tied
+        # name): column-parallel weights normal(0, std) and zero biases; row-parallel weights normal(0, std over sqrt(2 times layers)) and
+        # zero biases; LayerNorm weight 1 and bias 0; MQAColumnLinears weight normal and bias zero; embeddings normal(0, std); anything else raises. Finally assert all names covered.
+        # Inputs: config (full Config). Outputs: None.
+        # Exceptions: ValueError for unexpected parameter names; Exception for unhandled module types; AssertionError on set mismatch.
+        # Side effects: in-place parameter writes; RNG.
+        # KNOWN ISSUE: MQA parameters live in nn.ParameterDict submodules (qkv.q, qkv.kv), not on MQAColumnLinears itself, so they hit the unhandled-module Exception; the MQAColumnLinears branch is unreachable and would fail anyway since that class has no weight attribute.
         """Initialize model parameters randomly.
         Note:
             Layernorm weight all 0 or 1 depending on `apply_layernorm_1p`
@@ -1556,18 +1775,29 @@ class Starcoder2ForTraining(NanotronModel):
         }, f"Somehow the initialized set of parameters don't match:\n - Expected: { {name for name, _ in model.named_parameters()} }\n - Got: {initialized_parameters}"
 
     def get_embeddings_lm_head_tied_names(self) -> List[str]:
+        # [FUNCTION DOC]
+        # Behavior: always return the token embedding and lm_head weight names.
+        # Inputs: none. Outputs: list of two strings. Exceptions: None. Side effects: None.
+        # KNOWN ISSUE: does not check any tie_word_embeddings config flag; ties unconditionally.
         return [
             "model.token_embeddings.pp_block.token_embedding.weight",
             "model.lm_head.pp_block.weight",
         ]
 
     def before_tbi_sanity_checks(self):
+        # [FUNCTION DOC]
+        # Behavior: assert every parameter whose name contains .qkv.kv. is tied. Inputs: none. Outputs: None.
+        # Exceptions: AssertionError on untied kv params. Side effects: None.
         # SANITY CHECK: Check ".qkv.kv." params are tied
         for name, kv_param in self.named_parameters():
             if ".qkv.kv." in name:
                 assert kv_param.is_tied, f"{name} is not tied (kv weights/biases should be tied in GPTBigcode)"
 
     def get_block_compute_costs(self):
+        # [FUNCTION DOC]
+        # Behavior: GPTBlock cost 4 times heads times head dim times hidden plus 2 times d_ff times hidden; lm_head vocab times hidden.
+        # Inputs: none. Outputs: dict module class to cost. Exceptions: None. Side effects: None.
+        # KNOWN ISSUE: d_ff tests intermediate_size but then uses n_inner (which may be None), giving a None cost or TypeError.
         """Computes the compute cost of each block in the model so that we can do a better job of load balancing."""
         model_config = self.config
         d_ff = model_config.n_inner if model_config.intermediate_size is not None else 4 * model_config.hidden_size
@@ -1582,6 +1812,11 @@ class Starcoder2ForTraining(NanotronModel):
         return block_compute_costs
 
     def get_flops_per_sec(self, iteration_time_in_sec, sequence_length, global_batch_size):
+        # [FUNCTION DOC]
+        # Behavior: get_flops with d_ff (n_inner or 4 times hidden), no GLU, divided by time, world size and 1e12.
+        # Inputs: iteration_time_in_sec, sequence_length, global_batch_size. Outputs: tuple (model, hardware) TFLOPs/s per GPU.
+        # Exceptions: ZeroDivisionError for zero time. Side effects: None.
+        # KNOWN ISSUE: always counts MQA (single kv head) even when the model uses GQA.
         """Get flops per second for a given model"""
         world_size = self.parallel_context.world_pg.size()
         model_flops, hardware_flops = get_flops(
@@ -1611,6 +1846,13 @@ def get_flops(
     batch_size=1,
     glu_activation=False,
 ):
+    # [FUNCTION DOC]
+    # Behavior: forward flops of q projection, single shared kv projection, QK logits and attention times V (quadratic in seq_len,
+    # SWA not accounted), output projection, FFN first layer (doubled when glu_activation) and second layer, per layer, plus lm_head;
+    # model flops are 3 times forward; hardware flops equal (placeholder).
+    # Inputs: num_layers, hidden_size, num_heads, vocab_size, seq_len, kv_channels (default head dim), ffn_hidden_size (default 4 times hidden),
+    # batch_size (default 1), glu_activation (default False). Outputs: tuple (model_flops, hardware_flops).
+    # Exceptions: AssertionError if hidden not divisible by heads when kv_channels is None. Side effects: None.
     """Counts flops in an decoder-only model
     Args:
         num_layers: number of decoder layers

@@ -1,4 +1,16 @@
 # coding=utf-8
+# [MODULE DOC]
+# Purpose: nanotron implementation of the LLaMA decoder-only transformer with tensor parallelism (TP, heads and
+# MLP sharded across the TP group), pipeline parallelism (PP, each embedding/decoder layer/norm/head/loss wrapped
+# in a PipelineBlock placed on one PP rank by build_model), GQA/MQA, RoPE (interleaved or HF-style), flash-attention
+# kernels for training and KV-cache inference, optional activation recomputation and optional z-loss.
+# Main contents: rotary embedding modules, GLUActivation, MLP, CoreAttention, pad_to_right, CausalSelfAttention,
+# LlamaDecoderLayer, Embedding, LlamaModel (pipeline graph), masked_mean, Loss, LossWithZLoss, LlamaForTraining
+# (the NanotronModel used by the trainer) and get_flops (MFU accounting).
+# Layout conventions: activations between blocks are sequence-first [seq_length, batch_size, hidden]; masks are
+# batch-first [batch_size, seq_length]; logits stay sharded on the vocab dimension across TP ranks.
+# Import-time side effects: imports flash_attn (hard dependency, fails without it), creates a module logger, and
+# TorchScript-compiles masked_mean.
 # Copyright 2018 HuggingFace Inc. team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -52,7 +64,16 @@ logger = logging.get_logger(__name__)
 
 
 class RotaryEmbedding(nn.Module):
+    # [CLASS DOC]
+    # Purpose: interleaved RoPE (adjacent pairs of channels rotated as complex numbers), lazily building a cache of
+    # cos/sin pairs on CUDA and growing it by doubling when longer positions are requested.
+    # State: dim (rotary dim, must be even), end (cache length), theta (base), freqs_cis (non-persistent float buffer
+    # shaped end by dim/2 by 2, real view of complex unit phasors), _initialized_buffer flag.
     def __init__(self, dim: int, end: int, theta: float = 10000.0):
+        # [FUNCTION DOC]
+        # Behavior: validate dim is even and store dim, end, theta; buffer is created later.
+        # Inputs: dim (int), end (int, max positions), theta (float, default 10000.0). Outputs: None.
+        # Exceptions: AssertionError when dim is odd. Side effects: None.
         super().__init__()
         assert dim % 2 == 0
         self.dim = dim
@@ -64,6 +85,13 @@ class RotaryEmbedding(nn.Module):
         self._initialized_buffer = False
 
     def init_rotary_embeddings(self):
+        # [FUNCTION DOC]
+        # Behavior: return early if already initialized. Register a float32 CUDA buffer of shape end by dim/2 by 2 (cast to
+        # float32 if a surrounding dtype context changed it). Compute inverse frequencies theta to the power of minus
+        # 2i/dim on CPU (to match HF Transformers numerics), move to CUDA, take the outer product with positions 0..end-1,
+        # turn into unit complex numbers via polar form and store their real/imag pairs in the buffer; mark initialized.
+        # Inputs: none. Outputs: None. Exceptions: AssertionError if the buffer is not on CUDA or not float32.
+        # Side effects: allocates/overwrites the buffer on the CUDA device.
         if self._initialized_buffer is True:
             # Buffer if already initialized
             return
@@ -94,6 +122,16 @@ class RotaryEmbedding(nn.Module):
         x: torch.Tensor,  # [batch_size, seq_length, num_heads, d_qk]
         position_ids: Optional[torch.LongTensor],  # [batch_size, seq_length]
     ):
+        # [FUNCTION DOC]
+        # Behavior: while the last position id or the sequence length reaches end, double end and mark the cache stale
+        # (this check synchronizes with the device); rebuild the cache if stale (printing a message). View the last
+        # dimension as pairs, upcast bfloat16 to float32, view as complex, pick phasors for positions 0..seq_length-1
+        # (when position_ids is None) or gather them by position_ids, multiply, convert back to real and to the input dtype.
+        # Inputs: x [batch_size, seq_length, num_heads, d_qk]; position_ids [batch_size, seq_length] long tensor or None.
+        # Outputs: tensor shaped like x, rotated.
+        # Exceptions: AssertionError when the head dim is odd; ValueError when the last position id is negative or out of range.
+        # Side effects: may grow and reallocate the buffer; prints to stdout; host-device sync.
+        # KNOWN ISSUE: only the last position of the last row is validated/used to grow the cache; larger positions elsewhere in the batch are not checked.
         batch_size, seq_length, num_heads, inner_dim = x.shape
         while (
             position_ids is not None and position_ids[-1, -1] >= self.end
@@ -125,7 +163,15 @@ class RotaryEmbedding(nn.Module):
 
 ## Copy from transformers. Non interleaved version of RoPE. Will be refactored later
 class LlamaRotaryEmbedding(nn.Module):
+    # [CLASS DOC]
+    # Purpose: non-interleaved (rotate-half, HF Transformers compatible) RoPE that computes cos/sin on the fly from a
+    # stored inverse-frequency buffer.
+    # State: dim, end (kept only for the interface), theta (default 500000.0), inv_freq (non-persistent float32 CUDA buffer of length dim/2).
     def __init__(self, dim: int, end: int, theta: float = 500000.0):
+        # [FUNCTION DOC]
+        # Behavior: store dim, end, theta and immediately build inv_freq.
+        # Inputs: dim (int), end (int), theta (float, default 500000.0). Outputs: None. Exceptions: None explicitly raised.
+        # Side effects: CUDA allocation.
         super().__init__()
         self.dim = dim
         self.end = end
@@ -133,6 +179,9 @@ class LlamaRotaryEmbedding(nn.Module):
         self.init_rotary_embeddings()
 
     def init_rotary_embeddings(self):
+        # [FUNCTION DOC]
+        # Behavior: compute inverse frequencies on CPU in float32, register an empty CUDA buffer, force it to float32 and copy the values in.
+        # Inputs: none. Outputs: None. Exceptions: None explicitly raised. Side effects: registers/overwrites the inv_freq buffer.
         inv_freq = 1.0 / (
             self.theta ** (torch.arange(0, self.dim, 2, dtype=torch.float, device="cpu") / self.dim)
         )  # important to compute on CPU
@@ -150,6 +199,12 @@ class LlamaRotaryEmbedding(nn.Module):
         x: torch.Tensor,  # [batch_size, seq_length, num_heads, d_qk]
         position_ids: Optional[torch.LongTensor],  # [batch_size, seq_length]
     ):
+        # [FUNCTION DOC]
+        # Behavior (no grad): build angles as inverse frequencies times position ids in float32 with autocast disabled,
+        # duplicate them along the last dim, and return their cos and sin cast to x's dtype. x is used only for dtype and device.
+        # Inputs: x (any tensor), position_ids [batch_size, seq_length] (required in practice).
+        # Outputs: tuple (cos, sin), each [batch_size, seq_length, dim]. Exceptions: AttributeError if position_ids is None. Side effects: None.
+        # KNOWN ISSUE: position_ids is typed Optional but None is not supported.
         # x: [bs, num_attention_heads, seq_len, head_size]
         inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
@@ -165,12 +220,20 @@ class LlamaRotaryEmbedding(nn.Module):
         return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
 
     def rotate_half(self, x):
+        # [FUNCTION DOC]
+        # Behavior: split the last dim into two halves x1 and x2 and return the concatenation of negated x2 and x1.
+        # Inputs: x tensor. Outputs: tensor of same shape. Exceptions: None. Side effects: None.
         """Rotates half the hidden dims of the input."""
         x1 = x[..., : x.shape[-1] // 2]
         x2 = x[..., x.shape[-1] // 2 :]
         return torch.cat((-x2, x1), dim=-1)
 
     def apply_rotary_pos_emb(self, q, k, cos, sin, unsqueeze_dim=2):
+        # [FUNCTION DOC]
+        # Behavior: unsqueeze cos and sin at unsqueeze_dim (heads axis) and return q times cos plus rotate_half(q) times sin, and the same for k.
+        # Inputs: q, k [batch_size, seq_length, heads, d]; cos, sin [batch_size, seq_length, d]; unsqueeze_dim (int, default 2).
+        # Outputs: tuple (q_embed, k_embed). Exceptions: shape errors from broadcasting. Side effects: None.
+        # KNOWN ISSUE: docstring says unsqueeze_dim defaults to 1 but the code default is 2.
         """Applies Rotary Position Embedding to the query and key tensors.
 
         Args:
@@ -196,22 +259,40 @@ class LlamaRotaryEmbedding(nn.Module):
 
 
 class GLUActivation(nn.Module):
+    # [CLASS DOC]
+    # Purpose: gated linear unit: splits merged gate/up projections and returns act(gate) times up.
+    # State: act, the activation function looked up from ACT2FN by name.
     def __init__(self, act_fn_name: str):
+        # [FUNCTION DOC]
+        # Behavior: look up the activation by name. Inputs: act_fn_name (str). Outputs: None. Exceptions: KeyError for unknown names. Side effects: None.
         super().__init__()
         self.act = ACT2FN[act_fn_name]
 
     def forward(self, merged_states: torch.Tensor):
+        # [FUNCTION DOC]
+        # Behavior: split the last dim in two equal halves (gate, up) and return act(gate) times up.
+        # Inputs: merged_states [..., 2*k]. Outputs: tensor [..., k]. Exceptions: None explicitly raised. Side effects: None.
         gate_states, up_states = torch.split(merged_states, merged_states.shape[-1] // 2, dim=-1)
         return self.act(gate_states) * up_states
 
 
 class MLP(nn.Module):
+    # [CLASS DOC]
+    # Purpose: TP-sharded SwiGLU feed-forward block: column-parallel fused gate+up projection (hidden to 2 times
+    # intermediate, split into two contiguous chunks so each TP rank holds matching gate/up slices), GLU activation,
+    # row-parallel down projection back to hidden.
+    # Construction: config (LlamaConfig), parallel_config (ParallelismArgs or None, defaulting to ALL_REDUCE mode and no async comm), tp_pg.
     def __init__(
         self,
         config: LlamaConfig,
         parallel_config: Optional[ParallelismArgs],
         tp_pg: dist.ProcessGroup,
     ):
+        # [FUNCTION DOC]
+        # Behavior: derive TP mode and async-communication flag (down projection uses async only in REDUCE_SCATTER mode),
+        # then build gate_up_proj, down_proj (both without bias) and the activation.
+        # Inputs: config, parallel_config, tp_pg. Outputs: None. Exceptions: None explicitly raised. Side effects: parameter allocation.
+        # KNOWN ISSUE: parallel_config is treated as optional but tp_recompute_allgather is read from it unconditionally, so None raises AttributeError.
         super().__init__()
 
         # TODO @thomasw21: refactor so that we store that default in a single place.
@@ -245,13 +326,23 @@ class MLP(nn.Module):
         self.split_silu_mul = GLUActivation(config.hidden_act)
 
     def forward(self, hidden_states):  # [seq_length, batch_size, hidden_dim]
+        # [FUNCTION DOC]
+        # Behavior: gate_up projection, GLU activation, down projection (TP communication happens inside the parallel linears).
+        # Inputs: hidden_states [seq_length, batch_size, hidden] (or sequence-sharded in REDUCE_SCATTER mode).
+        # Outputs: dict with key hidden_states. Exceptions: None explicitly raised. Side effects: TP collectives.
         merged_states = self.gate_up_proj(hidden_states)
         hidden_states = self.down_proj(self.split_silu_mul(merged_states))
         return {"hidden_states": hidden_states}
 
 
 class CoreAttention(nn.Module):
+    # [CLASS DOC]
+    # Purpose: variable-length flash attention over packed (unpadded-by-mask) query/key/value tensors.
+    # State: d_qk, d_v (head dims), is_using_mup (switches softmax scale to 1/d), checkpoint_attention (False; flash-attn already recomputes).
     def __init__(self, config: LlamaConfig, parallel_config: Optional[ParallelismArgs], layer_idx: int):
+        # [FUNCTION DOC]
+        # Behavior: check hidden size divisible by heads and store head dims and mup flag.
+        # Inputs: config, parallel_config (unused), layer_idx (unused). Outputs: None. Exceptions: AssertionError on indivisible hidden size. Side effects: None.
         super().__init__()
         # TODO @thomasw21: GPT has a weird `d_kv` config which I'm guessing is essentically a `d_qkv`
         assert (
@@ -272,6 +363,15 @@ class CoreAttention(nn.Module):
         q_sequence_mask: torch.Tensor,  # torch.BoolTensor [batch_size, q_length] (can be broadcasted to that size)
         kv_sequence_mask: torch.Tensor,  # torch.BoolTensor [batch_size, kv_length] (can be broadcasted to that size)
     ):
+        # [FUNCTION DOC]
+        # Behavior: build cumulative sequence-length vectors (int32, leading zero) from the row sums of the query and key
+        # masks; use causal attention unless the query length is 1 (KV-cache decoding); softmax scale is 1/d under muP
+        # else the flash-attn default 1/sqrt(d); call flash_attn_varlen_func with no dropout using padded lengths as max lengths.
+        # Wrapped by checkpoint_method (recompute disabled by attribute).
+        # Inputs: query_states [batch*q_len, local_q_heads, d]; key_states and value_states [batch*kv_len, local_kv_heads, d];
+        # q_sequence_mask and kv_sequence_mask boolean [batch, len].
+        # Outputs: attention output [batch*q_len, local_q_heads, d_v]. Exceptions: errors from flash-attn. Side effects: None.
+        # KNOWN ISSUE: the inputs are not actually unpacked by mask; cumulative lengths assume the valid tokens of each row are contiguous at the start of the flattened rows, so left padding or masked holes give wrong results.
         from flash_attn.flash_attn_interface import flash_attn_varlen_func
 
         # TODO @thomasw21: Compute once, instead of computing for each layers.
@@ -305,6 +405,13 @@ class CoreAttention(nn.Module):
 
 
 def pad_to_right(tensor, mask, new_tensor=None):
+    # [FUNCTION DOC]
+    # HELPER: converts left-padded KV states into right-padded caches during prefill.
+    # Behavior: count valid tokens per row, build a right-aligned mask with that many leading True values, gather the
+    # valid entries in row order, and write them at the start of each row of new_tensor (zeros-like of tensor if not given).
+    # Inputs: tensor [batch, seqlen, d1, d2]; mask boolean [batch, seqlen]; new_tensor optional [batch, new_seqlen, d1, d2] (filled in place).
+    # Outputs: tuple (new_tensor, right_padded_mask [batch, seqlen]). Exceptions: None explicitly raised.
+    # Side effects: mutates new_tensor in place when provided.
     """Transform a left-padded tensor into a right-padded tensor. (Useful for prefilling key/value states)
     Args:
         tensor: (batch_size, seqlen, d1, d2)
@@ -333,6 +440,13 @@ def pad_to_right(tensor, mask, new_tensor=None):
 
 
 class CausalSelfAttention(nn.Module, AttachableStore):
+    # [CLASS DOC]
+    # Purpose: TP-sharded multi-head/grouped-query self-attention with RoPE, one fused column-parallel QKV projection
+    # and a row-parallel output projection, supporting a training path and a KV-cache inference path (selected by
+    # whether an AttachableStore is attached).
+    # Key attributes: n_local_q_heads and n_local_kv_heads (per TP rank), n_repeats, is_gqa, d_qk, d_v, d_model,
+    # qkv_proj, rotary_embedding (interleaved RotaryEmbedding or LlamaRotaryEmbedding, used at inference),
+    # flash_rotary_embedding (flash-attn rotary used in training), o_proj, attention (CoreAttention), prefill_kv_len (KV cache length).
     def __init__(
         self,
         config: LlamaConfig,
@@ -340,6 +454,14 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         tp_pg: dist.ProcessGroup,
         layer_idx: int,
     ):
+        # [FUNCTION DOC]
+        # Behavior: assert heads and kv heads divide by TP size (if num_key_value_heads is missing, log a warning on rank 0
+        # and set it equal to the number of heads, mutating config), assert heads divisible by kv heads; compute local
+        # head counts and dims; build the QKV projection with contiguous chunks (q, k, v) so TP sharding splits within each;
+        # build the rotary modules, output projection and core attention; set prefill_kv_len to max_position_embeddings.
+        # Inputs: config (LlamaConfig), parallel_config, tp_pg, layer_idx. Outputs: None.
+        # Exceptions: AssertionError on divisibility violations; AttributeError if parallel_config is None.
+        # Side effects: may mutate config; logging; parameter and CUDA buffer allocation.
         from flash_attn.layers.rotary import RotaryEmbedding as FlashRotaryEmbedding
 
         super().__init__()
@@ -439,6 +561,14 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         hidden_states,  # [seq_length, batch_size, hidden_size]
         sequence_mask,  # [batch_size, seq_length]
     ):
+        # [FUNCTION DOC]
+        # Behavior: project to QKV [seq, batch, ...]. With GQA split into q, k, v by local head counts and reshape each to
+        # [batch, seq, heads, d]; otherwise view as [seq, batch, 3, heads, d] and permute to three batch-first tensors.
+        # Dispatch to _forward_inference when a local store is attached, else _forward_training.
+        # Inputs: hidden_states [seq_length, batch_size, hidden]; sequence_mask [batch_size, seq_length].
+        # Outputs: dict with hidden_states [seq_length, batch_size, hidden] and sequence_mask.
+        # Exceptions: those of the sub-paths. Side effects: TP collectives in projections.
+        # KNOWN ISSUE: the non-GQA view assumes q, k and v are interleaved per position as three equal blocks, consistent with the fused projection only because their chunk sizes are equal.
         qkv_states = self.qkv_proj(
             hidden_states
         )  # [seq_length, batch_size, n_local_q_heads * d_qk + 2 * n_local_kv_heads * d_qk]
@@ -481,6 +611,22 @@ class CausalSelfAttention(nn.Module, AttachableStore):
             return self._forward_training(query_states, key_states, value_states, sequence_mask, batch_size, q_length)
 
     def _forward_inference(self, query_states, key_states, value_states, sequence_mask, batch_size, q_length, store):
+        # [FUNCTION DOC]
+        # HELPER: KV-cache generation path for CausalSelfAttention.forward.
+        # Behavior: compute position ids (previous offsets plus mask, or cumulative mask minus one on first call) and the
+        # new offsets (last position). Apply RoPE. On first call (prefill, no key in store): assert there is no padding in
+        # the middle of a row, allocate zero K/V caches of length prefill_kv_len, unpad q/k/v by mask, run causal
+        # varlen flash attention, re-pad the output, and right-pad K/V into the caches. On later calls: fetch caches,
+        # grow them with zeros if the rotary cache end grew, assert their length equals rotary end, and call
+        # flash_attn_with_kvcache with the new k/v and cache_seqlens set to the position offsets. Store updated caches and
+        # offsets, then reshape the output to sequence-first and apply o_proj.
+        # Inputs: q/k/v batch-first per-head tensors, sequence_mask, batch_size, q_length, store (dict-like AttachableStore).
+        # Outputs: dict with hidden_states and sequence_mask.
+        # Exceptions: AssertionError if k/v require grad, on middle padding, or on cache-size mismatch.
+        # Side effects: mutates store; allocates caches; TP collectives in o_proj.
+        # KNOWN ISSUE: the attention and cache logic is nested inside the non-interleaved branch, so with rope_interleaved true the attention output is never computed (UnboundLocalError) and the store is not updated.
+        # KNOWN ISSUE: in the non-interleaved branch RoPE is applied twice to query and key states (once before and once inside the duplicated block).
+        # KNOWN ISSUE: the grow-cache check compares rotary end before and after a call that only the interleaved RotaryEmbedding can grow; LlamaRotaryEmbedding never grows, so caches cannot exceed max_position_embeddings.
         from flash_attn.flash_attn_interface import flash_attn_with_kvcache
 
         assert key_states.requires_grad is False
@@ -673,6 +819,13 @@ class CausalSelfAttention(nn.Module, AttachableStore):
         return {"hidden_states": output, "sequence_mask": sequence_mask}
 
     def _forward_training(self, query_states, key_states, value_states, sequence_mask, batch_size, q_length):
+        # [FUNCTION DOC]
+        # HELPER: training path for CausalSelfAttention.forward.
+        # Behavior: stack k and v as [batch, seq, 2, kv_heads, d], apply flash-attn rotary to q and kv jointly (positions
+        # 0..seq-1, ignores padding), split k and v back, flatten batch and sequence for q, k, v, run CoreAttention with
+        # the same mask for queries and keys, reshape output to [seq, batch, local_heads*d_v] and apply o_proj.
+        # Inputs: q/k/v, sequence_mask, batch_size, q_length. Outputs: dict with hidden_states and sequence_mask.
+        # Exceptions: None explicitly raised. Side effects: TP collectives in o_proj.
         # Apply rotary embeddings to query/key states
         # NOTE: The layout is different from models/llama.py which is [batch_size, num_heads, seq_length, d_qk]
         # Here it is, [batch_size, seq_length, num_heads, d_qk]
@@ -718,6 +871,9 @@ class CausalSelfAttention(nn.Module, AttachableStore):
 
 
 class LlamaDecoderLayer(nn.Module):
+    # [CLASS DOC]
+    # Purpose: one pre-norm transformer block: RMSNorm, attention, residual add, RMSNorm, MLP, residual add; optional
+    # full-layer activation checkpointing (recompute_layer from parallel_config).
     def __init__(
         self,
         config: LlamaConfig,
@@ -725,6 +881,10 @@ class LlamaDecoderLayer(nn.Module):
         tp_pg: dist.ProcessGroup,
         layer_idx: int,
     ):
+        # [FUNCTION DOC]
+        # Behavior: build input_layernorm, attn, post_attention_layernorm, mlp, and read recompute_layer.
+        # Inputs: config, parallel_config (required in practice), tp_pg, layer_idx. Outputs: None.
+        # Exceptions: AttributeError if parallel_config is None. Side effects: parameter allocation.
         super().__init__()
         self.input_layernorm = TritonRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.attn = CausalSelfAttention(
@@ -744,6 +904,11 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: Union[torch.Tensor, TensorPointer],
         sequence_mask: Union[torch.Tensor, TensorPointer],
     ) -> List[Union[torch.Tensor, TensorPointer]]:
+        # [FUNCTION DOC]
+        # HELPER: the uncheckpointed computation of the layer.
+        # Behavior: residual plus attention of normalized input; then residual plus MLP of normalized result.
+        # Inputs: hidden_states [seq, batch, hidden]; sequence_mask. Outputs: tuple (hidden_states, sequence_mask).
+        # Exceptions: None explicitly raised. Side effects: TP collectives.
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -763,6 +928,10 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         sequence_mask: torch.Tensor,
     ) -> List[torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: activation-checkpointed variant.
+        # Behavior: run _core_forward through torch CheckpointFunction with RNG state preservation, so activations are recomputed in backward.
+        # Inputs/Outputs: as _core_forward. Exceptions: None explicitly raised. Side effects: recomputation in backward; RNG state save/restore.
         return CheckpointFunction.apply(self._core_forward, True, hidden_states, sequence_mask)
 
     def forward(
@@ -770,7 +939,10 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states: Union[torch.Tensor, TensorPointer],
         sequence_mask: Union[torch.Tensor, TensorPointer],
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
-
+        # [FUNCTION DOC]
+        # Behavior: use the checkpointed path when recompute_layer is set and the input is a real tensor (not a TensorPointer), else the core path; return a dict.
+        # Inputs: hidden_states and sequence_mask (tensors or TensorPointers). Outputs: dict with hidden_states and sequence_mask.
+        # Exceptions: None explicitly raised. Side effects: as the chosen path.
         if self.recompute_layer and not isinstance(hidden_states, TensorPointer):
             hidden_states, sequence_mask = self._checkpointed_forward(hidden_states, sequence_mask)
         else:
@@ -783,7 +955,13 @@ class LlamaDecoderLayer(nn.Module):
 
 
 class Embedding(nn.Module, AttachableStore):
+    # [CLASS DOC]
+    # Purpose: TP-sharded (vocab-parallel) token embedding; during inference also tracks past_length in its AttachableStore.
+    # State: token_embedding (TensorParallelEmbedding), pg.
     def __init__(self, tp_pg: dist.ProcessGroup, config: LlamaConfig, parallel_config: Optional[ParallelismArgs]):
+        # [FUNCTION DOC]
+        # Behavior: build the vocab-parallel embedding with the pad token as padding_idx and the TP mode (default ALL_REDUCE).
+        # Inputs: tp_pg, config, parallel_config (optional). Outputs: None. Exceptions: None explicitly raised. Side effects: parameter allocation.
         super().__init__()
         self.token_embedding = TensorParallelEmbedding(
             num_embeddings=config.vocab_size,
@@ -795,6 +973,11 @@ class Embedding(nn.Module, AttachableStore):
         self.pg = tp_pg
 
     def forward(self, input_ids: torch.Tensor, input_mask: torch.Tensor):  # [batch_size, seq_length]
+        # [FUNCTION DOC]
+        # Behavior: if a store is attached, set its past_length to the previous value (zeros on first call) plus the number of valid tokens per row.
+        # Transpose input_ids to [seq, batch] and embed.
+        # Inputs: input_ids and input_mask [batch, seq]. Outputs: dict with input_embeds [seq, batch, hidden].
+        # Exceptions: None explicitly raised. Side effects: mutates store; TP collective inside the embedding.
         store = self.get_local_store()
         if store is not None:
             if "past_length" in store:
@@ -813,6 +996,11 @@ class Embedding(nn.Module, AttachableStore):
 
 
 class LlamaModel(nn.Module):
+    # [CLASS DOC]
+    # Purpose: builds the pipeline graph as a sequence of PipelineBlocks: token_position_embeddings, decoder (one block
+    # per layer), final_layer_norm, lm_head (column-parallel, producing vocab-sharded logits) and cast_to_fp32.
+    # Each block only materializes its module on the PP rank assigned by build_model; others hold TensorPointers.
+    # State: p2p (P2P communicator over pp_pg on cuda), config, parallel_config, parallel_context, tp_mode.
     """Build pipeline graph"""
 
     def __init__(
@@ -821,6 +1009,11 @@ class LlamaModel(nn.Module):
         parallel_context: ParallelContext,
         parallel_config: Optional[ParallelismArgs],
     ):
+        # [FUNCTION DOC]
+        # Behavior: create the P2P helper and all PipelineBlocks with their module builders, kwargs and input/output keys;
+        # log the RoPE theta (and a warning-style info about interleaved RoPE) on rank 0.
+        # Inputs: config (LlamaConfig), parallel_context, parallel_config. Outputs: None.
+        # Exceptions: AttributeError if parallel_config is None (tp_recompute_allgather). Side effects: logging; P2P setup.
         super().__init__()
 
         # Declare all the nodes
@@ -909,6 +1102,10 @@ class LlamaModel(nn.Module):
         input_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
         input_mask: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
     ):
+        # [FUNCTION DOC]
+        # Behavior: return only the fp32 sharded logits of forward_with_hidden_states.
+        # Inputs: input_ids, input_mask (tensors or TensorPointers). Outputs: logits [seq, batch, vocab/tp] in float32 (or TensorPointer).
+        # Exceptions: None explicitly raised. Side effects: PP point-to-point sends/receives, TP collectives.
         return self.forward_with_hidden_states(input_ids=input_ids, input_mask=input_mask)[0]
 
     def forward_with_hidden_states(
@@ -916,8 +1113,12 @@ class LlamaModel(nn.Module):
         input_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
         input_mask: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
     ):
+        # [FUNCTION DOC]
+        # Behavior: embed, run all decoder blocks passing hidden_states and sequence_mask, final norm, lm_head, cast to fp32.
+        # Pipeline blocks transparently send/receive activations between PP ranks.
+        # Inputs: input_ids, input_mask. Outputs: tuple (fp32 sharded logits, final hidden states).
+        # Exceptions: None explicitly raised. Side effects: PP p2p and TP communication.
         # all tensors are optional as most ranks don't need anything from the dataloader.
-
         output = self.token_position_embeddings(input_ids=input_ids, input_mask=input_mask)
 
         hidden_encoder_states = {
@@ -936,6 +1137,11 @@ class LlamaModel(nn.Module):
         return fp32_sharded_logits, hidden_states
 
     def get_block_compute_costs(self):
+        # [FUNCTION DOC]
+        # Behavior: return a dict mapping module builder to relative cost: decoder layer cost is 4 times heads times head
+        # dim times hidden plus 3 times ffn times hidden; lm_head cost is vocab times hidden. Used by build_model for PP balancing.
+        # Inputs: none. Outputs: dict. Exceptions: None. Side effects: None.
+        # KNOWN ISSUE: the attention cost ignores GQA (assumes kv heads equal query heads).
         """Computes the compute cost of each block in the model so that we can do a better job of load balancing."""
         model_config = self.config
         d_ff = model_config.intermediate_size
@@ -950,6 +1156,11 @@ class LlamaModel(nn.Module):
         return block_compute_costs
 
     def get_flops_per_sec(self, iteration_time_in_sec, sequence_length, global_batch_size):
+        # [FUNCTION DOC]
+        # Behavior: compute model and hardware flops with get_flops for the global batch and divide by iteration time,
+        # world size and 1e12, giving TFLOPs per second per GPU.
+        # Inputs: iteration_time_in_sec (float), sequence_length (int), global_batch_size (int).
+        # Outputs: tuple (model TFLOPs/s per GPU, hardware TFLOPs/s per GPU). Exceptions: ZeroDivisionError for zero time. Side effects: None.
         """Get flops per second for a given model"""
         world_size = self.parallel_context.world_pg.size()
         try:
@@ -975,12 +1186,22 @@ class LlamaModel(nn.Module):
 
 @torch.jit.script
 def masked_mean(loss, label_mask, dtype):
+    # [FUNCTION DOC]
+    # HELPER: TorchScript-compiled masked average used by the losses.
+    # Behavior: sum of loss times mask accumulated in dtype, divided by the mask sum.
+    # Inputs: loss and label_mask tensors of the same shape; dtype. Outputs: 0-dim tensor.
+    # Exceptions: None explicitly raised. Side effects: None.
+    # KNOWN ISSUE: returns NaN when the mask is all zeros.
     # type: (Tensor, Tensor, torch.dtype) -> Tensor
     return (loss * label_mask).sum(dtype=dtype) / label_mask.sum()
 
 
 class Loss(nn.Module):
+    # [CLASS DOC]
+    # Purpose: vocab-parallel cross-entropy loss averaged over masked tokens. State: tp_pg.
     def __init__(self, tp_pg: dist.ProcessGroup):
+        # [FUNCTION DOC]
+        # Behavior: store tp_pg. Inputs: tp_pg. Outputs: None. Exceptions: None. Side effects: None.
         super().__init__()
         self.tp_pg = tp_pg
 
@@ -990,6 +1211,11 @@ class Loss(nn.Module):
         label_ids: torch.Tensor,  # [batch_size, seq_length]
         label_mask: torch.Tensor,  # [batch_size, seq_length]
     ) -> Dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Behavior: compute per-token cross entropy in float32 from TP-sharded logits (sharded_cross_entropy all-reduces
+        # over tp_pg) against labels transposed to sequence-first, transpose back, and take masked_mean.
+        # Inputs: sharded_logits [seq, batch, vocab/tp]; label_ids and label_mask [batch, seq].
+        # Outputs: dict with loss (0-dim float tensor). Exceptions: None explicitly raised. Side effects: TP collectives.
         loss = sharded_cross_entropy(
             sharded_logits,
             label_ids.transpose(0, 1).contiguous(),
@@ -1001,7 +1227,12 @@ class Loss(nn.Module):
 
 
 class LossWithZLoss(Loss):
+    # [CLASS DOC]
+    # Purpose: Loss plus the z-loss regularizer (penalty on log-sum-exp of logits) computed inside sharded_cross_entropy.
+    # State: z_loss_coef.
     def __init__(self, tp_pg: dist.ProcessGroup, z_loss_coefficient: float):
+        # [FUNCTION DOC]
+        # Behavior: initialize Loss and store the coefficient. Inputs: tp_pg, z_loss_coefficient (float). Outputs: None. Exceptions: None. Side effects: None.
         super().__init__(tp_pg)
         self.z_loss_coef = z_loss_coefficient
 
@@ -1011,6 +1242,10 @@ class LossWithZLoss(Loss):
         label_ids: torch.Tensor,  # [batch_size, seq_length]
         label_mask: torch.Tensor,  # [batch_size, seq_length]
     ) -> Dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Behavior: call sharded_cross_entropy with the z-loss coefficient, getting per-token loss and z-loss; average both
+        # by mask; the z-loss is detached so it is reported only (any gradient effect comes from inside the loss term).
+        # Inputs: as Loss.forward. Outputs: dict with loss and z_loss. Exceptions: None explicitly raised. Side effects: TP collectives.
         loss, z_loss = sharded_cross_entropy(
             sharded_logits,
             label_ids.transpose(0, 1).contiguous(),
@@ -1024,6 +1259,10 @@ class LossWithZLoss(Loss):
 
 
 class LlamaForTraining(NanotronModel):
+    # [CLASS DOC]
+    # Purpose: the NanotronModel wrapping LlamaModel plus a loss PipelineBlock (Loss or LossWithZLoss depending on
+    # config.z_loss_enabled); the object built by the trainer through build_model.
+    # State: model, loss, parallel_context, config, parallel_config.
     def __init__(
         self,
         config: LlamaConfig,
@@ -1031,6 +1270,10 @@ class LlamaForTraining(NanotronModel):
         parallel_config: Optional[ParallelismArgs],
         random_states: Optional[RandomStates] = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: build LlamaModel and the loss PipelineBlock (sharing the model's P2P) with output keys loss (and z_loss).
+        # Inputs: config, parallel_context, parallel_config, random_states (unused). Outputs: None.
+        # Exceptions: None explicitly raised. Side effects: allocation.
         super().__init__()
         self.model = LlamaModel(config=config, parallel_context=parallel_context, parallel_config=parallel_config)
 
@@ -1064,6 +1307,11 @@ class LlamaForTraining(NanotronModel):
         label_ids: Union[torch.Tensor, TensorPointer],
         label_mask: Union[torch.Tensor, TensorPointer],
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
+        # [FUNCTION DOC]
+        # Behavior: compute sharded logits via the model, compute the loss block, and return loss (and z_loss when enabled).
+        # Inputs: input_ids, input_mask, label_ids, label_mask (tensors or TensorPointers depending on PP rank).
+        # Outputs: dict of loss tensors (TensorPointers on non-output ranks). Exceptions: None explicitly raised.
+        # Side effects: PP and TP communication.
         sharded_logits = self.model(
             input_ids=input_ids,
             input_mask=input_mask,
@@ -1080,6 +1328,15 @@ class LlamaForTraining(NanotronModel):
 
     @torch.no_grad()
     def init_model_randomly(self, config: Config):
+        # [FUNCTION DOC]
+        # Behavior (no grad): pick StandardParametrizator for RandomInit or SpectralMupParametrizator for SpectralMupInit;
+        # log the choice; build a module-id-to-prefix map; for each named parameter compute its full name (tied parameters
+        # use their shared tied name), skip it if already initialized, otherwise call the parametrizator on the owning
+        # submodule; finally assert the set of initialized names equals the expected set.
+        # Inputs: config (full Config with model.init_method). Outputs: None.
+        # Exceptions: ValueError for unknown init method; AssertionError for non-NanotronParameter or name mismatch.
+        # Side effects: overwrites parameter values in place; uses the current RNG state; logging.
+        # KNOWN ISSUE: passes config.model to the parametrizator, but StandardParametrizator and SpectralMupParametrizator expect the full Config (they read model and parallelism sections), so this likely fails with AttributeError.
         """Initialize model parameters randomly.
         Note:
             Layernorm weight all 0 or 1 depending on `apply_layernorm_1p`
@@ -1139,6 +1396,9 @@ class LlamaForTraining(NanotronModel):
         }, f"Somehow the initialized set of parameters don't match:\n - Expected: { {name for name, _ in model.named_parameters()} }\n - Got: {initialized_parameters}"
 
     def get_embeddings_lm_head_tied_names(self):
+        # [FUNCTION DOC]
+        # Behavior: return the embedding and lm_head weight names when tie_word_embeddings is true, else an empty list.
+        # Inputs: none. Outputs: list of strings. Exceptions: None. Side effects: None.
         """Get the names of the tied embeddings and lm_head weights"""
         if self.config.tie_word_embeddings is True:
             return ["model.token_position_embeddings.pp_block.token_embedding.weight", "model.lm_head.pp_block.weight"]
@@ -1146,10 +1406,14 @@ class LlamaForTraining(NanotronModel):
             return []
 
     def get_block_compute_costs(self):
+        # [FUNCTION DOC]
+        # Behavior: delegate to LlamaModel. Inputs: none. Outputs: dict of module class to cost. Exceptions: None. Side effects: None.
         """Computes the compute cost of each block in the model so that we can do a better job of load balancing."""
         return self.model.get_block_compute_costs()
 
     def get_flops_per_sec(self, iteration_time_in_sec, sequence_length, global_batch_size):
+        # [FUNCTION DOC]
+        # Behavior: delegate to LlamaModel.get_flops_per_sec. Inputs/Outputs: as there. Exceptions: as there. Side effects: None.
         """Get flops per second for a given model"""
         return self.model.get_flops_per_sec(iteration_time_in_sec, sequence_length, global_batch_size)
 
@@ -1164,6 +1428,15 @@ def get_flops(
     ffn_hidden_size,
     batch_size=1,
 ):
+    # [FUNCTION DOC]
+    # Behavior: count forward flops (2 per multiply-add) for a decoder-only model: QKV projection (q plus 2 times kv
+    # heads), QK logits and attention-times-V (both quadratic in sequence length), attention output projection, gated
+    # FFN first layer (counted as 4 because of gate and up) and second layer, all times layers, plus the lm_head.
+    # Model flops are 3 times the forward flops (forward plus twice for backward); hardware flops are set equal (placeholder).
+    # Inputs: num_layers, hidden_size, num_heads, num_key_value_heads (None means equal to num_heads), vocab_size,
+    # seq_len, ffn_hidden_size, batch_size (default 1). Outputs: tuple (model_flops, hardware_flops) as numbers.
+    # Exceptions: None explicitly raised. Side effects: None.
+    # KNOWN ISSUE: hardware_flops ignores activation recomputation, contrary to the referenced paper section.
     """Counts flops in an decoder-only model
     Args:
         num_layers: number of decoder layers

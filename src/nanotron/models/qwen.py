@@ -1,3 +1,14 @@
+# [MODULE DOC]
+# Purpose: nanotron implementation of Qwen2-style decoder-only transformers with tensor parallelism (TP),
+# pipeline parallelism (PP, via PipelineBlocks), context parallelism (CP, ring attention over cp_pg), GQA,
+# packed-document training (sequence boundaries derived from position_ids resetting to 0 and passed as cu_seqlens),
+# optional sliding-window attention, optional no-RoPE layers, optional MoE layers, z-loss and attention-probability logging.
+# Main contents: CoreAttention (pluggable attention backends), Qwen2Attention, Qwen2MLP, Qwen2MoELayer (local,
+# unused), Qwen2DecoderLayer, Embedding, Qwen2Model, masked_mean, Loss, LossWithZLoss, Qwen2ForTraining, get_flops.
+# Layout conventions: activations are token-flattened [batch_size*seq_length, hidden] (unlike llama's sequence-first
+# layout); position_ids are [batch_size, seq_length] with value 0 at each document start.
+# Import-time side effects: imports flash_attn and the llama3 ring-attention module, creates a module logger,
+# TorchScript-compiles masked_mean.
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -35,6 +46,11 @@ logger = logging.get_logger(__name__)
 
 
 class CoreAttention(nn.Module):
+    # [CLASS DOC]
+    # Purpose: unpacked-path attention dispatcher that reshapes q/k/v for the configured backend from
+    # ALL_ATTENTION_FUNCTIONS (keyed by config._attn_implementation) and calls it.
+    # State: config, layer_idx, hidden_size, head_dim, global and local (per TP rank) head counts, num_key_value_groups,
+    # _attn_implementation, cp_pg, sliding_window_size, simple_causal_mask (always True), flex_attention_mask.
     """Core attention module that can use different attention implementations"""
 
     def __init__(
@@ -44,6 +60,9 @@ class CoreAttention(nn.Module):
         cp_pg: dist.ProcessGroup,
         layer_idx: int = 0,
     ):
+        # [FUNCTION DOC]
+        # Behavior: store the attention configuration derived from config and the TP/CP groups.
+        # Inputs: config (Qwen2Config), tp_pg, cp_pg, layer_idx (default 0). Outputs: None. Exceptions: None explicitly raised. Side effects: None.
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -73,6 +92,19 @@ class CoreAttention(nn.Module):
         dropout: float = 0.0,
         **kwargs,
     ):
+        # [FUNCTION DOC]
+        # Behavior: look up the backend; read cu_seqlens from kwargs. For ring_flash_triton reshape to
+        # [batch, seq, heads, d]; for ring keep token-flattened [tokens, heads, d]; otherwise, with simple_causal_mask,
+        # assert no custom mask and no sliding window. Call the backend with the module, q, k, v, mask, max_seqlen equal
+        # to seq_length, dropout, default scaling, sliding window, ring group, and flex-attention extras only for flex_attention.
+        # Take the first returned element and flatten heads.
+        # Inputs: query_states [tokens, local_heads, d]; key_states/value_states [tokens, local_kv_heads, d]; position_ids [tokens];
+        # seq_length (int); attention_mask (optional); dropout (float, default 0.0); extra kwargs forwarded (cu_seqlens, document_ids, ...).
+        # Outputs: tensor [tokens, local_heads*d].
+        # Exceptions: KeyError for unknown backend; AssertionError when a mask or sliding window is used with the simple causal mask.
+        # Side effects: CP ring communication inside ring backends.
+        # KNOWN ISSUE: simple_causal_mask is hard-coded True, so the branch that builds an attention mask from position_ids is dead code.
+        # KNOWN ISSUE: cu_seqlens is read from kwargs but kwargs is still forwarded whole, so the backend receives cu_seqlens as a keyword too.
         """Forward pass applying the chosen attention implementation"""
         # Get the appropriate attention function
         attention_func = ALL_ATTENTION_FUNCTIONS[self._attn_implementation]
@@ -133,6 +165,12 @@ class CoreAttention(nn.Module):
         )  # [b*s, num_heads, head_dim] -> [b*s, num_heads*head_dim]
 
 class Qwen2Attention(LogMixin, nn.Module):
+    # [CLASS DOC]
+    # Purpose: TP-sharded GQA self-attention with fused QKV projection (optional bias), RoPE, flash varlen
+    # attention over packed documents (or llama3 ring attention for CP), optional sliding window and attention-prob logging via LogMixin.
+    # Key attributes: tp_pg_size, cp_pg, cp_pg_size, head counts and sizes (global/local q and kv), qkv_proj, o_proj,
+    # rotary_emb (FlashRotaryEmbedding when _use_qkv_packed else nanotron RotaryEmbedding), attention (CoreAttention),
+    # _use_qkv_packed, sliding_window_size, log_attn_probs, heads_k_stride (ring attention stride).
     def __init__(
         self,
         config: Qwen2Config,
@@ -141,6 +179,13 @@ class Qwen2Attention(LogMixin, nn.Module):
         cp_pg: dist.ProcessGroup,
         layer_idx: int,
     ):
+        # [FUNCTION DOC]
+        # Behavior: compute head layout, TP mode (default ALL_REDUCE) and async flag; build the QKV column-parallel linear
+        # with contiguous q/k/v chunks and attention_bias, the row-parallel output projection without bias, the rotary
+        # module and the CoreAttention; copy flags from config.
+        # Inputs: config, parallel_config (required in practice), tp_pg, cp_pg, layer_idx. Outputs: None.
+        # Exceptions: AttributeError if parallel_config is None. Side effects: parameter allocation.
+        # KNOWN ISSUE: there is no check that head counts are divisible by the TP size.
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -224,6 +269,15 @@ class Qwen2Attention(LogMixin, nn.Module):
         position_ids: torch.Tensor,  # [batch_size, seq_length] where -1 is padding
         cu_seqlens: Optional[Union[torch.Tensor, Dict[str, torch.Tensor]]] = None,  # Added cu_seqlens argument
     ):
+        # [FUNCTION DOC]
+        # Behavior: local sequence length is position_ids width divided by CP size (position_ids are global under CP);
+        # flatten position_ids; project to QKV; when _use_qkv_packed run _forward_packed; apply o_proj; return output and
+        # position_ids reshaped to [-1, seq_length].
+        # Inputs: hidden_states [tokens, hidden]; position_ids [batch, global_seq]; cu_seqlens (int32 tensor, or dict for llama3 ring attention).
+        # Outputs: dict with hidden_states [tokens, hidden] and position_ids.
+        # Exceptions: UnboundLocalError when _use_qkv_packed is False. Side effects: TP collectives.
+        # KNOWN ISSUE: the non-packed path is commented out, so with _use_qkv_packed False attn_output is undefined.
+        # KNOWN ISSUE: under CP the returned position_ids are reshaped with the local seq_length although they hold the global positions, changing their shape.
         # [0, 1, 2, 3, 4, 0, 1, 2, -1, -1, -1] # 2 documents with 5 and 3 tokens then padding
         # [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10] # 1 document with 11 tokens
         # [0, 1, 2, 3, 4, 5, 6, 7, 8, -1, -1] # 1 document with 10 tokens then padding
@@ -264,6 +318,21 @@ class Qwen2Attention(LogMixin, nn.Module):
         return {"hidden_states": output, "position_ids": position_ids.view(-1, seq_length)}
 
     def _forward_packed(self, qkv, seq_length, position_ids, cu_seqlens):
+        # [FUNCTION DOC]
+        # HELPER: packed-QKV attention used by Qwen2Attention.forward.
+        # Behavior: assert cu_seqlens given; slice q and packed kv from the projection; view as [batch, seq, heads, d] and
+        # [batch, seq, 2, kv_heads, d]. Unless this layer is a no-RoPE layer (every no_rope_layer-th layer, 1-based),
+        # apply rotary with an offset of CP rank times seq_length and max length seq_length times CP size; for no-RoPE layers
+        # log at debug and disable sliding window. Flatten tokens. With llama3_ring_attention call the ring kernel using the
+        # dict entries of cu_seqlens over cp_pg; otherwise assert int32 cu_seqlens and call flash varlen kvpacked attention
+        # with the same cu_seqlens for q and k, causal, window of sliding_window_size minus 1 to the left (or unlimited).
+        # If log_attn_probs, unpack outputs and record attn_probs via tbi_logger. Return [tokens, local_heads*d].
+        # Inputs: qkv [tokens, local_q+2*local_kv]; seq_length (local int); position_ids (unused here); cu_seqlens.
+        # Outputs: tensor [tokens, local_heads*d].
+        # Exceptions: AssertionError on missing or wrongly typed cu_seqlens.
+        # Side effects: CP ring communication; may permanently set self.sliding_window_size to None; logging of attention probs.
+        # KNOWN ISSUE: the kv view assumes the k and v halves are stored as two consecutive kv blocks, which matches the q|k|v chunk layout only per TP shard; correct but fragile.
+        # KNOWN ISSUE: without llama3 ring attention but with CP above 1, global cu_seqlens computed by Qwen2Model are applied to local tokens, giving wrong document boundaries.
         assert cu_seqlens is not None, "cu_seqlens must be provided for packed attention"
         q = qkv[..., : self.local_num_heads * self.head_dim]  # Not contiguous, similar to flash_attn
         kv = qkv[..., self.local_num_heads * self.head_dim :]  # Not contiguous, similar to flash_attn
@@ -331,6 +400,9 @@ class Qwen2Attention(LogMixin, nn.Module):
 
 
 class Qwen2MLP(nn.Module):
+    # [CLASS DOC]
+    # Purpose: TP-sharded SwiGLU MLP: fused column-parallel gate/up projection (no bias), activation of gate times up, row-parallel down projection (no bias).
+    # Construction: config, parallel_config, tp_pg, intermediate_size.
     def __init__(
         self,
         config: Qwen2Config,
@@ -338,6 +410,10 @@ class Qwen2MLP(nn.Module):
         tp_pg: dist.ProcessGroup,
         intermediate_size: int,
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: derive TP mode/async flag and build gate_up_proj (with two contiguous chunks), down_proj and act.
+        # Inputs: config, parallel_config (required in practice), tp_pg, intermediate_size (int). Outputs: None.
+        # Exceptions: AttributeError if parallel_config is None; KeyError for unknown activation. Side effects: parameter allocation.
         super().__init__()
 
         # Get TP mode and communication settings
@@ -376,6 +452,9 @@ class Qwen2MLP(nn.Module):
         self.act = ACT2FN[config.hidden_act]
 
     def forward(self, hidden_states):
+        # [FUNCTION DOC]
+        # Behavior: project, split in halves, act(gate) times up, down-project.
+        # Inputs: hidden_states [tokens, hidden]. Outputs: dict with hidden_states. Exceptions: None explicitly raised. Side effects: TP collectives.
         # Apply gate_up_proj to get gate and up projections
         merged_states = self.gate_up_proj(hidden_states)
 
@@ -390,6 +469,12 @@ class Qwen2MLP(nn.Module):
 
 
 class Qwen2MoELayer(nn.Module):
+    # [CLASS DOC]
+    # Purpose: simple, non-distributed mixture-of-experts layer: router, top-k selection, per-expert Qwen2MLP, optional gated shared expert.
+    # State: hidden_size, intermediate_size, num_experts, num_experts_per_token, expert_parallel_size, num_local_experts,
+    # router, optional shared_expert and shared_expert_gate, experts, recompute_layer, token_dispatcher_type (unused).
+    # KNOWN ISSUE: this class is dead code in this module; Qwen2DecoderLayer imports a different Qwen2MoELayer from nanotron.nn.moe.
+    # KNOWN ISSUE: it cannot be constructed: Qwen2MLP requires intermediate_size but is called without it (TypeError).
     """Mixture of experts Layer for Qwen2 models."""
 
     def __init__(
@@ -399,6 +484,10 @@ class Qwen2MoELayer(nn.Module):
         tp_pg: dist.ProcessGroup,
         layer_idx: int = 0,
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: read MoE config, compute local expert count, build router (column-parallel to num_experts), optional shared expert and gate, and local experts.
+        # Inputs: config (with moe_config), parallel_config, tp_pg, layer_idx (unused, default 0). Outputs: None.
+        # Exceptions: TypeError from Qwen2MLP construction (see class); AttributeError if parallel_config is None. Side effects: allocation.
         super().__init__()
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.intermediate_size
@@ -462,6 +551,13 @@ class Qwen2MoELayer(nn.Module):
         # For more sophisticated implementations, we would add token dispatcher logic here
 
     def _compute_router_probabilities(self, hidden_states):
+        # [FUNCTION DOC]
+        # HELPER: routing for the MoE layer.
+        # Behavior: router logits, top-k values and indices per token, softmax over the top-k values.
+        # Inputs: hidden_states [tokens, hidden]. Outputs: tuple (weights [tokens, k], indices [tokens, k]).
+        # Exceptions: NameError at call time. Side effects: TP collectives in router.
+        # KNOWN ISSUE: F (torch.nn.functional) is never imported, so the softmax call raises NameError.
+        # KNOWN ISSUE: the router is column-parallel, so under TP each rank sees only its shard of expert logits before top-k.
         """Compute routing probabilities for each token to each expert."""
         router_logits = self.router(hidden_states)  # [batch_size*seq_length, num_experts]
 
@@ -474,6 +570,13 @@ class Qwen2MoELayer(nn.Module):
         return routing_weights, routing_indices
 
     def _dispatch_tokens(self, hidden_states, routing_weights, routing_indices):
+        # [FUNCTION DOC]
+        # HELPER: gathers and weights tokens per local expert.
+        # Behavior: for each local expert index select tokens whose top-k contains it, multiply by their routing weight for
+        # that expert, and record the token count.
+        # Inputs: hidden_states, routing_weights, routing_indices. Outputs: tuple (list of weighted token tensors, list of counts).
+        # Exceptions: None explicitly raised. Side effects: None.
+        # KNOWN ISSUE: contains a no-op expression statement reading the token count; local expert indices are compared with global expert ids, ignoring expert-parallel offsets.
         """
         Dispatches tokens to their selected experts.
         In a full implementation, this would handle the actual token routing logic
@@ -506,6 +609,12 @@ class Qwen2MoELayer(nn.Module):
         return dispatched_inputs, expert_counts
 
     def _combine_expert_outputs(self, expert_outputs, routing_indices, original_shape):
+        # [FUNCTION DOC]
+        # HELPER: scatters expert outputs back.
+        # Behavior: start from zeros of the original shape and add each non-empty expert output at the positions of tokens routed to it.
+        # Inputs: expert_outputs (list), routing_indices, original_shape. Outputs: combined tensor.
+        # Exceptions: None explicitly raised. Side effects: None.
+        # KNOWN ISSUE: the zeros tensor uses the default dtype rather than the expert output dtype.
         """
         Combines outputs from different experts back to the original tensor layout.
         """
@@ -523,6 +632,10 @@ class Qwen2MoELayer(nn.Module):
         return combined_output
 
     def _core_forward(self, hidden_states):
+        # [FUNCTION DOC]
+        # HELPER: uncheckpointed MoE computation.
+        # Behavior: route, dispatch, run each expert with tokens (empty tensors otherwise), combine, and add the sigmoid-gated shared expert output when enabled.
+        # Inputs: hidden_states [tokens, hidden]. Outputs: tensor [tokens, hidden]. Exceptions: as the helpers. Side effects: TP collectives.
         """Core forward logic for MoE layer."""
         # Get router probabilities
         routing_weights, routing_indices = self._compute_router_probabilities(hidden_states)
@@ -553,10 +666,16 @@ class Qwen2MoELayer(nn.Module):
         return output
 
     def _checkpointed_forward(self, hidden_states):
+        # [FUNCTION DOC]
+        # HELPER: runs _core_forward under CheckpointFunction with RNG preservation.
+        # Inputs/Outputs: as _core_forward. Exceptions: as _core_forward. Side effects: recomputation in backward.
         """Apply gradient checkpointing to save memory during training."""
         return CheckpointFunction.apply(self._core_forward, True, hidden_states)
 
     def forward(self, hidden_states):
+        # [FUNCTION DOC]
+        # Behavior: checkpointed path when recompute_layer and training, else core path; wrap in a dict.
+        # Inputs: hidden_states. Outputs: dict with hidden_states. Exceptions: as _core_forward. Side effects: as _core_forward.
         """Forward pass for the MoE layer."""
         if self.recompute_layer and self.training:
             hidden_states = self._checkpointed_forward(hidden_states)
@@ -567,6 +686,8 @@ class Qwen2MoELayer(nn.Module):
 
 
 class Qwen2DecoderLayer(nn.Module):
+    # [CLASS DOC]
+    # Purpose: pre-norm transformer block: RMSNorm, Qwen2Attention, residual, RMSNorm, MLP or MoE, residual; optional full-layer recomputation.
     def __init__(
         self,
         config: Qwen2Config,
@@ -575,6 +696,12 @@ class Qwen2DecoderLayer(nn.Module):
         cp_pg: dist.ProcessGroup,
         layer_idx: int,
     ) -> None:
+        # [FUNCTION DOC]
+        # Behavior: pick TritonRMSNorm when _fused_rms_norm else LlamaRMSNorm; build norms, attention, and either the MoE
+        # layer from nanotron.nn.moe (if layer_idx is in moe_config.layers) or Qwen2MLP; read recompute_layer.
+        # Inputs: config, parallel_config (required), tp_pg, cp_pg, layer_idx. Outputs: None.
+        # Exceptions: AttributeError if parallel_config is None. Side effects: allocation.
+        # KNOWN ISSUE: input_layernorm is overwritten with the unfused RMSNorm, ignoring _fused_rms_norm; post_attention_layernorm is built twice (wasteful, may shift RNG/param ordering).
         super().__init__()
         self.hidden_size = config.hidden_size
         # Use fused RMSNorm if configured
@@ -617,6 +744,12 @@ class Qwen2DecoderLayer(nn.Module):
         position_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length] where -1 is padding
         cu_seqlens: Union[torch.Tensor, TensorPointer],
     ) -> List[Union[torch.Tensor, TensorPointer]]:
+        # [FUNCTION DOC]
+        # HELPER: uncheckpointed layer computation.
+        # Behavior: residual plus attention of normalized input, residual plus MLP of normalized result; pass position_ids and cu_seqlens through.
+        # Inputs: hidden_states [tokens, hidden], position_ids, cu_seqlens. Outputs: tuple (hidden_states, position_ids, cu_seqlens).
+        # Exceptions: as submodules. Side effects: TP/CP communication.
+        # KNOWN ISSUE: position_ids returned are the input ones, not the reshaped ones from attention (harmless).
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
 
@@ -637,6 +770,10 @@ class Qwen2DecoderLayer(nn.Module):
         position_ids: torch.Tensor,
         cu_seqlens: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # [FUNCTION DOC]
+        # HELPER: runs _core_forward through CheckpointFunction with RNG preservation.
+        # Inputs/Outputs: as _core_forward. Exceptions: as _core_forward. Side effects: recomputation in backward.
+        # KNOWN ISSUE: passing a dict cu_seqlens (llama3 ring attention) through CheckpointFunction works only because non-tensor args are allowed; non-tensor outputs are returned as-is.
         return CheckpointFunction.apply(self._core_forward, True, hidden_states, position_ids, cu_seqlens)
 
     def forward(
@@ -645,6 +782,9 @@ class Qwen2DecoderLayer(nn.Module):
         position_ids: Union[torch.Tensor, TensorPointer],
         cu_seqlens: Union[torch.Tensor, TensorPointer],
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
+        # [FUNCTION DOC]
+        # Behavior: checkpointed path when recompute_layer and hidden_states is a real tensor, else core path; return dict.
+        # Inputs: hidden_states, position_ids, cu_seqlens. Outputs: dict with the three keys. Exceptions/Side effects: as the chosen path.
         if self.recompute_layer and not isinstance(hidden_states, TensorPointer):
             hidden_states, position_ids, cu_seqlens = self._checkpointed_forward(
                 hidden_states, position_ids, cu_seqlens
@@ -660,7 +800,12 @@ class Qwen2DecoderLayer(nn.Module):
 
 
 class Embedding(nn.Module):
+    # [CLASS DOC]
+    # Purpose: vocab-parallel token embedding over flattened tokens. State: token_embedding, pg.
     def __init__(self, tp_pg: dist.ProcessGroup, config: Qwen2Config, parallel_config: Optional[ParallelismArgs]):
+        # [FUNCTION DOC]
+        # Behavior: build TensorParallelEmbedding with pad token padding_idx and TP mode (default ALL_REDUCE).
+        # Inputs: tp_pg, config, parallel_config. Outputs: None. Exceptions: None explicitly raised. Side effects: allocation.
         super().__init__()
         self.token_embedding = TensorParallelEmbedding(
             num_embeddings=config.vocab_size,
@@ -672,12 +817,20 @@ class Embedding(nn.Module):
         self.pg = tp_pg
 
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor):  # [batch_size, seq_length]
+        # [FUNCTION DOC]
+        # Behavior: flatten input_ids to [tokens] and embed; pass position_ids through.
+        # Inputs: input_ids, position_ids [batch, seq]. Outputs: dict with input_embeds [tokens, hidden] and position_ids.
+        # Exceptions: None explicitly raised. Side effects: TP collective.
         input_ids = input_ids.view(-1)  # [batch_size*seq_length]
         input_embeds = self.token_embedding(input_ids)  # [batch_size*seq_length, hidden_size]
         return {"input_embeds": input_embeds, "position_ids": position_ids}
 
 
 class Qwen2Model(nn.Module):
+    # [CLASS DOC]
+    # Purpose: pipeline graph of PipelineBlocks: token_position_embeddings, decoder layers, final_layer_norm, lm_head
+    # (vocab-sharded logits). No fp32 cast block, unlike llama.
+    # State: p2p, config, parallel_config, parallel_context, tp_mode.
     """Build pipeline graph for Qwen2 model"""
 
     def __init__(
@@ -686,6 +839,10 @@ class Qwen2Model(nn.Module):
         parallel_context: ParallelContext,
         parallel_config: Optional[ParallelismArgs],
     ):
+        # [FUNCTION DOC]
+        # Behavior: create P2P over pp_pg and all PipelineBlocks with their builders, kwargs (decoder layers get tp_pg and cp_pg) and keys.
+        # Inputs: config, parallel_context, parallel_config. Outputs: None.
+        # Exceptions: AttributeError if parallel_config is None. Side effects: P2P setup.
         super().__init__()
 
         # Declare all the nodes
@@ -760,6 +917,15 @@ class Qwen2Model(nn.Module):
         input_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length]
         position_ids: Union[torch.Tensor, TensorPointer],  # [batch_size, seq_length] where -1 is padding
     ):
+        # [FUNCTION DOC]
+        # Behavior: embed; if position_ids is non-empty compute cu_seqlens as the indices where flattened position_ids is 0,
+        # plus the total token count, as int32. For llama3_ring_attention assert the global length equals local length times
+        # CP size and is divisible by twice CP size, then replace cu_seqlens with the dict produced by
+        # llama3_flash_attn_prepare_cu_seqlens for this CP rank. Run all decoder blocks, final norm, lm_head.
+        # Inputs: input_ids [batch, local_seq] and position_ids [batch, global_seq] (tensors or TensorPointers).
+        # Outputs: sharded logits [tokens, vocab/tp] (or TensorPointer).
+        # Exceptions: AssertionError on CP length constraints. Side effects: PP p2p, TP and CP communication.
+        # KNOWN ISSUE: cu_seqlens is computed from position_ids on every PP rank, so position_ids must be a real tensor everywhere (a TensorPointer would fail); padding tokens marked -1 are merged into the preceding document.
         output = self.token_position_embeddings(input_ids=input_ids, position_ids=position_ids)
         # Compute cu_seqlens
         cu_seqlens: Optional[Union[torch.Tensor, Dict[str, torch.Tensor]]] = None
@@ -811,6 +977,10 @@ class Qwen2Model(nn.Module):
         return sharded_logits
 
     def get_block_compute_costs(self):
+        # [FUNCTION DOC]
+        # Behavior: same cost model as llama: decoder layer 4 times heads times head dim times hidden plus 3 times ffn times hidden; lm_head vocab times hidden.
+        # Inputs: none. Outputs: dict module class to cost. Exceptions: None. Side effects: None.
+        # KNOWN ISSUE: ignores GQA and MoE in the cost.
         """Computes the compute cost of each block in the model for load balancing."""
         model_config = self.config
         d_ff = model_config.intermediate_size
@@ -825,6 +995,10 @@ class Qwen2Model(nn.Module):
         return block_compute_costs
 
     def get_flops_per_sec(self, iteration_time_in_sec, sequence_length, global_batch_size):
+        # [FUNCTION DOC]
+        # Behavior: get_flops for the global batch divided by time, world size and 1e12 (TFLOPs/s per GPU).
+        # Inputs: iteration_time_in_sec, sequence_length, global_batch_size. Outputs: tuple (model, hardware) TFLOPs/s.
+        # Exceptions: ZeroDivisionError for zero time. Side effects: None.
         """Get flops per second for the model"""
         world_size = self.parallel_context.world_pg.size()
 
@@ -852,12 +1026,20 @@ class Qwen2Model(nn.Module):
 
 @torch.jit.script
 def masked_mean(loss, label_mask, dtype):
+    # [FUNCTION DOC]
+    # HELPER: TorchScript-compiled masked mean: sum of loss times mask in dtype divided by mask sum.
+    # Inputs: loss, label_mask, dtype. Outputs: 0-dim tensor. Exceptions: None. Side effects: None.
+    # KNOWN ISSUE: NaN if the mask is all zeros.
     # type: (Tensor, Tensor, torch.dtype) -> Tensor
     return (loss * label_mask).sum(dtype=dtype) / label_mask.sum()
 
 
 class Loss(nn.Module):
+    # [CLASS DOC]
+    # Purpose: vocab-parallel cross-entropy averaged over masked tokens. State: tp_pg.
     def __init__(self, tp_pg: dist.ProcessGroup):
+        # [FUNCTION DOC]
+        # Behavior: store tp_pg. Inputs: tp_pg. Outputs: None. Exceptions: None. Side effects: None.
         super().__init__()
         self.tp_pg = tp_pg
 
@@ -867,6 +1049,10 @@ class Loss(nn.Module):
         label_ids: torch.Tensor,  # [batch_size, seq_length]
         label_mask: torch.Tensor,  # [batch_size, seq_length]
     ) -> Dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Behavior: reshape flattened logits to [batch, seq, vocab/tp], compute float32 sharded cross entropy against labels, masked mean.
+        # Inputs: sharded_logits [tokens, vocab/tp]; label_ids, label_mask [batch, seq]. Outputs: dict with loss.
+        # Exceptions: shape errors if sizes mismatch. Side effects: TP collectives.
         sharded_logits = sharded_logits.view(label_ids.shape[0], label_ids.shape[1], -1)
         loss = sharded_cross_entropy(sharded_logits, label_ids.contiguous(), group=self.tp_pg, dtype=torch.float)
         loss = masked_mean(loss, label_mask, dtype=torch.float)
@@ -874,7 +1060,11 @@ class Loss(nn.Module):
 
 
 class LossWithZLoss(Loss):
+    # [CLASS DOC]
+    # Purpose: Loss plus z-loss term computed by sharded_cross_entropy. State: z_loss_coef.
     def __init__(self, tp_pg: dist.ProcessGroup, z_loss_coefficient: float):
+        # [FUNCTION DOC]
+        # Behavior: init Loss and store coefficient. Inputs: tp_pg, z_loss_coefficient. Outputs: None. Exceptions: None. Side effects: None.
         super().__init__(tp_pg)
         self.z_loss_coef = z_loss_coefficient
 
@@ -884,6 +1074,9 @@ class LossWithZLoss(Loss):
         label_ids: torch.Tensor,  # [batch_size, seq_length]
         label_mask: torch.Tensor,  # [batch_size, seq_length]
     ) -> Dict[str, torch.Tensor]:
+        # [FUNCTION DOC]
+        # Behavior: as Loss.forward but with z-loss; return masked means of loss and of detached z-loss.
+        # Inputs: as Loss.forward. Outputs: dict with loss and z_loss. Exceptions: as Loss.forward. Side effects: TP collectives.
         sharded_logits = sharded_logits.view(label_ids.shape[0], label_ids.shape[1], -1)
         loss, z_loss = sharded_cross_entropy(
             sharded_logits, label_ids.contiguous(), group=self.tp_pg, dtype=torch.float, z_loss_coef=self.z_loss_coef
@@ -894,6 +1087,9 @@ class LossWithZLoss(Loss):
 
 from nanotron.logging import LoggingCollectorMixin
 class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
+    # [CLASS DOC]
+    # Purpose: NanotronModel wrapping Qwen2Model and a loss PipelineBlock; also a LoggingCollectorMixin (already inherited via NanotronModel) for gathering attention-prob logs.
+    # State: model, loss, parallel_context, config, parallel_config.
     def __init__(
         self,
         config: Qwen2Config,
@@ -901,6 +1097,9 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
         parallel_config: Optional[ParallelismArgs],
         random_states: Optional[RandomStates] = None,
     ):
+        # [FUNCTION DOC]
+        # Behavior: build Qwen2Model and the Loss or LossWithZLoss PipelineBlock (output keys loss, plus z_loss when enabled).
+        # Inputs: config, parallel_context, parallel_config, random_states (unused). Outputs: None. Exceptions: None explicitly raised. Side effects: allocation.
         super().__init__()
         self.model = Qwen2Model(config=config, parallel_context=parallel_context, parallel_config=parallel_config)
 
@@ -933,6 +1132,10 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
         label_ids: Union[torch.Tensor, TensorPointer],
         label_mask: Union[torch.Tensor, TensorPointer],
     ) -> Dict[str, Union[torch.Tensor, TensorPointer]]:
+        # [FUNCTION DOC]
+        # Behavior: compute logits then loss; return loss (and z_loss if enabled).
+        # Inputs: input_ids, position_ids, label_ids, label_mask. Outputs: dict of loss tensors or TensorPointers.
+        # Exceptions: None explicitly raised. Side effects: PP/TP/CP communication.
         sharded_logits = self.model(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -949,6 +1152,13 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
 
     @torch.no_grad()
     def init_model_randomly(self, config: Config):
+        # [FUNCTION DOC]
+        # Behavior (no grad): choose StandardParametrizator or SpectralMupParametrizator from config.model.init_method; for each
+        # parameter (tied ones once, by tied name) call the parametrizator on its owning module; assert all expected names were initialized.
+        # Inputs: config (full Config). Outputs: None.
+        # Exceptions: ValueError for unknown init method; AssertionError for non-NanotronParameter or set mismatch.
+        # Side effects: overwrites parameters in place; consumes RNG; logging.
+        # Note: passes the full Config to the parametrizator, which is what StandardParametrizator expects (llama passes config.model instead).
         """Initialize model parameters randomly."""
         init_method = config.model.init_method
         if isinstance(init_method, RandomInit):
@@ -1005,6 +1215,9 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
         }, f"Somehow the initialized set of parameters don't match:\n - Expected: { {name for name, _ in model.named_parameters()} }\n - Got: {initialized_parameters}"
 
     def get_embeddings_lm_head_tied_names(self):
+        # [FUNCTION DOC]
+        # Behavior: return the embedding and lm_head weight names if tie_word_embeddings, else an empty list.
+        # Inputs: none. Outputs: list of strings. Exceptions: None. Side effects: None.
         """Get the names of the tied embeddings and lm_head weights"""
         if self.config.tie_word_embeddings is True:
             # Should be similar to ["model.token_position_embeddings.pp_block.token_embedding.weight", "model.lm_head.pp_block.weight"]
@@ -1013,10 +1226,14 @@ class Qwen2ForTraining(NanotronModel, LoggingCollectorMixin):
             return []
 
     def get_block_compute_costs(self):
+        # [FUNCTION DOC]
+        # Behavior: delegate to Qwen2Model. Inputs: none. Outputs: dict. Exceptions: None. Side effects: None.
         """Computes the compute cost of each block in the model so that we can do a better job of load balancing."""
         return self.model.get_block_compute_costs()
 
     def get_flops_per_sec(self, iteration_time_in_sec, sequence_length, global_batch_size):
+        # [FUNCTION DOC]
+        # Behavior: delegate to Qwen2Model.get_flops_per_sec. Inputs/Outputs/Exceptions: as there. Side effects: None.
         """Get flops per second for a given model"""
         return self.model.get_flops_per_sec(iteration_time_in_sec, sequence_length, global_batch_size)
 
@@ -1031,6 +1248,14 @@ def get_flops(
     ffn_hidden_size,
     batch_size=1,
 ):
+    # [FUNCTION DOC]
+    # Behavior: identical to llama.get_flops: forward flops of QKV projections (GQA-aware), QK logits, attention times V,
+    # output projection, gated FFN (first layer counted 4x) and down projection per layer, plus lm_head; model flops are
+    # 3 times forward; hardware flops equal model flops (placeholder).
+    # Inputs: num_layers, hidden_size, num_heads, num_key_value_heads (None means num_heads), vocab_size, seq_len,
+    # ffn_hidden_size, batch_size (default 1). Outputs: tuple (model_flops, hardware_flops).
+    # Exceptions: None explicitly raised. Side effects: None.
+    # KNOWN ISSUE: ignores causal masking, sliding windows and MoE when counting flops.
     """Counts flops in an decoder-only model
     Args:
         num_layers: number of decoder layers
