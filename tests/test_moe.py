@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Purpose: single-GPU test of nanotron.nn.moe GroupedMLP output shape, dtype and device using the tiny MoE Qwen config; also runnable as a script.
+# Main contents: test_grouped_mlp.
 import torch
 from helpers.qwen_helper import TINY_MOE_QWEN_CONFIG
 from nanotron.config.parallelism_config import ParallelismArgs
@@ -6,6 +9,12 @@ from nanotron.nn.moe import GroupedMLP
 
 
 def test_grouped_mlp():
+    # [FUNCTION DOC]
+    # Behavior: with parallelism of size 1 everywhere, creates 36 permuted bfloat16 token states (tokens per expert 1 through 8, one count per expert), builds GroupedMLP on CUDA in bfloat16, runs it and checks the hidden_states output has shape tokens by hidden size, bfloat16 dtype and CUDA device.
+    # Inputs: none.
+    # Outputs: None.
+    # Exceptions: AssertionError on failure (including if the config does not have 8 experts).
+    # Side effects: GPU allocation.
     parallel_config = ParallelismArgs(
         dp=1,
         pp=1,

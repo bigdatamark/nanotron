@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Purpose: pytest test (currently skipped) for NanotronModel named_modules_in_pp_rank using a tiny Llama.
+# Main contents: test_get_named_modules_in_pp_rank and its per-rank body.
 import pytest
 import torch
 import torch.distributed as dist
@@ -14,6 +17,12 @@ from tests.helpers.llama_helper import TINY_LLAMA_CONFIG, create_llama_from_conf
 @pytest.mark.skip
 @rerun_if_address_is_in_use()
 def test_get_named_modules_in_pp_rank(tp: int, dp: int, pp: int):
+    # [FUNCTION DOC]
+    # Behavior: builds a training Config from TINY_LLAMA_CONFIG with random init (std 1.0) and runs the body on tp*dp*pp processes.
+    # Inputs: tp, dp, pp, parametrized (1,1,1) and (2,2,2).
+    # Outputs: None.
+    # Exceptions: AssertionError on failure (test is marked skip).
+    # Side effects: process spawning.
     model_args = ModelArgs(init_method=RandomInit(std=1.0), model_config=TINY_LLAMA_CONFIG)
     config = get_llama_training_config(model_args)
 
@@ -24,6 +33,12 @@ def _test_get_named_modules_in_pp_rank(
     parallel_context: ParallelContext,
     config: Config,
 ):
+    # [FUNCTION DOC]
+    # Behavior: creates the Llama on CUDA, randomly initializes it, collects PipelineBlocks whose rank differs from the current pipeline rank, then checks that every entry of named_modules_in_pp_rank is a module not among those other-rank blocks.
+    # Inputs: parallel_context; config, Config.
+    # Outputs: None.
+    # Exceptions: AssertionError on failure.
+    # Side effects: GPU allocation, collectives during build and init.
     model = create_llama_from_config(
         model_config=config.model.model_config,
         device=torch.device("cuda"),

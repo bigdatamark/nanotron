@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Purpose: pytest tests for nanotron.fp8 FP8Tensor quantization/dequantization and attributes; imports transformer_engine and its extensions (CUDA required).
+# Main contents: two test functions.
+# Import-time side effects: imports transformer_engine (registers its kernels).
 from copy import deepcopy
 
 import numpy as np
@@ -12,6 +16,12 @@ from nanotron.fp8.tensor import convert_tensor_from_fp8
 
 @pytest.mark.parametrize("size", [4, 8, 16, 64])
 def test_quantize_and_dequantize_tensor_in_fp8(size):
+    # [FUNCTION DOC]
+    # Behavior: quantizes a random square float32 CUDA tensor into FP8E4M3; checks the result is an FP8Tensor stored as uint8 with same device/shape/numel and different raw values, that its meta has amax equal to the input's max absolute value, a tensor inverse_scale, a scale other than 0.1 and 1, and a transformer engine dtype; then dequantizes with convert_tensor_from_fp8 and checks a float32 tensor close to the original (rtol and atol 0.1).
+    # Inputs: size, parametrized side length (4, 8, 16, 64).
+    # Outputs: None.
+    # Exceptions: AssertionError on failure.
+    # Side effects: GPU allocation.
     tensor = torch.randn((size, size), dtype=torch.float32, device="cuda")
     ref_tensor = deepcopy(tensor)
 
@@ -40,6 +50,12 @@ def test_quantize_and_dequantize_tensor_in_fp8(size):
 
 
 def test_fp8_tensor_attrs():
+    # [FUNCTION DOC]
+    # Behavior: quantizes a 64x64 float32 tensor and checks type, meta type, uint8 dtype, device, shape and numel against the original.
+    # Inputs: none.
+    # Outputs: None.
+    # Exceptions: AssertionError on failure.
+    # Side effects: GPU allocation.
     SIZE = 64
     tensor = torch.randn((SIZE, SIZE), dtype=torch.float32, device="cuda:0")
     ref_tensor = tensor.detach().clone()

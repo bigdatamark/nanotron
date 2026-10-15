@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Purpose: test helpers for building a tiny Qwen2 (dense and MoE) model and a matching training Config.
+# Main contents: QWEN_MOE_CONFIG (8 experts, top-1, shared expert, alltoall dispatcher), QWEN_MODEL_CONFIG dictionary (128 hidden, 4 layers, 4 heads, 2 KV heads, vocab 4096, rope theta 10000, flash attention 2), TINY_QWEN_CONFIG and TINY_MOE_QWEN_CONFIG (the same plus the MoE config); get_qwen_training_config; create_qwen_from_config.
+# Import-time side effects: constructs the MoEConfig and Qwen2Config constants.
 import torch
 from nanotron.config import (
     AdamWOptimizerArgs,
@@ -60,6 +64,12 @@ TINY_MOE_QWEN_CONFIG = Qwen2Config(
 
 
 def get_qwen_training_config(model_config: ModelArgs):
+    # [FUNCTION DOC]
+    # Behavior: returns a full nanotron Config for unit tests: project "unittest", seed 42, checkpoints in ./checkpoints every 10 steps, parallelism dp1 pp1 tp2 with expert parallel 2, 1f1b engine and ALL_REDUCE tp mode, gpt2 tokenizer, fused AdamW (eps 1e-8, betas 0.9/0.95), zero stage 0, weight decay 0.01, clip 1.0, linear warmup 100 steps then cosine to 1e-5 from lr 3e-4, sequence length 16, 10 steps, micro batch 16, and one "train" data stage on HuggingFaceH4/testing_alpaca_small.
+    # Inputs: model_config, a ModelArgs.
+    # Outputs: Config.
+    # Exceptions: whatever Config validation raises.
+    # Side effects: None.
     return Config(
         model=model_config,
         general=GeneralArgs(project="unittest", run="sanity_qwen", seed=42),
@@ -120,7 +130,13 @@ def get_qwen_training_config(model_config: ModelArgs):
 def create_qwen_from_config(
     model_config: Qwen2Config, device: torch.device, parallel_context: ParallelContext
 ) -> Qwen2ForTraining:
-
+    # [FUNCTION DOC]
+    # Behavior: builds ParallelismArgs matching the parallel context sizes (all-forward-all-backward engine, ALL_REDUCE, synchronous tp), builds a Qwen2ForTraining with build_model in bfloat16 on device, marks tied parameters, and returns it.
+    # Inputs: model_config, Qwen2Config; device, torch device; parallel_context.
+    # Outputs: Qwen2ForTraining instance (weights not initialized by this function).
+    # Exceptions: None explicitly raised.
+    # Side effects: device allocation; collectives used while building/tying.
+    # KNOWN ISSUE: the docstring mentions a checkpoint_path argument and loading from it, but the function has no such parameter and never loads weights.
     """
     Creates and returns a nanotron model.
     If `model_config` is None, then `checkpoint_path` must be set, in which case

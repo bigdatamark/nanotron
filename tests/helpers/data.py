@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Purpose: test helpers for Nanoset dataset/dataloader tests: create dummy JSON datasets, tokenize them with tools/preprocess_data.py (datatrove), and assert that batches and datasets are consistent across ranks.
+# Main contents: dataset path/file creation, preprocessing wrapper, batch and Nanoset synchronization asserts, hashing helpers.
+# Import-time side effects: imports the nanotron package to locate the repo root and appends it to sys.path so that tools.preprocess_data can be imported.
 import hashlib
 import importlib
 import json
@@ -22,6 +26,13 @@ from tools.preprocess_data import main
 
 
 def create_dataset_paths(tmp_dir: str, quantity: int):
+    # [FUNCTION DOC]
+    # HELPER: builds file paths for dataset tests.
+    # Behavior: returns two parallel lists of length quantity: JSON file paths named pytest_i.json and tokenized output folder paths named tokenized_documents_i, all inside tmp_dir.
+    # Inputs: tmp_dir, directory string or path; quantity, number of datasets.
+    # Outputs: tuple of (list of JSON paths, list of tokenized folder paths).
+    # Exceptions: None explicitly raised.
+    # Side effects: None (nothing is created on disk).
     json_dataset_path = [os.path.join(tmp_dir, f"pytest_{i}.json") for i in range(quantity)]
     datatrove_tokenized_dataset_paths = [os.path.join(tmp_dir, f"tokenized_documents_{i}") for i in range(quantity)]
 
@@ -29,7 +40,13 @@ def create_dataset_paths(tmp_dir: str, quantity: int):
 
 
 def create_dummy_json_dataset(path_to_json: str, dummy_text: str, n_samples: int = 50000):
-
+    # [FUNCTION DOC]
+    # HELPER: writes a JSON-lines dummy dataset.
+    # Behavior: appends n_samples lines to the file, each a JSON object with a "text" field containing the sample index and dummy_text.
+    # Inputs: path_to_json, file path; dummy_text, string inserted into every sample; n_samples, default 50000.
+    # Outputs: None.
+    # Exceptions: OSError on file errors.
+    # Side effects: appends to the file (existing content is kept).
     with open(path_to_json, "a") as json_file:
         for sample in range(n_samples):
             sample_dict = {"text": f"[{sample}] Hello! Im sample {sample}! And this is my dummy text: {dummy_text}"}
@@ -38,6 +55,13 @@ def create_dummy_json_dataset(path_to_json: str, dummy_text: str, n_samples: int
 
 
 def preprocess_dummy_dataset(json_dataset_path: str, datatrove_tokenized_dataset_path: str, tokenizer: str):
+    # [FUNCTION DOC]
+    # HELPER: tokenizes a JSONL dataset via tools/preprocess_data.py.
+    # Behavior: builds an argparse Namespace with reader jsonl, the given input path, column "text", no glob, the given output folder and tokenizer, no extra eos token, one task and no logging dir, then calls the preprocess main.
+    # Inputs: json_dataset_path, input file; datatrove_tokenized_dataset_path, output folder; tokenizer, tokenizer name or path.
+    # Outputs: None.
+    # Exceptions: whatever the preprocessing pipeline raises.
+    # Side effects: downloads tokenizer if needed, writes tokenized files to disk.
     # Create args for preprocessing
     args = Namespace(
         readers="jsonl",
@@ -57,6 +81,13 @@ def preprocess_dummy_dataset(json_dataset_path: str, datatrove_tokenized_dataset
 def assert_batch_dataloader(
     batch: dict, parallel_context: ParallelContext, micro_batch_size: int, sequence_length: int
 ):
+    # [FUNCTION DOC]
+    # HELPER: validates one dataloader batch in a distributed run.
+    # Behavior: for each key in the batch: on pipeline rank 0 keys starting with "input_" must be tensors, on the last pipeline rank keys starting with "label_" must be tensors, everything else must be a TensorPointer. Real tensors must have shape micro_batch_size by sequence_length. A TensorPointer is replaced by a tensor of its group_rank (class 1); boolean masks are cast to int64 (class 2); otherwise class 0. Then asserts the (flattened) tensor is identical across the tensor parallel group and the class value is identical across the data parallel group.
+    # Inputs: batch, dictionary with keys input_ids, input_mask, label_ids, label_mask; parallel_context; micro_batch_size; sequence_length.
+    # Outputs: None.
+    # Exceptions: AssertionError on any failed check.
+    # Side effects: collectives on tp and dp groups; moves tensors to CUDA.
     """
     batch (dict): Batch produced from the Dataloader, with keys input_ids, input_mask, label_ids, label_mask
 
@@ -107,6 +138,13 @@ def assert_batch_dataloader(
 
 
 def compute_hash(identifier: OrderedDict, n_digit: int = 8) -> int:
+    # [FUNCTION DOC]
+    # HELPER: deterministic hashing of nested identifiers.
+    # Behavior: serializes the ordered dictionary to indented JSON, hashes with sha256, interprets the hex digest as an integer and keeps the last n_digit decimal digits.
+    # Inputs: identifier, ordered dictionary of JSON-serializable values; n_digit, default 8.
+    # Outputs: integer hash.
+    # Exceptions: TypeError if values are not JSON-serializable.
+    # Side effects: None.
     """
     Creates a sha256 hash from the elements of a OrderedDict
     """
@@ -117,6 +155,13 @@ def compute_hash(identifier: OrderedDict, n_digit: int = 8) -> int:
 
 
 def assert_nanoset_sync_across_all_ranks(nanoset: Nanoset, parallel_context: ParallelContext):
+    # [FUNCTION DOC]
+    # HELPER: checks the Nanoset is built identically on all ranks.
+    # Behavior: collects the dataset folders, weights, sequence length, number of train samples, seed, length, input_ids of sample 23, dataset index arrays and token size into an ordered dictionary, hashes it with compute_hash and asserts the hash tensor is equal across the world group.
+    # Inputs: nanoset, a Nanoset; parallel_context.
+    # Outputs: None.
+    # Exceptions: AssertionError if ranks differ; IndexError if the dataset has fewer than 24 samples.
+    # Side effects: collective on the world group; CUDA allocation.
     """
     Checks that the same Nanoset is created in all processes
     """
@@ -144,6 +189,14 @@ def assert_nanoset_sync_across_all_ranks(nanoset: Nanoset, parallel_context: Par
 
 
 def compute_batch_hash(batch: dict) -> int:
+    # [FUNCTION DOC]
+    # HELPER: fingerprint of a batch for resume tests.
+    # Behavior: for each key, uses the group_rank for a TensorPointer, the int64 list for a boolean tensor, or the plain list for other tensors, then hashes the ordered collection with compute_hash.
+    # Inputs: batch, dictionary from the dataloader.
+    # Outputs: integer hash.
+    # Exceptions: None explicitly raised.
+    # Side effects: None (copies tensors to Python lists).
+    # KNOWN ISSUE: docstring says it "checks" recovery state, but it only computes a hash; the comparison is done by the caller.
     """
     Checks that the Nanoset/BlendedNanoset is in the same state after recovering from a crash
 

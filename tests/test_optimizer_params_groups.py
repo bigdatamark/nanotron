@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Purpose: pytest tests verifying that NamedOptimizer and OptimizerFromGradientAccumulator honour per-group learning rates and weight decays (overriding builder defaults), with and without FP32 gradient accumulation in half precision, and with DDP.
+# Main contents: DummyModel (two bias-free linears with ReLU) and nine tests. Expected updates are SGD: weight minus lr times grad, and with weight decay (1 minus lr times decay) times weight minus lr times grad.
 import pytest
 import torch
 import torch.nn as nn
@@ -13,18 +16,41 @@ from nanotron.random import set_random_seed
 
 
 class DummyModel(nn.Module):
+    # [CLASS DOC]
+    # Purpose: tiny two-layer MLP, linear 10 to 20 then 20 to 2, both bias-free, ReLU after each.
+    # Key attributes: fc1, fc2.
+    # Construction inputs: dtype, default float32.
+    # Inheritance role: nn.Module.
     def __init__(self, dtype=torch.float32):
+        # [FUNCTION DOC]
+        # Behavior: creates both linears and casts them to dtype.
+        # Inputs: dtype, torch dtype.
+        # Outputs: None.
+        # Exceptions: None explicitly raised.
+        # Side effects: uses torch RNG for initialization.
         super(DummyModel, self).__init__()
         self.fc1 = nn.Linear(10, 20, bias=False).to(dtype=dtype)
         self.fc2 = nn.Linear(20, 2, bias=False).to(dtype=dtype)
 
     def forward(self, x):
+        # [FUNCTION DOC]
+        # Behavior: ReLU of fc1, then ReLU of fc2.
+        # Inputs: x, tensor batch by 10.
+        # Outputs: tensor batch by 2.
+        # Exceptions: None explicitly raised.
+        # Side effects: None.
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         return x
 
 
 def test_optimizer_lr_one_group():
+    # [FUNCTION DOC]
+    # Behavior: seeds RNG with 42, builds a float32 DummyModel on CUDA and a NamedOptimizer over SGD (dummy default lr overridden) with a single group with lr 0.1 containing all parameters. For 100 steps on a fixed random input and integer targets: zero grads, cross entropy loss, backward, compute the expected weights (weight minus lr times grad), step, and compare exactly-close with torch testing.
+    # Inputs: none.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: global RNG seeding; GPU allocation.
     set_random_seed(42)
 
     model = DummyModel().to("cuda")
@@ -72,6 +98,12 @@ def test_optimizer_lr_one_group():
 
 
 def test_optimizer_lr_multiple_group():
+    # [FUNCTION DOC]
+    # Behavior: seeds RNG with 42, builds a float32 DummyModel on CUDA and a NamedOptimizer over SGD (dummy default lr overridden) with two groups, fc1 with lr 0.1 and fc2 with lr 0.001. For 100 steps on a fixed random input and integer targets: zero grads, cross entropy loss, backward, compute the expected weights (weight minus the group lr times grad), step, and compare exactly-close with torch testing.
+    # Inputs: none.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: global RNG seeding; GPU allocation.
     set_random_seed(42)
 
     model = DummyModel().to("cuda")
@@ -118,6 +150,12 @@ def test_optimizer_lr_multiple_group():
 
 
 def test_optimizer_lr_weight_decay_one_group():
+    # [FUNCTION DOC]
+    # Behavior: seeds RNG with 42, builds a float32 DummyModel on CUDA and a NamedOptimizer over SGD (dummy default lr overridden) with a single group with lr 0.1 and weight decay 0.1. For 100 steps on a fixed random input and integer targets: zero grads, cross entropy loss, backward, compute the expected weights (decayed weight minus lr times grad), step, and compare exactly-close with torch testing.
+    # Inputs: none.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: global RNG seeding; GPU allocation.
     set_random_seed(42)
 
     model = DummyModel().to("cuda")
@@ -163,6 +201,12 @@ def test_optimizer_lr_weight_decay_one_group():
 
 
 def test_optimizer_lr_weight_decay_multiple_group():
+    # [FUNCTION DOC]
+    # Behavior: seeds RNG with 42, builds a float32 DummyModel on CUDA and a NamedOptimizer over SGD (dummy default lr overridden) with two groups, fc1 with lr 0.1 and decay 0.1, fc2 with lr 0.001 and decay 0.001. For 100 steps on a fixed random input and integer targets: zero grads, cross entropy loss, backward, compute the expected weights (per group decayed weight minus lr times grad), step, and compare exactly-close with torch testing.
+    # Inputs: none.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: global RNG seeding; GPU allocation.
     set_random_seed(42)
 
     model = DummyModel().to("cuda")
@@ -218,6 +262,13 @@ def test_optimizer_lr_weight_decay_multiple_group():
 @pytest.mark.parametrize("half_precision", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("accumulation_steps", [1, 10])
 def test_optimizer_grad_accumulation_lr_one_group(half_precision: torch.dtype, accumulation_steps: int):
+    # [FUNCTION DOC]
+    # Behavior: seeds RNG with 42, builds a DummyModel of dtype half_precision on CUDA, wraps both weights as NanotronParameters, and builds an OptimizerFromGradientAccumulator with an FP32GradientAccumulator and a NamedOptimizer over SGD (dummy defaults overridden by the groups). One group with lr 0.1. For 100 iterations on a fixed input: zero grads, forward, cross entropy on float32 logits, backward through the accumulator; every accumulation_steps iterations computes the expected weights from the FP32 gradient buffers cast to dtype (weight minus lr times grad), steps, and compares.
+    # Inputs: half_precision, float16 or bfloat16; accumulation_steps, 1 or 10.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: global RNG seeding; GPU allocation.
+    # KNOWN ISSUE: optimizer.zero_grad is called at every iteration, including those between optimizer steps, so with accumulation_steps 10 the gradients are not actually accumulated across micro batches; the test only checks the update from the last backward.
     set_random_seed(42)
     dtype = half_precision
     lr1 = 0.1
@@ -236,6 +287,13 @@ def test_optimizer_grad_accumulation_lr_one_group(half_precision: torch.dtype, a
 
     # Optimizer
     def optimizer_builder(inp_param_groups):
+        # [FUNCTION DOC]
+        # HELPER: builds the inner NamedOptimizer for OptimizerFromGradientAccumulator.
+        # Behavior: wraps the given parameter groups in a NamedOptimizer over SGD with huge dummy defaults for lr that the groups override.
+        # Inputs: inp_param_groups, list of named parameter group dictionaries.
+        # Outputs: NamedOptimizer.
+        # Exceptions: None explicitly raised.
+        # Side effects: None.
         return NamedOptimizer(
             named_params_or_groups=inp_param_groups,
             optimizer_builder=lambda param_groups: optim.SGD(
@@ -284,6 +342,13 @@ def test_optimizer_grad_accumulation_lr_one_group(half_precision: torch.dtype, a
 @pytest.mark.parametrize("half_precision", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("accumulation_steps", [1, 10])
 def test_optimizer_grad_accumulation_lr_multiple_group(half_precision: torch.dtype, accumulation_steps: int):
+    # [FUNCTION DOC]
+    # Behavior: seeds RNG with 42, builds a DummyModel of dtype half_precision on CUDA, wraps both weights as NanotronParameters, and builds an OptimizerFromGradientAccumulator with an FP32GradientAccumulator and a NamedOptimizer over SGD (dummy defaults overridden by the groups). Two groups: fc1 lr 0.1, fc2 lr 0.001. For 100 iterations on a fixed input: zero grads, forward, cross entropy on float32 logits, backward through the accumulator; every accumulation_steps iterations computes the expected weights from the FP32 gradient buffers cast to dtype (weight minus group lr times grad), steps, and compares.
+    # Inputs: half_precision, float16 or bfloat16; accumulation_steps, 1 or 10.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: global RNG seeding; GPU allocation.
+    # KNOWN ISSUE: optimizer.zero_grad is called at every iteration, including those between optimizer steps, so with accumulation_steps 10 the gradients are not actually accumulated across micro batches; the test only checks the update from the last backward.
     set_random_seed(42)
     dtype = half_precision
     lr1, lr2 = 0.1, 0.001
@@ -301,6 +366,13 @@ def test_optimizer_grad_accumulation_lr_multiple_group(half_precision: torch.dty
 
     # Optimizer
     def optimizer_builder(inp_param_groups):
+        # [FUNCTION DOC]
+        # HELPER: builds the inner NamedOptimizer for OptimizerFromGradientAccumulator.
+        # Behavior: wraps the given parameter groups in a NamedOptimizer over SGD with huge dummy defaults for lr that the groups override.
+        # Inputs: inp_param_groups, list of named parameter group dictionaries.
+        # Outputs: NamedOptimizer.
+        # Exceptions: None explicitly raised.
+        # Side effects: None.
         return NamedOptimizer(
             named_params_or_groups=inp_param_groups,
             optimizer_builder=lambda param_groups: optim.SGD(
@@ -349,6 +421,13 @@ def test_optimizer_grad_accumulation_lr_multiple_group(half_precision: torch.dty
 @pytest.mark.parametrize("half_precision", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("accumulation_steps", [1, 10])
 def test_optimizer_grad_accumulation_lr_weight_decay_one_group(half_precision: torch.dtype, accumulation_steps: int):
+    # [FUNCTION DOC]
+    # Behavior: seeds RNG with 42, builds a DummyModel of dtype half_precision on CUDA, wraps both weights as NanotronParameters, and builds an OptimizerFromGradientAccumulator with an FP32GradientAccumulator and a NamedOptimizer over SGD (dummy defaults overridden by the groups). One group with lr 0.1 and weight decay 0.1. For 100 iterations on a fixed input: zero grads, forward, cross entropy on float32 logits, backward through the accumulator; every accumulation_steps iterations computes the expected weights from the FP32 gradient buffers cast to dtype (decayed weight minus lr times grad), steps, and compares.
+    # Inputs: half_precision, float16 or bfloat16; accumulation_steps, 1 or 10.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: global RNG seeding; GPU allocation.
+    # KNOWN ISSUE: optimizer.zero_grad is called at every iteration, including those between optimizer steps, so with accumulation_steps 10 the gradients are not actually accumulated across micro batches; the test only checks the update from the last backward.
     set_random_seed(42)
     dtype = half_precision
     lr1 = 0.1
@@ -367,6 +446,13 @@ def test_optimizer_grad_accumulation_lr_weight_decay_one_group(half_precision: t
 
     # Optimizer
     def optimizer_builder(inp_param_groups):
+        # [FUNCTION DOC]
+        # HELPER: builds the inner NamedOptimizer for OptimizerFromGradientAccumulator.
+        # Behavior: wraps the given parameter groups in a NamedOptimizer over SGD with huge dummy defaults for lr and weight decay that the groups override.
+        # Inputs: inp_param_groups, list of named parameter group dictionaries.
+        # Outputs: NamedOptimizer.
+        # Exceptions: None explicitly raised.
+        # Side effects: None.
         return NamedOptimizer(
             named_params_or_groups=inp_param_groups,
             optimizer_builder=lambda param_groups: optim.SGD(
@@ -418,6 +504,13 @@ def test_optimizer_grad_accumulation_lr_weight_decay_one_group(half_precision: t
 def test_optimizer_grad_accumulation_lr_weight_decay_multiple_group(
     half_precision: torch.dtype, accumulation_steps: int
 ):
+    # [FUNCTION DOC]
+    # Behavior: seeds RNG with 42, builds a DummyModel of dtype half_precision on CUDA, wraps both weights as NanotronParameters, and builds an OptimizerFromGradientAccumulator with an FP32GradientAccumulator and a NamedOptimizer over SGD (dummy defaults overridden by the groups). Two groups: fc1 lr 0.1 decay 0.1, fc2 lr 0.001 decay 0.001. For 100 iterations on a fixed input: zero grads, forward, cross entropy on float32 logits, backward through the accumulator; every accumulation_steps iterations computes the expected weights from the FP32 gradient buffers cast to dtype (per group decayed weight minus lr times grad), steps, and compares.
+    # Inputs: half_precision, float16 or bfloat16; accumulation_steps, 1 or 10.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: global RNG seeding; GPU allocation.
+    # KNOWN ISSUE: optimizer.zero_grad is called at every iteration, including those between optimizer steps, so with accumulation_steps 10 the gradients are not actually accumulated across micro batches; the test only checks the update from the last backward.
     set_random_seed(42)
     dtype = half_precision
     lr1, lr2 = 0.1, 0.001
@@ -443,6 +536,13 @@ def test_optimizer_grad_accumulation_lr_weight_decay_multiple_group(
     ]
     # Optimizer
     def optimizer_builder(inp_param_groups):
+        # [FUNCTION DOC]
+        # HELPER: builds the inner NamedOptimizer for OptimizerFromGradientAccumulator.
+        # Behavior: wraps the given parameter groups in a NamedOptimizer over SGD with huge dummy defaults for lr and weight decay that the groups override.
+        # Inputs: inp_param_groups, list of named parameter group dictionaries.
+        # Outputs: NamedOptimizer.
+        # Exceptions: None explicitly raised.
+        # Side effects: None.
         return NamedOptimizer(
             named_params_or_groups=inp_param_groups,
             optimizer_builder=lambda param_groups: optim.SGD(
@@ -496,6 +596,12 @@ def test_optimizer_grad_accumulation_lr_weight_decay_multiple_group(
 def test_ddp_optimizer_grad_accumulation_lr_weight_decay_multiple_group(
     half_precision: torch.dtype, accumulation_steps: int
 ):
+    # [FUNCTION DOC]
+    # Behavior: spawns 2 data parallel ranks running the per-rank body (skipped with fewer than 2 GPUs).
+    # Inputs: half_precision; accumulation_steps.
+    # Outputs: None.
+    # Exceptions: propagates failures.
+    # Side effects: process spawning.
     init_distributed(tp=1, dp=2, pp=1)(_test_ddp_optimizer_grad_accumulation_lr_weight_decay_multiple_group)(
         half_precision=half_precision,
         accumulation_steps=accumulation_steps,
@@ -505,6 +611,14 @@ def test_ddp_optimizer_grad_accumulation_lr_weight_decay_multiple_group(
 def _test_ddp_optimizer_grad_accumulation_lr_weight_decay_multiple_group(
     parallel_context: ParallelContext, half_precision: torch.dtype, accumulation_steps: int
 ):
+    # [FUNCTION DOC]
+    # Behavior: like test_optimizer_grad_accumulation_lr_weight_decay_multiple_group but with lr 0.04/0.05 and decay 0.5/0.2, the model wrapped in DistributedDataParallel over dp and parameter names taken from the DDP wrapper (prefixed "module."); gradient buffers are looked up under the prefixed names.
+    # Inputs: parallel_context; half_precision; accumulation_steps.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: global RNG seeding; GPU allocation; DDP construction broadcasts parameters over dp.
+    # KNOWN ISSUE: optimizer.zero_grad is called at every iteration, including those between optimizer steps, so with accumulation_steps 10 the gradients are not actually accumulated across micro batches; the test only checks the update from the last backward.
+    # KNOWN ISSUE: the forward pass calls the unwrapped model instead of the DDP wrapper, so gradients are never all-reduced and DDP behaviour is not actually exercised; the parallel context is also never destroyed.
     set_random_seed(42)
     dtype = half_precision
     # Making it bigger so that the difference is more visible during update
@@ -535,6 +649,13 @@ def _test_ddp_optimizer_grad_accumulation_lr_weight_decay_multiple_group(
     ]
     # Optimizer
     def optimizer_builder(inp_param_groups):
+        # [FUNCTION DOC]
+        # HELPER: builds the inner NamedOptimizer for OptimizerFromGradientAccumulator.
+        # Behavior: wraps the given parameter groups in a NamedOptimizer over SGD with huge dummy defaults for lr and weight decay that the groups override.
+        # Inputs: inp_param_groups, list of named parameter group dictionaries.
+        # Outputs: NamedOptimizer.
+        # Exceptions: None explicitly raised.
+        # Side effects: None.
         return NamedOptimizer(
             named_params_or_groups=inp_param_groups,
             optimizer_builder=lambda param_groups: optim.SGD(

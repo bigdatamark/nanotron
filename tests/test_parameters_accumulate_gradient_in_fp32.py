@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Purpose: pytest tests for FP32 gradient accumulation of half precision NanotronParameters: promotion to FP32, accumulation precision, optimizer stepping, DDP integration via the FP32 accumulation communication hook, and tied-weight gradient sync with pipeline parallelism and ZeRO sharding.
+# Main contents: three single-GPU tests, two distributed driver tests and their per-rank bodies.
 import copy
 
 import nanotron.distributed as dist
@@ -35,6 +38,12 @@ from torch import nn
 
 @pytest.mark.parametrize("half_precision", [torch.float16, torch.bfloat16])
 def test_gradient_promoting_in_fp32(half_precision: torch.dtype):
+    # [FUNCTION DOC]
+    # Behavior: wraps a bias-free half precision linear(3,2) weight as a NanotronParameter, attaches an FP32GradientAccumulator, runs sanity_check, backpropagates a sum loss through the accumulator, and checks the FP32 master gradient is float32 while the half precision gradient is either None or zero.
+    # Inputs: half_precision, float16 or bfloat16.
+    # Outputs: None.
+    # Exceptions: AssertionError on failure.
+    # Side effects: GPU allocation.
     model = nn.Linear(3, 2, bias=False, dtype=half_precision, device="cuda")
 
     # Create Nanotron Parameter
@@ -59,6 +68,12 @@ def test_gradient_promoting_in_fp32(half_precision: torch.dtype):
 
 @pytest.mark.parametrize("half_precision", [torch.float16, torch.bfloat16])
 def test_gradient_accumulated_in_fp32(half_precision: torch.dtype):
+    # [FUNCTION DOC]
+    # Behavior: copies a linear's weight into a reference linear, accumulates two backward passes of large positive inputs through the FP32 accumulator and through plain autograd on the reference, and checks the FP32 gradient cast to half precision matches the reference gradient.
+    # Inputs: half_precision.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: GPU allocation.
     model = nn.Linear(3, 2, bias=False, dtype=half_precision, device="cuda")
     ref_model = nn.Linear(3, 2, bias=False, dtype=half_precision, device="cuda")
     with torch.inference_mode():
@@ -92,6 +107,12 @@ def test_gradient_accumulated_in_fp32(half_precision: torch.dtype):
 
 @pytest.mark.parametrize("half_precision", [torch.float16, torch.bfloat16])
 def test_optimizer_can_step_gradient_in_fp32(half_precision: torch.dtype):
+    # [FUNCTION DOC]
+    # Behavior: builds an OptimizerFromGradientAccumulator (FP32 accumulator plus NamedOptimizer over default AdamW) for a half precision linear; after one backward checks the FP32 gradient is float32 and the half one is None or zero; after step and zero_grad checks both gradients are None, the FP32 grad buffer is zeroed, and the weight changed.
+    # Inputs: half_precision.
+    # Outputs: None.
+    # Exceptions: AssertionError on failure.
+    # Side effects: GPU allocation.
     model = nn.Linear(3, 2, bias=False, dtype=half_precision, device="cuda")
     original_weight = model.weight.detach().clone()
 
@@ -143,6 +164,12 @@ def test_optimizer_can_step_gradient_in_fp32(half_precision: torch.dtype):
 @pytest.mark.parametrize("train_iterations", [1, 3])
 @rerun_if_address_is_in_use()
 def test_ddp_with_grad_accum_in_fp32(half_precision: torch.dtype, accumulation_steps: int, train_iterations: int):
+    # [FUNCTION DOC]
+    # Behavior: spawns 2 data parallel ranks running _test_ddp_with_grad_accum_in_fp32 (skipped with fewer than 2 GPUs).
+    # Inputs: half_precision; accumulation_steps, 1 or 10; train_iterations, 1 or 3.
+    # Outputs: None.
+    # Exceptions: propagates failures.
+    # Side effects: process spawning.
     init_distributed(tp=1, dp=2, pp=1)(_test_ddp_with_grad_accum_in_fp32)(
         half_precision=half_precision,
         accumulation_steps=accumulation_steps,
@@ -156,6 +183,12 @@ def _test_ddp_with_grad_accum_in_fp32(
     accumulation_steps: int,
     train_iterations: int,
 ):
+    # [FUNCTION DOC]
+    # Behavior: builds a 3-layer bias-free half precision MLP and a deep copy, wraps all weights as NanotronParameters, and wraps both in DDP over dp (the first only for matching names; its inner module is used directly as an unsynchronized reference). The copy gets an FP32GradientAccumulator and the FP32 accumulation hook (all-reduce averaging, no reduce-scatter) via FP32GradBucketManager. For each train iteration: for all but the last accumulation step, runs reference backward and accumulator backward under DDP and accumulator no_sync, accumulates reference gradients in float32 manually and checks that they equal the FP32 bucket, that the bucket equals the FP32 parameter gradient, and that both are not synchronized across dp (except on rank 0); zeroes reference grads. On the last step, adds the reference gradient and averages it across dp manually, runs the synced accumulator backward, then checks half gradients are None, buckets match the reference, the FP32 gradient shares memory with its bucket, and both are synchronized across dp. Finally zeroes everything and checks all buckets and buffers are zero. Destroys the context.
+    # Inputs: parallel_context; half_precision; accumulation_steps; train_iterations.
+    # Outputs: None.
+    # Exceptions: AssertionError on failure.
+    # Side effects: dp collectives and barriers; GPU allocation; process group destruction.
     hidden_size = 32
     n_layers = 3
     model = nn.Sequential(
@@ -310,6 +343,12 @@ def _test_ddp_with_grad_accum_in_fp32(
 @pytest.mark.parametrize("reduce_scatter", [True, False])
 @rerun_if_address_is_in_use()
 def test_tied_weights_sync_with_grad_accum_in_fp32(pipeline_engine: PipelineEngine, reduce_scatter: bool):
+    # [FUNCTION DOC]
+    # Behavior: spawns 4 ranks (dp 2, pp 2) running _test_tied_weights_sync_with_grad_accum_in_fp32 for both pipeline engines (skipped with fewer than 4 GPUs).
+    # Inputs: pipeline_engine, AllForwardAllBackward or OneForwardOneBackward engine instance; reduce_scatter, boolean.
+    # Outputs: None.
+    # Exceptions: propagates failures.
+    # Side effects: process spawning.
     init_distributed(tp=1, dp=2, pp=2)(_test_tied_weights_sync_with_grad_accum_in_fp32)(
         pipeline_engine=pipeline_engine, reduce_scatter=reduce_scatter
     )
@@ -318,6 +357,13 @@ def test_tied_weights_sync_with_grad_accum_in_fp32(pipeline_engine: PipelineEngi
 def _test_tied_weights_sync_with_grad_accum_in_fp32(
     parallel_context: ParallelContext, pipeline_engine: PipelineEngine, reduce_scatter: bool
 ):
+    # [FUNCTION DOC]
+    # Behavior: builds a float16 DummyModel and a reference DummyModel with layer i on pipeline rank i; in both, ties all linear weights across pipeline ranks (same dp/tp/ep coordinates, SUM reduction), wraps biases as NanotronParameters and runs initial_sync; copies reference parameters into the model. Wraps the model in DDP, computes full names (tied names resolved through module prefixes), and builds a ZeroDistributedOptimizer wrapping an OptimizerFromGradientAccumulator (FP32 accumulator with grad buckets over all named parameters) wrapping a NamedOptimizer over AdamW, only to obtain the accumulator; assigns dp shard offsets to the accumulator and registers the FP32 accumulation hook (reduce_scatter as given, average). With 2 micro batches: the reference runs one micro batch at a time through the pipeline engine without accumulator, accumulating float32 gradients manually and averaging across dp at the end. The DDP model trains both micro batches with the accumulator. Checks every parameter is in the accumulator, buckets are dp-synchronized when not reduce-scattering, and buckets (or the local shard slice) equal the reference divided by the micro batch count. Checks tied gradients are not yet synchronized across their tie group (except rank 0), runs sync_tied_weights_gradients under a 500 ms timeout, then for each tied parameter checks the SUM reduce op, that the FP32 parameter gradient aliases its dp slice of the buffer, and that the buffer (or slice) is synchronized across the tie group, all-reducing the reference accordingly. Finally compares all FP32 buffers with the reference. Destroys the context.
+    # Inputs: parallel_context; pipeline_engine; reduce_scatter.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch; TimeoutError if tied sync hangs.
+    # Side effects: P2P, dp, tie group collectives and barriers; SIGALRM handler installation; process group destruction.
+    # KNOWN ISSUE: a comment in the tied-sync check says reduce_scatter is False inside the branch that runs when it is True, and another comment says model_ddp.module is used to get names although the accumulator comes from the optimizer; the comments disagree with the code.
     # We init two replicas of 2 denses. Each dense is on a device.
     dtype = torch.float16
     device = torch.device("cuda")
@@ -441,6 +487,13 @@ def _test_tied_weights_sync_with_grad_accum_in_fp32(
 
     ## Reference model iteration step
     def forward_backward_reference(mdl, micro_batch):
+        # [FUNCTION DOC]
+        # HELPER: runs one reference micro batch.
+        # Behavior: calls the pipeline engine's train_batch_iter on mdl with a single micro batch and no gradient accumulator.
+        # Inputs: mdl, the model; micro_batch, dictionary of inputs.
+        # Outputs: None.
+        # Exceptions: propagates engine errors.
+        # Side effects: forward/backward with pipeline P2P communication; populates parameter gradients.
         pipeline_engine.train_batch_iter(
             mdl, pg=parallel_context.pp_pg, batch=[micro_batch], nb_microbatches=1, grad_accumulator=None
         )

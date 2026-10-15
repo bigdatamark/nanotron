@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Purpose: distributed pytest tests for nanotron.optim.clip_grads clip_grad_norm, comparing against torch clip_grad_norm_ on an unsharded reference, under pipeline parallelism, tensor parallelism, tied weights, and an FP32 gradient accumulator.
+# Main contents: four driver tests (each spawns ranks via init_distributed) and their per-rank bodies. Norm types tested: infinity, 1 and 2, with max norm 1.0.
 import math
 import os
 
@@ -34,10 +37,24 @@ from torch import nn
 @pytest.mark.parametrize("norm_type", [math.inf, 1.0, 2.0])
 @rerun_if_address_is_in_use()
 def test_clip_grads_with_pp(norm_type: float):
+    # [FUNCTION DOC]
+    # Behavior: runs _test_clip_grads_with_pp on 2 pipeline ranks (skipped with fewer than 2 GPUs).
+    # Inputs: norm_type, parametrized float.
+    # Outputs: None.
+    # Exceptions: propagates failures from spawned ranks.
+    # Side effects: process spawning.
     init_distributed(tp=1, dp=1, pp=2)(_test_clip_grads_with_pp)(norm_type=norm_type)
 
 
 def _test_clip_grads_with_pp(parallel_context: ParallelContext, norm_type: float):
+    # [FUNCTION DOC]
+    # Behavior: builds a DummyModel whose layer i lives on pipeline rank i (loss on the last rank) and, on pipeline rank 0 only, a full reference DummyModel built entirely on rank 0. Linear weights and biases are wrapped as NanotronParameters. Rank 0 receives each other rank's linear weight and bias via P2P to copy into the reference; other ranks send theirs. Five micro batches from dummy_infinite_data_loader are trained with AllForwardAllBackwardPipelineEngine (no accumulator); the reference runs the same micro batches with loss divided by 5. Gradients are gathered to rank 0 and compared (atol 1e-6, rtol 1e-7). Then clip_grad_norm over the model-parallel group is applied, rank 0 compares the total norm with torch clip_grad_norm_ on the reference, every rank checks its gradients changed, and gradients are compared again after clipping. Prints the parallel context attribute list and destroys the context.
+    # Inputs: parallel_context; norm_type.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: P2P sends/receives, collectives inside clip_grad_norm, stdout print, process group destruction.
+    # KNOWN ISSUE: the second "grad changed" check compares old_bias_grad with the weight gradient instead of the bias gradient (wrong variable), so the bias check is meaningless.
+    # KNOWN ISSUE: a leftover debug print of the parallel context's attribute list.
     device = torch.device("cuda")
     p2p = P2P(parallel_context.pp_pg, device=device)
     reference_rank = 0
@@ -203,6 +220,12 @@ def _test_clip_grads_with_pp(parallel_context: ParallelContext, norm_type: float
 @pytest.mark.parametrize("norm_type", [math.inf, 1.0, 2.0])
 @rerun_if_address_is_in_use()
 def test_clip_grads_with_tp(tp_mode: TensorParallelLinearMode, async_communication: bool, norm_type: float):
+    # [FUNCTION DOC]
+    # Behavior: runs _test_clip_grads_with_tp on 2 tensor parallel ranks for ALL_REDUCE (sync) and REDUCE_SCATTER (async) modes.
+    # Inputs: tp_mode; async_communication; norm_type.
+    # Outputs: None.
+    # Exceptions: propagates failures.
+    # Side effects: process spawning.
     init_distributed(tp=2, dp=1, pp=1)(_test_clip_grads_with_tp)(
         tp_mode=tp_mode, async_communication=async_communication, norm_type=norm_type
     )
@@ -211,6 +234,13 @@ def test_clip_grads_with_tp(tp_mode: TensorParallelLinearMode, async_communicati
 def _test_clip_grads_with_tp(
     parallel_context: ParallelContext, tp_mode: TensorParallelLinearMode, async_communication: bool, norm_type: float
 ):
+    # [FUNCTION DOC]
+    # Behavior: if async, sets CUDA_DEVICE_MAX_CONNECTIONS to 1. Builds a TensorParallelColumnLinear (4 inputs, 8 outputs per rank) and an unsharded reference nn.Linear, filling the reference by all-gathering weight and bias shards. Builds an input: in ALL_REDUCE mode a batch of 5 averaged across tp so all ranks share it; in REDUCE_SCATTER mode each rank has its own 5 rows and the reference input is their all-gather. Compares the sharded output to the matching column slice of the reference output, then the weight and bias gradient slices after sum-backward. Applies clip_grad_norm and torch clip_grad_norm_, checks the weight gradient changed, the clipped gradient slices match, and the total norms match. Destroys the context.
+    # Inputs: parallel_context; tp_mode; async_communication; norm_type.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: environment variable write; tp collectives; process group destruction.
+    # KNOWN ISSUE: the fallback branch for an unsupported mode constructs a ValueError without raising it.
     if async_communication:
         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
     in_features = 4
@@ -345,10 +375,22 @@ def _test_clip_grads_with_tp(
 @pytest.mark.parametrize("norm_type", [math.inf, 1.0, 2.0])
 @rerun_if_address_is_in_use()
 def test_clip_grads_tied_weights(norm_type: float):
+    # [FUNCTION DOC]
+    # Behavior: runs _test_clip_grads_tied_weights on 2 pipeline ranks.
+    # Inputs: norm_type.
+    # Outputs: None.
+    # Exceptions: propagates failures.
+    # Side effects: process spawning.
     init_distributed(tp=1, dp=1, pp=2)(_test_clip_grads_tied_weights)(norm_type=norm_type)
 
 
 def _test_clip_grads_tied_weights(parallel_context: ParallelContext, norm_type: float):
+    # [FUNCTION DOC]
+    # Behavior: pipeline rank 0 owns dense0 and rank 1 owns dense1 (linear 10 to 10 on CUDA); their weights and biases are tied across ranks 0 and 1 with SUM reduction. Asserts the parameters are tied NanotronParameters, runs initial_sync and checks they are synchronized over the (0,1) group. Each rank runs its linear on its own random input, backpropagates, syncs tied gradients and checks gradients are synchronized. Saves clones of the parameters with gradients as reference, applies clip_grad_norm and torch clip_grad_norm_ on the reference pair, checks the weight gradient changed and that gradients and total norm match (norm exactly). Destroys the context.
+    # Inputs: parallel_context; norm_type.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: collectives; process group destruction.
     if dist.get_rank(parallel_context.pp_pg) == 0:
         model = nn.ModuleDict({"dense0": nn.Linear(10, 10, device="cuda")})
     else:
@@ -438,6 +480,12 @@ def _test_clip_grads_tied_weights(parallel_context: ParallelContext, norm_type: 
 @pytest.mark.parametrize("norm_type", [math.inf, 1.0, 2.0])
 @rerun_if_address_is_in_use()
 def test_clip_grads_fp32_accumulator(norm_type: float, half_precision: torch.dtype):
+    # [FUNCTION DOC]
+    # Behavior: runs _test_clip_grads_fp32_accumulator on 2 pipeline ranks.
+    # Inputs: norm_type; half_precision, float16 or bfloat16.
+    # Outputs: None.
+    # Exceptions: propagates failures.
+    # Side effects: process spawning.
     init_distributed(tp=1, dp=1, pp=2)(_test_clip_grads_fp32_accumulator)(
         norm_type=norm_type, half_precision=half_precision
     )
@@ -446,6 +494,12 @@ def test_clip_grads_fp32_accumulator(norm_type: float, half_precision: torch.dty
 def _test_clip_grads_fp32_accumulator(
     parallel_context: ParallelContext, norm_type: float, half_precision: torch.dtype
 ):
+    # [FUNCTION DOC]
+    # Behavior: like _test_clip_grads_with_pp but the pipeline model is cast to half_precision while the reference on rank 0 stays float32. Weights are copied to the reference via P2P; an FP32GradientAccumulator is attached and sanity_check validates the model. Five half precision micro batches are trained with the pipeline engine using the accumulator. Instead of running autograd on the reference, the FP32 gradient buffers (local or received via P2P) are copied into the reference gradients. Clips with clip_grad_norm (given the accumulator) and torch clip_grad_norm_; checks every FP32 buffer changed, and on rank 0 checks total norm and all gradients match the reference (atol 1e-6, rtol 1e-7), receiving remote buffers via P2P. Destroys the context.
+    # Inputs: parallel_context; norm_type; half_precision, torch dtype.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: P2P and collectives; process group destruction.
     device = torch.device("cuda")
     p2p = P2P(parallel_context.pp_pg, device=device)
     reference_rank = 0

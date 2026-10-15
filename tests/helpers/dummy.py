@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Purpose: test helpers building a tiny pipeline-parallel model, its optimizer and an infinite random data loader, used by pipeline/DP/clip-grad tests.
+# Main contents: DummyModel, init_dummy_model, init_dummy_optimizer, dummy_infinite_data_loader.
 from math import ceil
 from typing import Union
 
@@ -18,10 +21,21 @@ from torch.nn.parallel import DistributedDataParallel
 
 
 class DummyModel(nn.Module):
+    # [CLASS DOC]
+    # Purpose: toy pipeline model with one linear(10 to 10) plus activation block per pipeline rank, followed by a sum loss block.
+    # Key attributes: p2p, the P2P communicator; mlp, a Sequential of ModuleDicts each holding "linear" and "activation" PipelineBlocks (Sigmoid except Identity on the last stage); loss, a PipelineBlock summing its input.
+    # Construction inputs: p2p, P2P object over the pipeline group (its group size sets the number of layers).
+    # Inheritance role: torch nn.Module. PipelineBlocks are not built until build_and_set_rank is called (see init_dummy_model).
     def __init__(
         self,
         p2p: P2P,
     ):
+        # [FUNCTION DOC]
+        # Behavior: creates p2p.pg.size() ModuleDicts of linear and activation PipelineBlocks (input key "input", output key "output") and the loss PipelineBlock (input key "x").
+        # Inputs: p2p, P2P.
+        # Outputs: None.
+        # Exceptions: None explicitly raised.
+        # Side effects: sets attributes on self.
         super().__init__()
         self.p2p = p2p
         self.mlp = nn.Sequential(
@@ -57,6 +71,12 @@ class DummyModel(nn.Module):
         )
 
     def forward(self, x: Union[torch.Tensor, TensorPointer]):
+        # [FUNCTION DOC]
+        # Behavior: passes x through each layer's linear then activation block (taking the "output" entry each time), then through the loss block; values can be TensorPointers on ranks not owning a block.
+        # Inputs: x, tensor of shape batch by 10, or a TensorPointer.
+        # Outputs: the loss output (scalar tensor on the owning rank, TensorPointer elsewhere).
+        # Exceptions: None explicitly raised.
+        # Side effects: point-to-point pipeline communication through the blocks.
         for non_linear in self.mlp:
             x = non_linear.linear(input=x)["output"]
             x = non_linear.activation(input=x)["output"]
@@ -65,6 +85,12 @@ class DummyModel(nn.Module):
 
 
 def init_dummy_model(parallel_context: ParallelContext, dtype: torch.dtype = torch.float) -> DummyModel:
+    # [FUNCTION DOC]
+    # Behavior: creates a P2P on the pipeline group with CUDA device and a DummyModel; assigns PipelineBlocks to pipeline ranks in contiguous chunks of size ceil(number of blocks / pp size) and builds them on CUDA with the given dtype; ties every non-sharded parameter across the tensor parallel group with SUM reduction; runs initial_sync; wraps the model in DistributedDataParallel over the dp group if the local rank has any parameters.
+    # Inputs: parallel_context; dtype, default torch float.
+    # Outputs: the DummyModel, possibly wrapped in DistributedDataParallel.
+    # Exceptions: None explicitly raised.
+    # Side effects: CUDA allocation; collectives during tying, initial sync and DDP construction.
     p2p = P2P(pg=parallel_context.pp_pg, device=torch.device("cuda"))
     model = DummyModel(p2p=p2p)
 
@@ -103,6 +129,12 @@ def init_dummy_model(parallel_context: ParallelContext, dtype: torch.dtype = tor
 
 
 def init_dummy_optimizer(model: nn.Module, parallel_context: ParallelContext) -> BaseOptimizer:
+    # [FUNCTION DOC]
+    # Behavior: builds a NamedOptimizer over the model's named parameters using default AdamW.
+    # Inputs: model, nn.Module; parallel_context (unused).
+    # Outputs: the NamedOptimizer.
+    # Exceptions: None explicitly raised.
+    # Side effects: None.
     optimizer = NamedOptimizer(
         named_params_or_groups=model.named_parameters(), optimizer_builder=lambda params: torch.optim.AdamW(params)
     )
@@ -113,6 +145,12 @@ def init_dummy_optimizer(model: nn.Module, parallel_context: ParallelContext) ->
 
 
 def dummy_infinite_data_loader(pp_pg: dist.ProcessGroup, dtype=torch.float, input_pp_rank=0):
+    # [FUNCTION DOC]
+    # Behavior: infinite generator yielding dictionaries with key "x": a random tensor of shape 3 by 10 on CUDA on the input pipeline rank, otherwise a TensorPointer pointing at input_pp_rank.
+    # Inputs: pp_pg, pipeline process group; dtype, default float; input_pp_rank, default 0.
+    # Outputs: generator of dictionaries.
+    # Exceptions: None explicitly raised.
+    # Side effects: consumes the torch CUDA RNG; GPU allocation.
     micro_batch_size = 3
     # We assume the first linear is always built on the first rank.
     current_pp_rank = dist.get_rank(pp_pg)

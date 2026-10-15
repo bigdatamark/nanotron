@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Purpose: pytest tests for NanotronParameter metadata isolation and DTypeInvariantTensor (a tensor whose dtype cannot be changed but device can).
+# Main contents: three test functions.
 import torch
 from helpers.exception import assert_fail_with
 from nanotron.models.base import DTypeInvariantTensor, init_on_device_and_dtype
@@ -6,11 +9,23 @@ from torch import nn
 
 
 def test_nanotron_parameter_does_not_override_some_parameter_variable():
+    # [FUNCTION DOC]
+    # Behavior: checks a plain nn.Parameter does not carry the NanotronParameter metadata attribute (no global monkey patching).
+    # Inputs: none.
+    # Outputs: None.
+    # Exceptions: AssertionError on failure.
+    # Side effects: None.
     param = nn.Parameter(torch.empty(3))
     assert not hasattr(param, NanotronParameter.NANOTRON_PARAMETER_METADATA_ATTRIBUTE_NAME)
 
 
 def test_uncastable_tensor():
+    # [FUNCTION DOC]
+    # Behavior: wraps a random 3x3 tensor as DTypeInvariantTensor; checks float(), half() and to(dtype) in positional and keyword form raise RuntimeError with specific messages; checks in-place value writes work and moving to CUDA works.
+    # Inputs: none.
+    # Outputs: None.
+    # Exceptions: AssertionError on failure.
+    # Side effects: GPU allocation.
     # Test that we can create an DTypeInvariantTensor
     x = DTypeInvariantTensor(torch.randn(3, 3))
     assert isinstance(x, torch.Tensor)
@@ -39,6 +54,12 @@ def test_uncastable_tensor():
 
 
 def test_register_buffer_does_not_update_uncastable_tensor():
+    # [FUNCTION DOC]
+    # Behavior: inside init_on_device_and_dtype targeting CPU and bfloat16, registers a float32 CUDA DTypeInvariantTensor as a buffer; checks the buffer is writable, moved to CPU, and still float32.
+    # Inputs: none.
+    # Outputs: None.
+    # Exceptions: AssertionError on failure.
+    # Side effects: GPU allocation.
     old_device = torch.device("cuda")
     old_dtype = torch.float32
     new_device = torch.device("cpu")

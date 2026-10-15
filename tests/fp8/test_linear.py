@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Purpose: pytest tests for nanotron.fp8 FP8Linear: forward accuracy against nn.Linear, backward gradients, parameter attributes, and a small multi-layer training loop.
+# Main contents: four test functions; requires CUDA (one test also parametrizes CPU).
 import pytest
 import torch
 from nanotron.fp8 import DTypes, FP8Linear, FP8Parameter, FP8Tensor
@@ -7,6 +10,12 @@ from torch.optim import Adam
 
 @pytest.mark.parametrize("is_bias", [True, False])
 def test_fp8_linear_forward_pass(is_bias):
+    # [FUNCTION DOC]
+    # Behavior: builds a 16x16 nn.Linear reference and an FP8Linear whose weight is an FP8Parameter (FP8E4M3) copied from the reference (bias copied if used), runs both on the same random input and checks the FP8 output is a float32 tensor within absolute tolerance 0.1 of the reference.
+    # Inputs: is_bias, parametrized boolean, whether the layers use a bias.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: GPU allocation.
     input = torch.randn(16, 16, device="cuda", dtype=torch.float32)
     ref_input = input.detach().clone()
     ref_linear = nn.Linear(16, 16, bias=is_bias, device="cuda", dtype=torch.float32)
@@ -29,6 +38,12 @@ def test_fp8_linear_forward_pass(is_bias):
 @pytest.mark.parametrize("input_requires_grad", [True, False])
 @pytest.mark.parametrize("device", ["cuda:0", "cpu"])
 def test_fp8_linear_backward_pass(input_requires_grad, device):
+    # [FUNCTION DOC]
+    # Behavior: copies reference weights into an FP8Linear (plain tensor on CPU, FP8Tensor on CUDA), runs sum-backward on both and compares weight gradients (tolerance 0.1) and bias gradients (atol 0.1). Input gradient comparison is commented out.
+    # Inputs: input_requires_grad, parametrized boolean; device, parametrized "cuda:0" or "cpu".
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: device allocation.
     input = torch.randn(16, 16, device=device, dtype=torch.float32, requires_grad=input_requires_grad)
     ref_input = input.detach().clone().requires_grad_(True)
     ref_linear = nn.Linear(16, 16, device=device, dtype=torch.float32)
@@ -53,6 +68,12 @@ def test_fp8_linear_backward_pass(input_requires_grad, device):
 
 
 def test_fp8_linear_attrs():
+    # [FUNCTION DOC]
+    # Behavior: checks an FP8Linear on cuda has at least one parameter and that all parameters require grad.
+    # Inputs: none.
+    # Outputs: None.
+    # Exceptions: AssertionError on failure; StopIteration if no parameters.
+    # Side effects: GPU allocation.
     fp8_linear = FP8Linear(16, 16, device="cuda:0")
 
     assert next(fp8_linear.parameters()) is not None
@@ -64,6 +85,12 @@ def test_fp8_linear_attrs():
 
 
 def test_fp8_model_bwd():
+    # [FUNCTION DOC]
+    # Behavior: builds a 5-layer sequential of FP8Linear(128,128)+ReLU, trains 3 Adam steps (lr 1e-3) on a fixed random input with sum loss, then checks every parameter received a gradient.
+    # Inputs: none.
+    # Outputs: None.
+    # Exceptions: AssertionError on failure.
+    # Side effects: GPU allocation and compute.
     HIDEEN_SIZE = 128
     N_LAYERS = 5
     N_EPOCHS = 3

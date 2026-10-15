@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Purpose: distributed pytest tests for Nanoset and build_nanoset_dataloader: correctness of sampling and blending across 3D parallel layouts, and deterministic resumption after skipping batches.
+# Main contents: test_build_nanoset_dataloader and test_recover_nanoset_dataloader (driver tests that prepare tokenized datasets and spawn ranks) and their per-rank bodies.
+# Import-time side effects: appends the tests directory to sys.path so the helpers package can be imported.
 import sys
 from math import isclose
 from pathlib import Path
@@ -41,6 +45,12 @@ from transformers import AutoTokenizer
 def test_build_nanoset_dataloader(
     tp: int, dp: int, pp: int, train_steps: int, sequence_length: int, tokenizer_name_or_path: str
 ):
+    # [FUNCTION DOC]
+    # Behavior: creates a TestContext temporary directory, writes two dummy JSONL datasets (50000 and 100000 samples), tokenizes each with the given tokenizer, then runs _test_build_nanoset_dataloader on tp*dp*pp processes.
+    # Inputs: tp, dp, pp, parametrized over all layouts of up to 4 GPUs; train_steps (500 or 10000); sequence_length (512 or 8192); tokenizer_name_or_path (gpt2 or a llama-3 tokenizer).
+    # Outputs: None.
+    # Exceptions: AssertionError or spawn errors on failure.
+    # Side effects: disk writes, tokenizer downloads, process spawning; retried on address-in-use errors.
     test_context = TestContext()
 
     # Create dataset folders
@@ -71,6 +81,12 @@ def _test_build_nanoset_dataloader(
     sequence_length: int,
     tokenizer_name_or_path: str,
 ):
+    # [FUNCTION DOC]
+    # Behavior: per-rank body. Global batch size is 4 micro batch times 8 micro batches times dp size. Token size is 4 bytes if the tokenizer vocabulary exceeds the uint16 range else 2. For three configs (single dataset weight 1, two datasets with default weights, two datasets weighted 8 and 2) it builds the Nanoset with world rank 0 first, asserts the Nanoset is identical on all ranks, asserts for each dataset that sampled indexes stay below its length and that the realized blend proportion is within 0.05 of the requested weight, then builds a dataloader (micro batch 4, no workers, drop last) and validates the first batch with assert_batch_dataloader. Finally destroys the parallel context.
+    # Inputs: parallel_context; datatrove_tokenized_dataset_folders, list of paths; train_steps; sequence_length; tokenizer_name_or_path.
+    # Outputs: None.
+    # Exceptions: AssertionError on failed checks.
+    # Side effects: collectives, tokenizer loading, destroys process groups.
     SEED = 1234
     MICRO_BATCH_SIZE = 4
     N_MICRO_BATCHES_PER_BATCH = 8
@@ -167,6 +183,12 @@ def _test_build_nanoset_dataloader(
 @pytest.mark.parametrize("tokenizer_name_or_path", ["openai-community/gpt2", "unsloth/llama-3-8b-bnb-4bit"])
 @rerun_if_address_is_in_use()
 def test_recover_nanoset_dataloader(tp: int, dp: int, pp: int, skipped_batches: int, tokenizer_name_or_path: str):
+    # [FUNCTION DOC]
+    # Behavior: same dataset preparation as test_build_nanoset_dataloader, then runs _test_recover_nanoset_dataloader on tp*dp*pp processes.
+    # Inputs: tp, dp, pp layouts; skipped_batches (20 or 5555); tokenizer_name_or_path.
+    # Outputs: None.
+    # Exceptions: AssertionError or spawn errors.
+    # Side effects: disk writes, downloads, process spawning.
     test_context = TestContext()
 
     # Create dataset folders
@@ -195,6 +217,12 @@ def _test_recover_nanoset_dataloader(
     skipped_batches: int,
     tokenizer_name_or_path: str,
 ):
+    # [FUNCTION DOC]
+    # Behavior: per-rank body with sequence length 1024 and 10000 train steps. For the same three configs it builds the Nanoset, iterates an initial dataloader skipped_batches plus one times keeping the last batch, builds a second dataloader with consumed_train_samples equal to skipped_batches times micro batch times dp size, and asserts its first batch hashes equal to the kept batch. Destroys the parallel context at the end.
+    # Inputs: parallel_context; datatrove_tokenized_dataset_folders; skipped_batches; tokenizer_name_or_path.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: collectives, destroys process groups.
     SEED = 1234
     MICRO_BATCH_SIZE = 4
     N_MICRO_BATCHES_PER_BATCH = 8

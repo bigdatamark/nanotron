@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Purpose: pytest test comparing nanotron TritonLayerNorm against torch LayerNorm in float16 on CUDA (marked fa2).
+# Main contents: test_fused_layer_norm.
 import pytest
 import torch
 from torch.nn import LayerNorm
@@ -11,6 +14,12 @@ from nanotron.nn.layer_norm import TritonLayerNorm
     [1024, 1025],  # fused layer norm supports 1024 as hidden size but not 1025
 )
 def test_fused_layer_norm(hidden_size):
+    # [FUNCTION DOC]
+    # Behavior: builds a random input of shape 5 by 128 by hidden_size, runs both layer norms, compares outputs (rtol 1e-3, atol 1e-2, matching flash-attention's own tolerance), then backpropagates sums and compares weight and bias gradients with the same tolerances.
+    # Inputs: hidden_size, parametrized 1024 or 1025.
+    # Outputs: None.
+    # Exceptions: AssertionError on mismatch.
+    # Side effects: GPU allocation.
     BATCH_SIZE = 5
     SEQ_LEN = 128
     DEVICE, DTYPE = torch.device("cuda:0"), torch.float16

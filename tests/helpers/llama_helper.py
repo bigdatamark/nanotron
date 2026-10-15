@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Purpose: test helpers for building a tiny Llama model and a matching training Config.
+# Main contents: TINY_LLAMA_CONFIG (128 hidden, 4 layers, 4 heads, 2 KV heads, vocab 4096, untied embeddings); get_llama_training_config; create_llama_from_config.
+# Import-time side effects: constructs the LlamaConfig constant.
 import torch
 from nanotron.config import (
     AdamWOptimizerArgs,
@@ -48,6 +52,12 @@ TINY_LLAMA_CONFIG = LlamaConfig(
 
 
 def get_llama_training_config(model_config: ModelArgs):
+    # [FUNCTION DOC]
+    # Behavior: returns a full nanotron Config for unit tests: project "unittest", seed 42, checkpoints in ./checkpoints every 10 steps, parallelism dp1 pp1 tp2 with expert parallel 2, 1f1b engine and ALL_REDUCE tp mode, gpt2 tokenizer, fused AdamW (eps 1e-8, betas 0.9/0.95), zero stage 0, weight decay 0.01, clip 1.0, linear warmup 100 steps then cosine to 1e-5 from lr 3e-4, sequence length 16, 10 steps, micro batch 16, and one "train" data stage on HuggingFaceH4/testing_alpaca_small.
+    # Inputs: model_config, a ModelArgs.
+    # Outputs: Config.
+    # Exceptions: whatever Config validation raises.
+    # Side effects: None.
     return Config(
         model=model_config,
         general=GeneralArgs(project="unittest", run="sanity_llama", seed=42),
@@ -108,7 +118,13 @@ def get_llama_training_config(model_config: ModelArgs):
 def create_llama_from_config(
     model_config: LlamaConfig, device: torch.device, parallel_context: ParallelContext
 ) -> LlamaForTraining:
-
+    # [FUNCTION DOC]
+    # Behavior: builds ParallelismArgs matching the parallel context sizes (all-forward-all-backward engine, ALL_REDUCE, synchronous tp), builds a LlamaForTraining with build_model in bfloat16 on device, marks tied parameters, and returns it.
+    # Inputs: model_config, LlamaConfig; device, torch device; parallel_context.
+    # Outputs: LlamaForTraining instance (weights not initialized by this function).
+    # Exceptions: None explicitly raised.
+    # Side effects: device allocation; collectives used while building/tying.
+    # KNOWN ISSUE: the docstring mentions a checkpoint_path argument and loading from it, but the function has no such parameter and never loads weights.
     """
     Creates and returns a nanotron model.
     If `model_config` is None, then `checkpoint_path` must be set, in which case

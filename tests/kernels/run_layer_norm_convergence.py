@@ -1,3 +1,7 @@
+# [MODULE DOC]
+# Purpose: manual script (not a pytest test) comparing the convergence of torch LayerNorm and nanotron TritonLayerNorm over 10000 Adam steps on a fixed CUDA input, printing and logging both losses via LoggerWriter.
+# Main contents: get_time_name and a main block containing the training loop and a local loss_function.
+# Import-time side effects: None beyond imports; the training runs only as a script.
 import torch
 from nanotron.logging import LoggerWriter
 from nanotron.nn.layer_norm import TritonLayerNorm
@@ -5,6 +9,14 @@ from torch.nn import LayerNorm
 
 
 def get_time_name():
+    # [FUNCTION DOC]
+    # HELPER: timestamp string.
+    # Behavior: returns the current local time formatted day/month/year_hour:minute:second.
+    # Inputs: none.
+    # Outputs: string.
+    # Exceptions: None explicitly raised.
+    # Side effects: None.
+    # KNOWN ISSUE: defined but never used in this script.
     import datetime
 
     today = datetime.datetime.now()
@@ -31,6 +43,13 @@ if __name__ == "__main__":
     logger = LoggerWriter()
 
     def loss_function(x):
+        # [FUNCTION DOC]
+        # HELPER: loss for the convergence loop.
+        # Behavior: sums all elements of x.
+        # Inputs: x, tensor.
+        # Outputs: scalar tensor.
+        # Exceptions: None explicitly raised.
+        # Side effects: None.
         return x.sum()
 
     for step in range(NUM_STEPS):

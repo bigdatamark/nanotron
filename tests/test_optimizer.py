@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Purpose: distributed pytest test (currently skipped) for get_custom_lr_for_named_parameters under standard and spectral muP parametrizations on a tiny Llama.
+# Main contents: test_get_custom_lr and _test_get_custom_lr.
 from typing import Union
 
 import pytest
@@ -18,6 +21,12 @@ from tests.helpers.llama_helper import TINY_LLAMA_CONFIG, create_llama_from_conf
 @pytest.mark.skip
 @rerun_if_address_is_in_use()
 def test_get_custom_lr(tp: int, dp: int, pp: int, parametrization_method: ParametrizationMethod):
+    # [FUNCTION DOC]
+    # Behavior: chooses RandomInit(std 1.0) for STANDARD or SpectralMupInit for SPECTRAL_MUP and spawns ranks running _test_get_custom_lr with lr 1e-3.
+    # Inputs: tp, dp, pp layouts; parametrization_method.
+    # Outputs: None.
+    # Exceptions: UnboundLocalError if an unknown method were passed (init_method undefined).
+    # Side effects: process spawning.
     LR = 1e-3
 
     if parametrization_method == ParametrizationMethod.STANDARD:
@@ -38,6 +47,13 @@ def _test_get_custom_lr(
     init_method: Union[RandomInit, SpectralMupInit],
     parametrization_method: ParametrizationMethod,
 ):
+    # [FUNCTION DOC]
+    # Behavior: builds and randomly initializes the Llama with the parametrization, collects named parameters with correct tie handling (returns early on ranks with none), computes per-parameter learning rate groups and checks one group per parameter, float learning rates, list-valued named_params, and that all learning rates equal the base one if and only if the method is STANDARD.
+    # Inputs: parallel_context; lr, float; init_method; parametrization_method.
+    # Outputs: None.
+    # Exceptions: AssertionError on failure.
+    # Side effects: GPU allocation, collectives during build.
+    # KNOWN ISSUE: returns early on ranks without parameters without destroying the parallel context, and the context is never destroyed on other ranks either.
     model_args = ModelArgs(init_method=init_method, model_config=TINY_LLAMA_CONFIG)
     config = get_llama_training_config(model_args)
     llama = create_llama_from_config(

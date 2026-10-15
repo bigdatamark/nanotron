@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Purpose: distributed pytest test for data parallel gradient synchronization with all-forward-all-backward accumulation using ddp_trigger_sync_in_bwd and a custom DDP communication hook.
+# Main contents: test_ddp_with_afab and its per-rank body.
 from contextlib import nullcontext
 
 import pytest
@@ -17,13 +20,32 @@ from torch.distributed import GradBucket
 @pytest.mark.parametrize("accumulation_steps", [1, 3])
 @rerun_if_address_is_in_use()
 def test_ddp_with_afab(accumulation_steps):
+    # [FUNCTION DOC]
+    # Behavior: runs _test_ddp_with_afab on 2 data parallel ranks (skipped with fewer than 2 GPUs).
+    # Inputs: accumulation_steps, parametrized 1 or 3.
+    # Outputs: None.
+    # Exceptions: propagates failures.
+    # Side effects: process spawning.
     init_distributed(tp=1, dp=2, pp=1)(_test_ddp_with_afab)(accumulation_steps=accumulation_steps)
 
 
 def _test_ddp_with_afab(parallel_context: ParallelContext, accumulation_steps: int):
+    # [FUNCTION DOC]
+    # Behavior: wraps a bias-free float16 linear(3,2) on CUDA, whose weight is a NanotronParameter, in DistributedDataParallel over dp with a custom average all-reduce hook. Runs all forwards under no_sync, storing the losses; then runs the backwards in order, wrapping only the last in ddp_trigger_sync_in_bwd. After each backward checks the gradient: after the last it must be synchronized across dp; before that, the sync assertion must fail on every rank except dp rank 0 (gradients differ because inputs differ).
+    # Inputs: parallel_context; accumulation_steps.
+    # Outputs: None.
+    # Exceptions: AssertionError on failure.
+    # Side effects: GPU allocation; dp collectives; process group destruction.
     half_precision = torch.float16
 
     def allreduce_hook(process_group: dist.ProcessGroup, bucket: GradBucket):
+        # [FUNCTION DOC]
+        # HELPER: DDP communication hook.
+        # Behavior: launches an asynchronous averaging all-reduce of the bucket's flat gradient buffer on the given process group (or dp if None) and returns a future resolving to the reduced buffer.
+        # Inputs: process_group, optional group (the hook state); bucket, a GradBucket.
+        # Outputs: torch Future of the reduced tensor.
+        # Exceptions: None explicitly raised.
+        # Side effects: all-reduce collective, in-place on the bucket buffer.
         # DDP groups grads in GradBuckets. This hook is called throughout the bwd pass, once each bucket is ready to overlap communication with computation.
         # See https://pytorch.org/docs/stable/ddp_comm_hooks.html#what-does-a-communication-hook-operate-on for more details.
         half_flat_bucket_buffer = bucket.buffer()

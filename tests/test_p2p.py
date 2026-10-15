@@ -1,3 +1,6 @@
+# [MODULE DOC]
+# Purpose: distributed pytest test of nanotron P2P tensor send/receive with contiguous, non-contiguous and sliced tensors.
+# Main contents: test_check_send_recv_tensor and its per-rank body.
 import contextlib
 
 import pytest
@@ -14,10 +17,24 @@ from nanotron.parallel.pipeline_parallel.p2p import P2P
 @pytest.mark.parametrize("full", [True, False])
 @rerun_if_address_is_in_use()
 def test_check_send_recv_tensor(send_contiguous: bool, full: bool):
+    # [FUNCTION DOC]
+    # Behavior: spawns 2 pipeline ranks running _test_check_send_recv_tensor (skipped with fewer than 2 GPUs).
+    # Inputs: send_contiguous and full, parametrized booleans.
+    # Outputs: None.
+    # Exceptions: propagates failures.
+    # Side effects: process spawning.
     init_distributed(tp=1, dp=1, pp=2)(_test_check_send_recv_tensor)(send_contiguous=send_contiguous, full=full)
 
 
 def _test_check_send_recv_tensor(parallel_context: ParallelContext, send_contiguous: bool, full: bool):
+    # [FUNCTION DOC]
+    # Behavior: rank 0 creates a random 3 by 5 tensor, transposes it if non-contiguous is requested, and slices rows 1 to 3 if not full. A non-contiguous slice is expected to fail the first send with a specific AssertionError about storage size; in that case both ranks return early. Otherwise rank 0 asynchronously sends to rank 1, waits, receives the echo and checks exact equality; rank 1 receives asynchronously, waits and sends the tensor back. For a contiguous slice, rank 0 additionally prints storage contents and checks the first storage element differs, proving only the viewed part was sent. Destroys the context.
+    # Inputs: parallel_context; send_contiguous; full.
+    # Outputs: None.
+    # Exceptions: AssertionError on failure; ValueError for a rank other than 0 or 1.
+    # Side effects: P2P communication, stdout prints, process group destruction.
+    # KNOWN ISSUE: the comment says a ValueError is expected but the code expects an AssertionError; the early returns skip destroying the parallel context.
+    # KNOWN ISSUE: leftover debug prints.
     p2p = P2P(pg=parallel_context.pp_pg, device=torch.device("cuda"))
     if dist.get_rank(p2p.pg) == 0:
         tensor_to_send = torch.randn(3, 5, dtype=torch.float, device=torch.device("cuda"))
