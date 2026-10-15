@@ -157,7 +157,6 @@ def checkpoint_method(attr_name: str):
     """Decorator to checkpoint a method of a class."""
 
     def decorator(func):
-        @functools.wraps(func)
         # [FUNCTION DOC]
         # HELPER: wraps the target function for checkpoint_method.
         # Behavior: returns wrapper, a functools-wrapped version of func.
@@ -165,6 +164,7 @@ def checkpoint_method(attr_name: str):
         # Outputs: the wrapper function.
         # Exceptions: None explicitly raised.
         # Side effects: None.
+        @functools.wraps(func)
         def wrapper(*args, **kwargs):
             # [FUNCTION DOC]
             # HELPER: runtime dispatch for checkpoint_method.
